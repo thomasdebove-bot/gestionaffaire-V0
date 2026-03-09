@@ -23,6 +23,7 @@ DEFAULT_CACHE_FILE = "finance_cache.json"
 WORKBOOK_PATH = os.getenv("ACTIVITE_XLSX_PATH", DEFAULT_WORKBOOK_PATH)
 SHEET_NAME = os.getenv("ACTIVITE_SHEET_NAME", DEFAULT_SHEET_NAME)
 CACHE_FILE = os.getenv("FINANCE_CACHE_FILE", DEFAULT_CACHE_FILE)
+EXPECTED_SCHEMA_VERSION = "finance_affaires_dataset_v4"
 TEMPO_LOGO_PATH = os.getenv("TEMPO_LOGO_PATH", r"\\192.168.10.100\02 - affaires\02.2 - SYNTHESE\ZZ - METRONOME\Content\T logo.png")
 
 MONTHS = [
@@ -169,13 +170,21 @@ class FinanceService:
     def get_finance_cache(self) -> Dict[str, Any]:
         with self._lock:
             cache = dict(self._cache)
-        if cache.get("status") == "ready" and cache.get("items"):
+        if (
+            cache.get("status") == "ready"
+            and cache.get("items")
+            and cache.get("schema_version") == EXPECTED_SCHEMA_VERSION
+        ):
             return cache
 
         if self.cache_file.exists():
             try:
                 disk = json.loads(self.cache_file.read_text(encoding="utf-8"))
-                if disk.get("source_mtime") == self.source_mtime() and disk.get("items"):
+                if (
+                    disk.get("schema_version") == EXPECTED_SCHEMA_VERSION
+                    and disk.get("source_mtime") == self.source_mtime()
+                    and disk.get("items")
+                ):
                     with self._lock:
                         self._cache = disk
                     return dict(self._cache)
@@ -200,7 +209,7 @@ class FinanceService:
         parsed = self.parse_affaires_sheet(ws)
 
         cache = {
-            "schema_version": "finance_affaires_dataset_v3",
+            "schema_version": EXPECTED_SCHEMA_VERSION,
             "status": "ready",
             "generated_at": now_iso(),
             "rows_read": parsed["meta"]["rows_read"],
