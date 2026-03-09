@@ -107,12 +107,16 @@ def row_tuple_to_dict(values: tuple) -> Dict[str, Any]:
     return data
 
 
-def cumulative_facturation_from_row(row: Dict[str, Any]) -> float:
-    return sum(
-        clean_number(value)
-        for key, value in row.items()
-        if isinstance(key, str) and key.startswith("facturation_cumulee_")
-    )
+def anteriorite_from_row(row: Dict[str, Any]) -> float:
+    return sum(clean_number(row.get(k)) for k in [
+        "facturation_cumulee_2017", "facturation_cumulee_2018", "facturation_cumulee_2021",
+        "facturation_cumulee_2022", "facturation_cumulee_2023", "facturation_cumulee_2024",
+        "facturation_cumulee_2025",
+    ])
+
+
+def facture_2026_from_row(row: Dict[str, Any]) -> float:
+    return clean_number(row.get("facturation_cumulee_2026"))
 
 
 class FinanceService:
@@ -253,6 +257,7 @@ class FinanceService:
                 current_parent = self._normalize_row(row, current_client=current_client)
                 current_parent["missions"] = []
                 current_parent["_row_index"] = row_index
+                current_parent["_is_parent_row"] = True
                 parent_rows.append(current_parent)
                 rows_kept += 1
                 continue
@@ -271,6 +276,7 @@ class FinanceService:
             if current_parent is None:
                 mission["missions"] = [self._mission_payload_from_affaire(mission)]
                 mission["_row_index"] = row_index
+                mission["_is_parent_row"] = False
                 parent_rows.append(mission)
                 current_parent = mission
             else:
@@ -317,8 +323,9 @@ class FinanceService:
         total_previsionnel = sum(mensuel[m]["previsionnel"] for m in MONTHS)
         total_facture = clean_number(row.get("total_facture")) or sum(mensuel[m]["facture"] for m in MONTHS)
         commande_ht = clean_number(row.get("commande_ht"))
-        fact_2026 = clean_number(row.get("facturation_cumulee_2026"))
-        total_facturation_cumulee = cumulative_facturation_from_row(row)
+        anteriorite = anteriorite_from_row(row)
+        fact_2026 = facture_2026_from_row(row)
+        facturation_totale = anteriorite + fact_2026
         reste = clean_number(row.get("reste_a_facturer"))
 
         return {
@@ -341,14 +348,16 @@ class FinanceService:
             "facturation_cumulee_2024": clean_number(row.get("facturation_cumulee_2024")),
             "facturation_cumulee_2025": clean_number(row.get("facturation_cumulee_2025")),
             "facturation_cumulee_2026": fact_2026,
-            "total_facturation_cumulee": total_facturation_cumulee,
+            "anteriorite": anteriorite,
+            "facture_2026": fact_2026,
+            "facturation_totale": facturation_totale,
             "reste_a_facturer": reste,
             "has_reste_value": row.get("reste_a_facturer") not in (None, ""),
             "mensuel": mensuel,
             "total_previsionnel": total_previsionnel,
             "total_facture": total_facture,
             "ecart_previsionnel_vs_facture": total_facture - total_previsionnel,
-            "taux_avancement_financier": (total_facturation_cumulee / commande_ht) if commande_ht else 0.0,
+            "taux_avancement_financier": (facturation_totale / commande_ht) if commande_ht else 0.0,
         }
 
     def _mission_payload_from_affaire(self, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -365,7 +374,9 @@ class FinanceService:
             "facturation_cumulee_2024": data.get("facturation_cumulee_2024", 0.0),
             "facturation_cumulee_2025": data.get("facturation_cumulee_2025", 0.0),
             "facturation_cumulee_2026": data.get("facturation_cumulee_2026", 0.0),
-            "total_facturation_cumulee": data.get("total_facturation_cumulee", data.get("facturation_cumulee_2026", 0.0)),
+            "anteriorite": data.get("anteriorite", 0.0),
+            "facture_2026": data.get("facture_2026", data.get("facturation_cumulee_2026", 0.0)),
+            "facturation_totale": data.get("facturation_totale", data.get("anteriorite", 0.0) + data.get("facture_2026", data.get("facturation_cumulee_2026", 0.0))),
             "reste_a_facturer": data.get("reste_a_facturer", 0.0),
             "has_reste_value": data.get("has_reste_value", False),
             "total_previsionnel": data.get("total_previsionnel", 0.0),
@@ -381,12 +392,12 @@ class FinanceService:
             numero = affaire.get("numero", "")
             commande = 0.0
             facture_2026 = 0.0
-            facture_cumulee = 0.0
+            anteriorite = 0.0
             delai_values = []
             for mission in missions:
                 commande += clean_number(mission.get("commande_ht"))
-                facture_2026 += clean_number(mission.get("facturation_cumulee_2026"))
-                facture_cumulee += cumulative_facturation_from_row(mission)
+                facture_2026 += clean_number(mission.get("facture_2026", mission.get("facturation_cumulee_2026")))
+                anteriorite += clean_number(mission.get("anteriorite"))
                 if clean_number(mission.get("delai_reglement_jours")) > 0:
                     delai_values.append(safe_int(mission.get("delai_reglement_jours")))
                 if mission.get("tag"):
@@ -400,16 +411,20 @@ class FinanceService:
             for month in MONTHS:
                 monthly[month]["ecart"] = monthly[month]["facture"] - monthly[month]["previsionnel"]
 
-            parent_commande = clean_number(affaire.get("commande_ht"))
-            parent_facture_2026 = clean_number(affaire.get("facturation_cumulee_2026"))
-            parent_facture_cumulee = cumulative_facturation_from_row(affaire)
-            affaire["commande_ht"] = parent_commande if abs(parent_commande) > 1e-9 else commande
-            affaire["facturation_cumulee_2026"] = parent_facture_2026 if abs(parent_facture_2026) > 1e-9 else facture_2026
-            affaire["total_facturation_cumulee"] = parent_facture_cumulee if abs(parent_facture_cumulee) > 1e-9 else facture_cumulee
-            has_parent_reste = bool(affaire.get("has_reste_value", False))
-            reste_parent = clean_number(affaire.get("reste_a_facturer"))
-            reste_missions = sum(clean_number(m.get("reste_a_facturer")) for m in missions)
-            affaire["reste_a_facturer"] = reste_parent if has_parent_reste else reste_missions
+            has_parent_recap = bool(affaire.get("_is_parent_row", False))
+            if has_parent_recap:
+                affaire["commande_ht"] = clean_number(affaire.get("commande_ht"))
+                affaire["anteriorite"] = clean_number(affaire.get("anteriorite"))
+                affaire["facture_2026"] = clean_number(affaire.get("facture_2026", affaire.get("facturation_cumulee_2026")))
+                affaire["facturation_totale"] = affaire["anteriorite"] + affaire["facture_2026"]
+                affaire["reste_a_facturer"] = clean_number(affaire.get("reste_a_facturer"))
+            else:
+                affaire["commande_ht"] = commande
+                affaire["anteriorite"] = anteriorite
+                affaire["facture_2026"] = facture_2026
+                affaire["facturation_totale"] = anteriorite + facture_2026
+                affaire["reste_a_facturer"] = sum(clean_number(m.get("reste_a_facturer")) for m in missions)
+            affaire["facturation_cumulee_2026"] = affaire.get("facture_2026", 0.0)
             affaire["mensuel"] = monthly
             affaire["tags"] = sorted(set([t for t in tags if t]))
             affaire["numero"] = numero
@@ -417,24 +432,27 @@ class FinanceService:
             affaire["total_facture"] = sum(monthly[m]["facture"] for m in MONTHS)
             affaire["ecart_previsionnel_vs_facture"] = affaire["total_facture"] - affaire["total_previsionnel"]
             affaire["delai_reglement_jours"] = affaire.get("delai_reglement_jours") or (max(delai_values) if delai_values else 0)
-            affaire["taux_avancement_financier"] = (affaire["total_facturation_cumulee"] / affaire["commande_ht"]) if affaire["commande_ht"] else 0.0
+            affaire["taux_avancement_financier"] = (affaire["facturation_totale"] / affaire["commande_ht"]) if affaire["commande_ht"] else 0.0
         else:
             affaire["missions"] = []
             if affaire.get("tag") and not affaire.get("tags"):
                 affaire["tags"] = [affaire["tag"]]
 
-        affaire["total_facturation_cumulee"] = clean_number(affaire.get("total_facturation_cumulee")) or cumulative_facturation_from_row(affaire)
+        affaire["anteriorite"] = clean_number(affaire.get("anteriorite")) or anteriorite_from_row(affaire)
+        affaire["facture_2026"] = clean_number(affaire.get("facture_2026", affaire.get("facturation_cumulee_2026")))
+        affaire["facturation_totale"] = clean_number(affaire.get("facturation_totale")) or (affaire["anteriorite"] + affaire["facture_2026"])
         affaire["insights"] = self.compute_insights(affaire)
         affaire.pop("has_reste_value", None)
         affaire.pop("tag", None)
         affaire.pop("_row_index", None)
+        affaire.pop("_is_parent_row", None)
         return affaire
 
     @staticmethod
     def compute_insights(affaire: Dict[str, Any]) -> List[str]:
         insights: List[str] = []
         commande = clean_number(affaire.get("commande_ht"))
-        facture = clean_number(affaire.get("total_facturation_cumulee"))
+        facture = clean_number(affaire.get("facturation_totale"))
         reste = clean_number(affaire.get("reste_a_facturer"))
         prev = clean_number(affaire.get("total_previsionnel"))
         fact_total = clean_number(affaire.get("total_facture"))
@@ -489,7 +507,7 @@ def landing_html() -> str:
 .eyebrow{font-size:12px;font-weight:800;color:var(--accent);text-transform:uppercase;letter-spacing:.14em}h1{margin:8px 0 12px;font-size:44px;line-height:1.05}.sub{font-size:20px;color:var(--muted);max-width:930px}
 .selector{margin-top:22px;display:grid;grid-template-columns:2fr 1fr;gap:12px}.search{height:52px;border:1px solid var(--line);border-radius:14px;padding:0 14px;font-size:16px;width:100%}
 .badge{display:inline-flex;align-items:center;justify-content:center;padding:0 14px;height:52px;border-radius:14px;background:#f9fbff;color:#41547b;font-weight:700;border:1px solid var(--line)}
-.grid{margin-top:18px;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{padding:20px}.card h3{margin:0;font-size:21px}.card p{margin:10px 0 18px;color:var(--muted);font-size:14px;min-height:60px}
+.grid{margin-top:18px;display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:14px}.card{padding:20px}.card h3{margin:0;font-size:21px}.card p{margin:10px 0 18px;color:var(--muted);font-size:14px;min-height:60px}
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;height:44px;padding:0 16px;border-radius:12px;text-decoration:none;border:none;font-weight:800;cursor:pointer}
 .btn.primary,.btn.dark{background:var(--accent);color:#fff}.btn.disabled{background:#ecf0f7;color:#8a94a8;cursor:not-allowed}
 .state{margin-top:14px;padding:14px 16px;border-radius:14px;background:#f8faff;border:1px solid var(--line);color:#4f5d78;font-weight:600}
@@ -559,7 +577,7 @@ def finance_html() -> str:
 .hero{margin-top:18px;padding:26px 28px}.hero-top{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap}.hero h2{margin:8px 0 4px;font-size:42px;line-height:1.02}.eyebrow{font-size:12px;font-weight:800;color:var(--blue);letter-spacing:.14em;text-transform:uppercase}
 .meta-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin-top:18px}.meta-pill{background:var(--panel2);border:1px solid var(--line);border-radius:18px;padding:14px 16px}.meta-pill .label{font-size:12px;color:var(--muted);text-transform:uppercase;font-weight:800;letter-spacing:.08em}.meta-pill .value{margin-top:6px;font-size:16px;font-weight:700}
 .health{padding:10px 14px;border-radius:999px;font-size:13px;font-weight:800}.health.ok{background:#eaf8f0;color:var(--green)}.health.warn{background:#fff6e6;color:var(--amber)}.health.bad{background:#fff0f0;color:var(--red)}
-.kpis{margin-top:18px;padding:16px}.kpi-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.kpi{background:linear-gradient(180deg,#fff,#f8faff);border:1px solid var(--line);border-radius:20px;padding:18px;min-height:132px}.kpi .label{font-size:13px;color:var(--muted);font-weight:800;text-transform:uppercase;letter-spacing:.06em}.kpi .value{margin-top:10px;font-size:34px;font-weight:800;line-height:1}.kpi .sub{margin-top:10px;font-size:13px;color:var(--muted)}
+.kpis{margin-top:18px;padding:16px}.kpi-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:14px}.kpi{background:linear-gradient(180deg,#fff,#f8faff);border:1px solid var(--line);border-radius:20px;padding:18px;min-height:132px}.kpi .label{font-size:13px;color:var(--muted);font-weight:800;text-transform:uppercase;letter-spacing:.06em}.kpi .value{margin-top:10px;font-size:34px;font-weight:800;line-height:1}.kpi .sub{margin-top:10px;font-size:13px;color:var(--muted)}
 .kpi.good{background:linear-gradient(180deg,#fff,#edf8f2)}.kpi.warn{background:linear-gradient(180deg,#fff,#fff8eb)}.kpi.bad{background:linear-gradient(180deg,#fff,#fff1f1)}
 .layout{display:grid;grid-template-columns:2fr 1fr;gap:18px;margin-top:18px}.section{padding:18px 18px 22px}.section h3{margin:0 0 14px;font-size:24px}
 .chart-card{height:420px}.chart-wrap{height:340px;border-radius:18px;background:linear-gradient(180deg,#f7f9fc 0%,#f3f6fb 100%);border:1px solid var(--line);padding:14px}
@@ -567,7 +585,7 @@ def finance_html() -> str:
 .table-wrap{overflow:auto;border:1px solid var(--line);border-radius:18px}table{width:100%;border-collapse:collapse}th,td{padding:14px;border-bottom:1px solid var(--line);font-size:14px;text-align:left}th{background:#f7f9fc;color:#536079;font-size:12px;text-transform:uppercase;letter-spacing:.08em}tr:last-child td{border-bottom:none}td.num{text-align:right;font-variant-numeric:tabular-nums}
 .delta.pos{color:var(--green);font-weight:800}.delta.neg{color:var(--red);font-weight:800}.insights{display:flex;flex-wrap:wrap;gap:10px}.insight{padding:12px 14px;border-radius:16px;font-size:14px;font-weight:700;border:1px solid var(--line);background:var(--panel2)}
 .notice{padding:14px 16px;border-radius:16px;background:#fff7e7;color:#8c6211;border:1px solid #f0dcab}.error{padding:14px 16px;border-radius:16px;background:#fff0f0;color:#992f2f;border:1px solid #f1c6c6}.empty{padding:28px;border:1px dashed var(--line);border-radius:18px;color:var(--muted);text-align:center;background:#fafbfd}.small{font-size:13px;color:var(--muted)}.footer-row{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-top:12px}
-@media (max-width:1200px){.kpi-grid{grid-template-columns:repeat(3,1fr)}.layout{grid-template-columns:1fr}.meta-grid{grid-template-columns:repeat(2,1fr)}}@media (max-width:720px){.topbar{position:static}.kpi-grid{grid-template-columns:1fr}.meta-grid{grid-template-columns:1fr}.hero h2{font-size:30px}.select,.search{min-width:100%}}
+@media (max-width:1200px){.kpi-grid{grid-template-columns:repeat(2,1fr)}.layout{grid-template-columns:1fr}.meta-grid{grid-template-columns:repeat(2,1fr)}}@media (max-width:720px){.topbar{position:static}.kpi-grid{grid-template-columns:1fr}.meta-grid{grid-template-columns:1fr}.hero h2{font-size:30px}.select,.search{min-width:100%}}
 </style>
 </head>
 <body>
@@ -607,7 +625,9 @@ def finance_html() -> str:
 
   <div class='kpis'><div class='kpi-grid'>
     <div class='kpi' id='kpiCommandeCard'><div class='label'>Commande HT</div><div class='value' id='kpiCommande'>0 €</div><div class='sub'>Montant contractualisé</div></div>
-    <div class='kpi' id='kpiFactureCard'><div class='label'>Facturation cumulée 2017-2026</div><div class='value' id='kpiFacture'>0 €</div><div class='sub'>Antériorité incluse</div></div>
+    <div class='kpi' id='kpiAnterioriteCard'><div class='label'>Antériorité</div><div class='value' id='kpiAnteriorite'>0 €</div><div class='sub'>Somme G → M</div></div>
+    <div class='kpi' id='kpiFacture2026Card'><div class='label'>Facturé 2026</div><div class='value' id='kpiFacture2026'>0 €</div><div class='sub'>Colonne N</div></div>
+    <div class='kpi' id='kpiFacturationTotaleCard'><div class='label'>Facturation totale</div><div class='value' id='kpiFacturationTotale'>0 €</div><div class='sub'>Antériorité + 2026</div></div>
     <div class='kpi' id='kpiResteCard'><div class='label'>Reste à facturer</div><div class='value' id='kpiReste'>0 €</div><div class='sub'>Solde estimé</div></div>
     <div class='kpi' id='kpiAvanceCard'><div class='label'>Avancement financier</div><div class='value' id='kpiAvance'>0 %</div><div class='sub'>Facturé / commande</div></div>
   </div></div>
@@ -645,10 +665,22 @@ async function loadSelectedAffaire(id){if(!id){state.selectedAffaireId='';state.
 function setHeroEmpty(){document.getElementById('heroTitle').textContent='Sélectionnez une affaire';document.getElementById('heroSubtitle').textContent='Le cockpit se remplit à partir du cache du tableau activité.';document.getElementById('metaClient').textContent='-';document.getElementById('metaAffaire').textContent='-';document.getElementById('metaTags').textContent='-';const h=document.getElementById('heroHealth');h.textContent='En attente';h.className='health warn';}
 function cardTone(id,tone){const el=document.getElementById(id);el.classList.remove('good','warn','bad');if(tone)el.classList.add(tone);}
 function renderHero(){const a=state.selectedAffaire;if(!a){setHeroEmpty();return;}document.getElementById('heroTitle').textContent=a.display_name||'-';document.getElementById('heroSubtitle').textContent=`Client ${a.client||'-'} · ${(a.missions||[]).length} mission(s)`;document.getElementById('metaClient').textContent=a.client||'-';document.getElementById('metaAffaire').textContent=a.affaire||'-';document.getElementById('metaTags').textContent=(a.tags||[]).join(' · ')||'-';document.getElementById('metaCache').textContent=(state.cacheStatus&&state.cacheStatus.generated_at)||'-';const hh=healthClass(a),el=document.getElementById('heroHealth');el.textContent=hh.label;el.className=`health ${hh.cls}`;}
-function renderKpis(){const a=state.selectedAffaire||{commande_ht:0,total_facturation_cumulee:0,reste_a_facturer:0,taux_avancement_financier:0};document.getElementById('kpiCommande').textContent=euro(a.commande_ht);document.getElementById('kpiFacture').textContent=euro(a.total_facturation_cumulee||a.facturation_cumulee_2026||0);document.getElementById('kpiReste').textContent=euro(a.reste_a_facturer);document.getElementById('kpiAvance').textContent=pct(a.taux_avancement_financier);cardTone('kpiCommandeCard','good');cardTone('kpiFactureCard',(a.total_facturation_cumulee||0)>0?'good':'warn');cardTone('kpiResteCard',a.reste_a_facturer<0?'bad':(a.reste_a_facturer>(a.commande_ht||0)*0.5?'warn':'good'));cardTone('kpiAvanceCard',a.taux_avancement_financier>0.85?'good':(a.taux_avancement_financier<0.35?'warn':''));}
+function renderKpis(){const a=state.selectedAffaire||{commande_ht:0,anteriorite:0,facture_2026:0,facturation_totale:0,reste_a_facturer:0,taux_avancement_financier:0};
+document.getElementById('kpiCommande').textContent=euro(a.commande_ht);
+document.getElementById('kpiAnteriorite').textContent=euro(a.anteriorite||0);
+document.getElementById('kpiFacture2026').textContent=euro(a.facture_2026||a.facturation_cumulee_2026||0);
+document.getElementById('kpiFacturationTotale').textContent=euro(a.facturation_totale||0);
+document.getElementById('kpiReste').textContent=euro(a.reste_a_facturer);
+document.getElementById('kpiAvance').textContent=pct(a.taux_avancement_financier);
+cardTone('kpiCommandeCard','good');
+cardTone('kpiAnterioriteCard',(a.anteriorite||0)>0?'good':'warn');
+cardTone('kpiFacture2026Card',(a.facture_2026||0)>0?'good':'warn');
+cardTone('kpiFacturationTotaleCard',(a.facturation_totale||0)>0?'good':'warn');
+cardTone('kpiResteCard',a.reste_a_facturer<0?'bad':(a.reste_a_facturer>(a.commande_ht||0)*0.5?'warn':'good'));
+cardTone('kpiAvanceCard',a.taux_avancement_financier>0.85?'good':(a.taux_avancement_financier<0.35?'warn':''));}
 function renderFinanceChart(){const root=document.getElementById('monthlyChart');const a=state.selectedAffaire;if(!a){root.innerHTML=`<text x="490" y="160" text-anchor="middle" fill="#6e7a90" font-size="18">Sélectionnez une affaire</text>`;return;}const s=MONTHS.map(m=>({label:MONTH_LABELS[m],pre:Number((((a.mensuel||{})[m]||{}).previsionnel)||0),fac:Number((((a.mensuel||{})[m]||{}).facture)||0)}));const maxVal=Math.max(1,...s.flatMap(x=>[x.pre,x.fac]));const left=56,top=16,width=880,height=250,step=width/s.length,barW=step*0.48;let grid='',bars='',labels='';const points=[];for(let i=0;i<=4;i++){const y=top+(height/4)*i,val=Math.round(maxVal*(1-i/4));grid+=`<line x1="${left}" y1="${y}" x2="${left+width}" y2="${y}" stroke="#dfe5ef" stroke-width="1"/><text x="${left-10}" y="${y+4}" text-anchor="end" fill="#8090a8" font-size="12">${fmt(val)}</text>`;}s.forEach((it,i)=>{const x=left+i*step+(step-barW)/2;const h=(it.pre/maxVal)*height;const y=top+height-h;const py=top+height-(it.fac/maxVal)*height;bars+=`<rect x="${x}" y="${y}" width="${barW}" height="${Math.max(h,0.5)}" rx="8" fill="#dbe6ff"><title>${it.label} prévisionnel: ${euro(it.pre)}</title></rect>`;points.push(`${x+barW/2},${py}`);labels+=`<text x="${x+barW/2}" y="${top+height+22}" text-anchor="middle" fill="#66748b" font-size="12">${it.label}</text>`;});root.innerHTML=`${grid}<line x1="${left}" y1="${top+height}" x2="${left+width}" y2="${top+height}" stroke="#b8c3d4" stroke-width="1.2"/>${bars}<polyline points="${points.join(' ')}" fill="none" stroke="#ef8d00" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>${points.map((p,i)=>{const q=p.split(',');return `<circle cx="${q[0]}" cy="${q[1]}" r="4.5" fill="#fff" stroke="#ef8d00" stroke-width="3"><title>${s[i].label} facturé: ${euro(s[i].fac)}</title></circle>`;}).join('')}${labels}`;}
 function renderMonthlyTable(){const root=document.getElementById('monthlyTableWrap');const a=state.selectedAffaire;if(!a){root.innerHTML=`<div class='empty'>Sélectionnez une affaire pour afficher le détail mensuel.</div>`;return;}let rows='';MONTHS.forEach(m=>{const pre=Number((((a.mensuel||{})[m]||{}).previsionnel)||0),fac=Number((((a.mensuel||{})[m]||{}).facture)||0),ec=fac-pre;rows+=`<tr><td>${MONTH_LABELS[m]}</td><td class='num'>${euro(pre)}</td><td class='num'>${euro(fac)}</td><td class='num delta ${ec>=0?'pos':'neg'}'>${euro(ec)}</td></tr>`;});rows+=`<tr><td><strong>Total</strong></td><td class='num'><strong>${euro(a.total_previsionnel||0)}</strong></td><td class='num'><strong>${euro(a.total_facture||0)}</strong></td><td class='num delta ${Number(a.ecart_previsionnel_vs_facture||0)>=0?'pos':'neg'}'><strong>${euro(a.ecart_previsionnel_vs_facture||0)}</strong></td></tr>`;root.innerHTML=`<table><thead><tr><th>Mois</th><th class='num'>Prévisionnel</th><th class='num'>Facturé</th><th class='num'>Écart</th></tr></thead><tbody>${rows}</tbody></table>`;}
-function renderMissions(){const root=document.getElementById('missionsTableWrap');const meta=document.getElementById('missionsMeta');const a=state.selectedAffaire;if(!a){meta.textContent='0 mission';root.innerHTML=`<div class='empty'>Sélectionnez une affaire pour afficher les missions.</div>`;return;}const missions=a.missions||[];meta.textContent=`${missions.length} mission(s)`;if(!missions.length){root.innerHTML=`<div class='empty'>Aucune mission détaillée sur cette affaire.</div>`;return;}root.innerHTML=`<table><thead><tr><th>Tag</th><th>Mission</th><th>N°</th><th class='num'>Commande</th><th class='num'>Fact. cumulée</th><th class='num'>Reste</th><th class='num'>Prévisionnel</th><th class='num'>Facturé</th></tr></thead><tbody>${missions.map(m=>`<tr><td>${esc(m.tag||'')}</td><td>${esc(m.label||'')}</td><td>${esc(m.numero||'')}</td><td class='num'>${euro(m.commande_ht)}</td><td class='num'>${euro(m.total_facturation_cumulee||m.facturation_cumulee_2026)}</td><td class='num'>${euro(m.reste_a_facturer)}</td><td class='num'>${euro(m.total_previsionnel)}</td><td class='num'>${euro(m.total_facture)}</td></tr>`).join('')}</tbody></table>`;}
+function renderMissions(){const root=document.getElementById('missionsTableWrap');const meta=document.getElementById('missionsMeta');const a=state.selectedAffaire;if(!a){meta.textContent='0 mission';root.innerHTML=`<div class='empty'>Sélectionnez une affaire pour afficher les missions.</div>`;return;}const missions=a.missions||[];meta.textContent=`${missions.length} mission(s)`;if(!missions.length){root.innerHTML=`<div class='empty'>Aucune mission détaillée sur cette affaire.</div>`;return;}root.innerHTML=`<table><thead><tr><th>Tag</th><th>Mission</th><th>N°</th><th class='num'>Commande</th><th class='num'>Facturation totale</th><th class='num'>Reste</th><th class='num'>Prévisionnel</th><th class='num'>Facturé</th></tr></thead><tbody>${missions.map(m=>`<tr><td>${esc(m.tag||'')}</td><td>${esc(m.label||'')}</td><td>${esc(m.numero||'')}</td><td class='num'>${euro(m.commande_ht)}</td><td class='num'>${euro(m.facturation_totale||((m.anteriorite||0)+(m.facture_2026||m.facturation_cumulee_2026||0)))}</td><td class='num'>${euro(m.reste_a_facturer)}</td><td class='num'>${euro(m.total_previsionnel)}</td><td class='num'>${euro(m.total_facture)}</td></tr>`).join('')}</tbody></table>`;}
 function renderInsights(){const root=document.getElementById('insightsBox');const a=state.selectedAffaire;if(!a){root.innerHTML=`<div class='empty' style='width:100%'>Sélectionnez une affaire.</div>`;return;}const items=a.insights||[];root.innerHTML=items.map(x=>`<div class='insight'>${esc(x)}</div>`).join('');}
 function renderAll(){renderHero();renderKpis();renderFinanceChart();renderMonthlyTable();renderMissions();renderInsights();document.getElementById('exportBtn').disabled=!state.selectedAffaireId;const dash=document.getElementById('dashboardBtn');dash.href=state.selectedAffaireId?`/dashboard?affaire_id=${encodeURIComponent(state.selectedAffaireId)}`:'/dashboard';}
 async function rebuildCache(){clearError();showNotice('Reconstruction du cache en cours…');await api('/api/finance/rebuild-cache',{method:'POST'});await loadCacheStatus();await loadAffairesList(document.getElementById('searchInput').value||'');if(state.selectedAffaireId&&state.affaires.some(x=>x.affaire_id===state.selectedAffaireId)){await loadSelectedAffaire(state.selectedAffaireId);}else{state.selectedAffaireId='';state.selectedAffaire=null;renderAll();}showNotice('Cache reconstruit avec succès.');}
@@ -692,7 +724,7 @@ def dashboard_html() -> str:
   <div class='hero'>
     <div class='eyeb'>Tableau de bord</div>
     <div id='title' class='title'>Sélectionnez une affaire</div>
-    <div id='subtitle' class='muted'>Synthèse principale : client, commande, facturation cumulée, reste à facturer.</div>
+    <div id='subtitle' class='muted'>Synthèse principale : client, commande, antériorité, facturé 2026, facturation totale et reste à facturer.</div>
   </div>
   <div class='kpis'><div class='grid'>
     <div class='k'><div class='muted'>Commande HT</div><div id='kCommande' class='v'>0 €</div></div>
@@ -711,7 +743,7 @@ async function api(u){const r=await fetch(u);const d=await r.json();if(!r.ok) th
 async function loadAffairesList(search=''){const d=await api(`/api/finance/affaires?search=${encodeURIComponent(search)}`);state.affaires=d.items||[];const sel=document.getElementById('affaireSelect');sel.innerHTML=`<option value=''>Sélectionnez une affaire</option>`+state.affaires.map(x=>`<option value="${esc(x.affaire_id)}">${esc(x.display_name)}</option>`).join('');if(state.selectedId&&state.affaires.some(x=>x.affaire_id===state.selectedId)){sel.value=state.selectedId;}}
 async function loadSelectedAffaire(id){if(!id){state.selectedId='';state.selected=null;render();return;}const d=await api(`/api/finance/affaire/${encodeURIComponent(id)}`);state.selectedId=id;state.selected=d.affaire;localStorage.setItem('selectedAffaireId',id);render();}
 function renderChart(){const root=document.getElementById('chart');const a=state.selected;if(!a){root.innerHTML='';return;}const monthIdx=(new Date().getMonth());const data=MONTHS.slice(monthIdx).map(m=>({label:MONTH_LABELS[m],pre:Number(((a.mensuel||{})[m]||{}).previsionnel||0),fac:Number(((a.mensuel||{})[m]||{}).facture||0)}));const max=Math.max(1,...data.flatMap(x=>[x.pre,x.fac]));const left=56,top=20,width=880,height=240,step=width/Math.max(1,data.length),bw=step*0.46;let out='';for(let i=0;i<=4;i++){const y=top+(height/4)*i;out+=`<line x1="${left}" y1="${y}" x2="${left+width}" y2="${y}" stroke="#dfe5ef"/><text x="${left-8}" y="${y+4}" text-anchor="end" fill="#8190a8" font-size="12">${Math.round(max*(1-i/4))}</text>`;}const pts=[];data.forEach((d,i)=>{const x=left+i*step+(step-bw)/2;const h=(d.pre/max)*height;const y=top+height-h;const py=top+height-(d.fac/max)*height;out+=`<rect x="${x}" y="${y}" width="${bw}" height="${Math.max(h,1)}" rx="7" fill="#fbd8a8"></rect><text x="${x+bw/2}" y="${top+height+18}" text-anchor="middle" fill="#6f7f98" font-size="12">${d.label}</text>`;pts.push(`${x+bw/2},${py}`);});out+=`<polyline points="${pts.join(' ')}" fill="none" stroke="#ef8d00" stroke-width="4"/>`;root.innerHTML=out;}
-function render(){const a=state.selected;document.getElementById('financeBtn').href=state.selectedId?`/finance?affaire_id=${encodeURIComponent(state.selectedId)}`:'/finance';document.getElementById('exportBtn').disabled=!state.selectedId;document.getElementById('title').textContent=a?(a.display_name||'-'):'Sélectionnez une affaire';document.getElementById('subtitle').textContent=a?`Client ${a.client||'-'} · ${a.affaire||'-'}`:'Synthèse principale : client, commande, facturation cumulée, reste à facturer.';document.getElementById('kCommande').textContent=euro(a?a.commande_ht:0);document.getElementById('kFacture').textContent=euro(a?(a.total_facturation_cumulee||a.facturation_cumulee_2026):0);document.getElementById('kReste').textContent=euro(a?a.reste_a_facturer:0);renderChart();}
+function render(){const a=state.selected;document.getElementById('financeBtn').href=state.selectedId?`/finance?affaire_id=${encodeURIComponent(state.selectedId)}`:'/finance';document.getElementById('exportBtn').disabled=!state.selectedId;document.getElementById('title').textContent=a?(a.display_name||'-'):'Sélectionnez une affaire';document.getElementById('subtitle').textContent=a?`Client ${a.client||'-'} · ${a.affaire||'-'}`:'Synthèse principale : client, commande, antériorité, facturé 2026, facturation totale et reste à facturer.';document.getElementById('kCommande').textContent=euro(a?a.commande_ht:0);document.getElementById('kFacture').textContent=euro(a?(a.facturation_totale||((a.anteriorite||0)+(a.facture_2026||a.facturation_cumulee_2026||0))):0);document.getElementById('kReste').textContent=euro(a?a.reste_a_facturer:0);renderChart();}
 async function init(){await loadAffairesList('');const params=new URLSearchParams(window.location.search);const pre=params.get('affaire_id')||localStorage.getItem('selectedAffaireId')||'';if(pre&&state.affaires.some(x=>x.affaire_id===pre)){document.getElementById('affaireSelect').value=pre;await loadSelectedAffaire(pre);}else{render();}document.getElementById('searchInput').addEventListener('input',async e=>{await loadAffairesList(e.target.value||'');});document.getElementById('affaireSelect').addEventListener('change',async e=>loadSelectedAffaire(e.target.value||''));document.getElementById('exportBtn').addEventListener('click',()=>{if(state.selectedId)window.location.href=`/api/finance/affaire/${encodeURIComponent(state.selectedId)}/export-csv`;});}
 init();
 </script>
@@ -825,14 +857,14 @@ def api_affaire_export_csv(affaire_id: str):
         row = item.get("mensuel", {}).get(month, {})
         writer.writerow([MONTH_LABELS[month], row.get("previsionnel", 0), row.get("facture", 0), row.get("ecart", 0)])
     writer.writerow([])
-    writer.writerow(["Tag", "Mission", "Numero", "Commande HT", "Facturation cumulée", "Reste à facturer", "Total prévisionnel", "Total facturé"])
+    writer.writerow(["Tag", "Mission", "Numero", "Commande HT", "Facturation totale", "Reste à facturer", "Total prévisionnel", "Total facturé"])
     for mission in item.get("missions", []):
         writer.writerow([
             mission.get("tag", ""),
             mission.get("label", ""),
             mission.get("numero", ""),
             mission.get("commande_ht", 0),
-            mission.get("total_facturation_cumulee", mission.get("facturation_cumulee_2026", 0)),
+            mission.get("facturation_totale", (clean_number(mission.get("anteriorite")) + clean_number(mission.get("facture_2026", mission.get("facturation_cumulee_2026", 0))))),
             mission.get("reste_a_facturer", 0),
             mission.get("total_previsionnel", 0),
             mission.get("total_facture", 0),
