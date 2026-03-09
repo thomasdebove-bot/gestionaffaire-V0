@@ -102,13 +102,13 @@ class InMemoryCache:
 
 
 class FinanceASGIApp:
-    def __init__(self) -> None:
+    def __init__(self, cache_backend: Optional[Any] = None) -> None:
         self.config = {
             "FINANCE_WORKBOOK_PATH": os.getenv("FINANCE_WORKBOOK_PATH", DEFAULT_WORKBOOK_PATH),
             "FINANCE_SHEET_NAME": os.getenv("FINANCE_SHEET_NAME", DEFAULT_SHEET_NAME),
             "FINANCE_DEBUG_PARSE": os.getenv("FINANCE_DEBUG_PARSE", "0") == "1",
         }
-        self.cache = InMemoryCache()
+        self.cache = cache_backend or InMemoryCache()
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
         self.logger = logging.getLogger("finance")
 
@@ -119,6 +119,14 @@ class FinanceASGIApp:
 
         method = scope.get("method", "GET")
         path = unquote(scope.get("path", ""))
+
+        if method == "GET" and path == "/":
+            await self._send_json(send, 200, self._service_index())
+            return
+
+        if method == "GET" and path == "/health":
+            await self._send_json(send, 200, {"status": "ok", "service": "finance"})
+            return
 
         if method == "GET" and path == "/api/finance/affaires":
             await self._handle_affaires(send)
@@ -170,6 +178,18 @@ class FinanceASGIApp:
             }
         )
         await send({"type": "http.response.body", "body": body})
+
+    def _service_index(self) -> Dict[str, Any]:
+        return {
+            "service": "finance",
+            "status": "ok",
+            "endpoints": {
+                "list_affaires": "/api/finance/affaires",
+                "affaire_detail": "/api/finance/affaires/{affaire_id}",
+                "parse_debug": "/api/finance/debug/parse",
+                "health": "/health",
+            },
+        }
 
     def get_finance_dataset(self) -> Dict[str, Any]:
         workbook_path = self.config["FINANCE_WORKBOOK_PATH"]
