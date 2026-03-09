@@ -121,6 +121,10 @@ class FinanceASGIApp:
         path = unquote(scope.get("path", ""))
 
         if method == "GET" and path == "/":
+            await self._send_html(send, 200, self._service_homepage())
+            return
+
+        if method == "GET" and path == "/api/finance":
             await self._send_json(send, 200, self._service_index())
             return
 
@@ -179,17 +183,45 @@ class FinanceASGIApp:
         )
         await send({"type": "http.response.body", "body": body})
 
+
+    async def _send_html(self, send: Any, status: int, html: str) -> None:
+        body = html.encode("utf-8")
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [[b"content-type", b"text/html; charset=utf-8"]],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
     def _service_index(self) -> Dict[str, Any]:
         return {
             "service": "finance",
             "status": "ok",
             "endpoints": {
+                "service_index": "/api/finance",
                 "list_affaires": "/api/finance/affaires",
                 "affaire_detail": "/api/finance/affaires/{affaire_id}",
                 "parse_debug": "/api/finance/debug/parse",
                 "health": "/health",
             },
         }
+
+    def _service_homepage(self) -> str:
+        return """<!doctype html>
+<html lang="fr">
+<head><meta charset="utf-8"><title>Finance API</title></head>
+<body>
+<h1>Finance API</h1>
+<ul>
+  <li><a href="/api/finance">GET /api/finance</a></li>
+  <li><a href="/health">GET /health</a></li>
+  <li><a href="/api/finance/affaires">GET /api/finance/affaires</a></li>
+  <li><a href="/api/finance/debug/parse">GET /api/finance/debug/parse</a></li>
+</ul>
+</body>
+</html>"""
 
     def get_finance_dataset(self) -> Dict[str, Any]:
         workbook_path = self.config["FINANCE_WORKBOOK_PATH"]
