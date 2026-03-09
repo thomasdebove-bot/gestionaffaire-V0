@@ -1168,12 +1168,18 @@ async function init(){
   try{
     await loadAffaires('');
     const params=new URLSearchParams(window.location.search);
-    const pre=params.get('affaire_id')||localStorage.getItem('selectedAffaireId')||'';
-    if(pre){
-      state.selectedId=pre;
+    const urlId=params.get('affaire_id');
+    const initialId=urlId||localStorage.getItem('selectedAffaireId')||'';
+    if(initialId){
+      state.selectedId=initialId;
       const sel=document.getElementById('affaireSelect');
-      if(state.affaires.some(x=>x.affaire_id===pre)){sel.value=pre;}
-      await loadBoard(pre);
+      const found=state.affaires.find(a=>a.affaire_id===initialId);
+      if(found){
+        state.selectedId=found.affaire_id;
+        sel.value=found.affaire_id;
+        localStorage.setItem('selectedAffaireId',found.affaire_id);
+      }
+      await loadBoard(initialId);
     }else{renderBoard();}
     document.getElementById('searchInput').addEventListener('input',async e=>{await loadAffaires(e.target.value||'');});
     document.getElementById('affaireSelect').addEventListener('change',async e=>{await loadBoard(e.target.value||'');});
