@@ -516,7 +516,173 @@ class FinanceService:
         return out
 
 
+
+class MetronomeService:
+    def __init__(self, base_path: str) -> None:
+        self.base_path = Path(base_path)
+        self._lock = Lock()
+        self._cache: Dict[str, Any] = {"loaded": False, "tables": {}, "mtime": {}}
+
+    def _read_csv_rows(self, path: Path) -> List[Dict[str, str]]:
+        raw = path.read_bytes()
+        for enc in ("utf-8-sig", "cp1252", "latin-1"):
+            try:
+                text = raw.decode(enc)
+                break
+            except Exception:
+                continue
+        else:
+            text = raw.decode("utf-8", errors="ignore")
+        return list(csv.DictReader(io.StringIO(text), delimiter=","))
+
+    def _table_path(self, key: str) -> Path:
+        return self.base_path / METRONOME_FILES[key]
+
+    def _current_mtime(self) -> Dict[str, Optional[float]]:
+        out: Dict[str, Optional[float]] = {}
+        for key in METRONOME_FILES:
+            p = self._table_path(key)
+            try:
+                out[key] = p.stat().st_mtime
+            except OSError:
+                out[key] = None
+        return out
+
+    def _ensure_loaded(self) -> Dict[str, Any]:
+        with self._lock:
+            mt = self._current_mtime()
+            if self._cache.get("loaded") and self._cache.get("mtime") == mt:
+                return dict(self._cache)
+
+            tables: Dict[str, List[Dict[str, str]]] = {}
+            missing = []
+            for key in METRONOME_FILES:
+                p = self._table_path(key)
+                if not p.exists():
+                    missing.append(str(p))
+                    tables[key] = []
+                    continue
+                tables[key] = self._read_csv_rows(p)
+
+            self._cache = {
+                "loaded": True,
+                "tables": tables,
+                "mtime": mt,
+                "missing": missing,
+                "loaded_at": now_iso(),
+            }
+            return dict(self._cache)
+
+    @staticmethod
+    def _idx(rows: List[Dict[str, str]], key: str = "ID") -> Dict[str, Dict[str, str]]:
+        out: Dict[str, Dict[str, str]] = {}
+        for r in rows:
+            k = clean_text(r.get(key))
+            if k:
+                out[k] = r
+        return out
+
+    def build_project_board(self, project_name: str) -> Dict[str, Any]:
+        cache = self._ensure_loaded()
+        t = cache.get("tables", {})
+        projects = t.get("projects", [])
+        entries = t.get("entries", [])
+        meetings = self._idx(t.get("meetings", []))
+        areas = self._idx(t.get("areas", []))
+        packages = self._idx(t.get("packages", []))
+        companies = self._idx(t.get("companies", []))
+        users = self._idx(t.get("users", []))
+
+        comments_by_entry: Dict[str, List[str]] = {}
+        for c in t.get("comments", []):
+            eid = clean_text(c.get("Entry"))
+            txt = clean_text(c.get("Comment") or c.get("Entry") or c.get("Text"))
+            if eid and txt:
+                comments_by_entry.setdefault(eid, []).append(txt)
+
+        proj = None
+        target = clean_text(project_name)
+        for p in projects:
+            if clean_text(p.get("Name")) == target:
+                proj = p
+                break
+        if not proj:
+            return {
+                "ok": False,
+                "project_name": target,
+                "reason": "project_not_found",
+                "missing_files": cache.get("missing", []),
+            }
+
+        project_id = clean_text(proj.get("ID"))
+        rows = []
+        today = datetime.now().date()
+
+        for e in entries:
+            if clean_text(e.get("Project")) != project_id:
+                continue
+            status = clean_text(e.get("Status")).lower()
+            if status in {"closed", "close", "done", "termine", "terminé"}:
+                continue
+
+            entry_id = clean_text(e.get("ID"))
+            area = areas.get(clean_text(e.get("Area")), {})
+            pkg = packages.get(clean_text(e.get("Package")), {})
+            company = companies.get(clean_text(e.get("Company")), {})
+            user = users.get(clean_text(e.get("Assignee")), {})
+            meeting = meetings.get(clean_text(e.get("Meeting")), {})
+            due = clean_text(e.get("DueDate"))
+            meeting_date = clean_text(meeting.get("Date"))
+
+            overdue = False
+            if due:
+                for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d"):
+                    try:
+                        overdue = datetime.strptime(due[:10], fmt).date() < today
+                        break
+                    except Exception:
+                        continue
+
+            rows.append({
+                "zone": clean_text(area.get("Name")),
+                "lot": clean_text(pkg.get("Name")),
+                "sujet": clean_text(e.get("Title")),
+                "entreprise": clean_text(company.get("Name")),
+                "responsable": clean_text(user.get("Name")),
+                "statut": clean_text(e.get("Status")),
+                "date_echeance": due,
+                "reunion_origine": meeting_date,
+                "commentaire": " | ".join(comments_by_entry.get(entry_id, [])),
+                "overdue": overdue,
+            })
+
+        def count_by(field: str) -> List[Dict[str, Any]]:
+            agg: Dict[str, int] = {}
+            for r in rows:
+                k = clean_text(r.get(field)) or "Non défini"
+                agg[k] = agg.get(k, 0) + 1
+            return [{"label": k, "count": v} for k, v in sorted(agg.items(), key=lambda x: (-x[1], x[0]))]
+
+        by_meeting = count_by("reunion_origine")
+        return {
+            "ok": True,
+            "project_name": target,
+            "project_id": project_id,
+            "kpis": {
+                "open_topics": len(rows),
+                "overdue_topics": sum(1 for r in rows if r.get("overdue")),
+                "by_company": count_by("entreprise"),
+                "by_package": count_by("lot"),
+                "by_meeting": by_meeting,
+            },
+            "rows": rows,
+            "missing_files": cache.get("missing", []),
+            "loaded_at": cache.get("loaded_at"),
+        }
+
+
 service = FinanceService(WORKBOOK_PATH, SHEET_NAME, CACHE_FILE)
+metronome_service = MetronomeService(METRONOME_BASE_PATH)
 
 
 def landing_html() -> str:
@@ -566,7 +732,7 @@ def landing_html() -> str:
         <h3>Finances</h3><p>Cockpit financier détaillé de l'affaire.</p>
         <a id='financeLink' class='btn disabled' href='javascript:void(0)' aria-disabled='true'>Ouvrir Finances</a>
       </article>
-      <article class='card'><h3>Gestion de projet</h3><p>Planification, jalons et coordination.</p><button class='btn disabled' disabled>Ouvrir</button></article>
+      <article class='card'><h3>Gestion de projet</h3><p>Planification, jalons et coordination.</p><a id='pmLink' class='btn disabled' href='javascript:void(0)' aria-disabled='true'>Ouvrir</a></article>
       <article class='card'><h3>Imputation</h3><p>Suivi des temps et affectations.</p><button class='btn disabled' disabled>Ouvrir</button></article>
     </section>
   </div>
@@ -574,7 +740,7 @@ def landing_html() -> str:
 const state={projects:[],selectedId:'',selectedLabel:''};
 function esc(v){return String(v||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
 function setModuleLink(id,base){const el=document.getElementById(id);if(state.selectedId){el.className='btn primary';el.href=`/${base}?affaire_id=${encodeURIComponent(state.selectedId)}`;el.removeAttribute('aria-disabled');}else{el.className='btn disabled';el.href='javascript:void(0)';el.setAttribute('aria-disabled','true');}}
-function updateUi(){document.getElementById('projectBadge').textContent=state.selectedLabel?`Affaire : ${state.selectedLabel}`:'Aucune affaire sélectionnée';document.getElementById('state').textContent=state.selectedLabel?`Vous naviguez sur l'affaire ${state.selectedLabel}.`:'Sélectionnez une affaire pour activer les modules.';setModuleLink('financeLink','finance');setModuleLink('dashboardLink','dashboard');if(state.selectedId){localStorage.setItem('selectedAffaireId',state.selectedId);} }
+function updateUi(){document.getElementById('projectBadge').textContent=state.selectedLabel?`Affaire : ${state.selectedLabel}`:'Aucune affaire sélectionnée';document.getElementById('state').textContent=state.selectedLabel?`Vous naviguez sur l'affaire ${state.selectedLabel}.`:'Sélectionnez une affaire pour activer les modules.';setModuleLink('financeLink','finance');setModuleLink('dashboardLink','dashboard');setModuleLink('pmLink','gestion-projet');if(state.selectedId){localStorage.setItem('selectedAffaireId',state.selectedId);} }
 async function loadProjects(){try{const res=await fetch('/api/finance/affaires');const data=await res.json();state.projects=(data.items||[]).map(x=>({id:x.affaire_id,label:x.display_name})).filter(x=>x.id&&x.label).sort((a,b)=>a.label.localeCompare(b.label,'fr'));}catch(_){state.projects=[];}
 const list=document.getElementById('projectList');list.innerHTML=state.projects.map(p=>`<option value="${esc(p.label)}"></option>`).join('');const savedId=localStorage.getItem('selectedAffaireId')||'';const selected=state.projects.find(x=>x.id===savedId);if(selected){state.selectedId=selected.id;state.selectedLabel=selected.label;document.getElementById('projectSearch').value=selected.label;}updateUi();}
 document.getElementById('projectSearch').addEventListener('input',ev=>{const q=(ev.target.value||'').trim().toLowerCase();const selected=state.projects.find(p=>p.label.toLowerCase()===q)||state.projects.find(p=>p.label.toLowerCase().startsWith(q));state.selectedId=selected?.id||'';state.selectedLabel=selected?.label||'';updateUi();});
@@ -625,6 +791,7 @@ def finance_html() -> str:
       <button id='reloadBtn' class='btn primary'>Reconstruire le cache</button>
       <button id='exportBtn' class='btn dark' disabled>Exporter CSV</button>
       <a id='dashboardBtn' class='btn dark' href='/dashboard'>Tableau de bord</a>
+      <a id='pmBtn' class='btn dark' href='/gestion-projet'>Gestion de projet</a>
       <a class='btn dark' href='/'>Accueil</a>
       <div id='cacheBadge' class='badge'><span class='dot idle'></span><span>Cache : attente</span></div>
     </div>
@@ -679,14 +846,14 @@ const state={cacheStatus:null,affaires:[],selectedAffaireId:"",selectedAffaire:n
 function euro(v){return new Intl.NumberFormat('fr-FR',{style:'currency',currency:'EUR',maximumFractionDigits:0}).format(Number(v||0));}
 function pct(v){return new Intl.NumberFormat('fr-FR',{style:'percent',maximumFractionDigits:1}).format(Number(v||0));}
 function fmt(v){return new Intl.NumberFormat('fr-FR',{maximumFractionDigits:0}).format(Number(v||0));}
-function esc(v){return String(v??'').replace(/[&<>"]/g,s=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[s]));}
+function esc(v){return String(v??'').replace(/[&<>]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[ch]||ch));}
 function showError(msg){const b=document.getElementById('errorBox');b.textContent=msg||'Erreur';b.style.display='block';}
 function clearError(){document.getElementById('errorBox').style.display='none';}
 function showNotice(msg){const b=document.getElementById('noticeBox');b.textContent=msg||'';b.style.display=msg?'block':'none';}
 function setCacheBadge(status,label){const c=status==='ready'?'ready':status==='building'?'building':status==='error'?'error':'idle';document.getElementById('cacheBadge').innerHTML=`<span class="dot ${c}"></span><span>${esc(label)}</span>`;}
 async function api(url,options){const r=await fetch(url,options||{});const data=await r.json().catch(()=>({}));if(!r.ok) throw new Error(data.error||data.detail||data.message||`HTTP ${r.status}`);return data;}
 function healthClass(a){const reste=Number(a.reste_a_facturer||0),taux=Number(a.taux_avancement_financier||0);if(taux>=0.9)return{label:'Presque soldée',cls:'ok'};if(reste>0&&taux<0.35)return{label:'À surveiller',cls:'warn'};if(reste<0)return{label:'Incohérence à vérifier',cls:'bad'};return{label:'Stable',cls:'ok'};}
-async function loadCacheStatus(){const d=await api('/api/finance/cache-status');state.cacheStatus=d;const label=d.status==='ready'?`Cache prêt · ${d.affaires_count} affaires`:d.status==='building'?'Cache en reconstruction…':`Cache : ${d.status}`;setCacheBadge(d.status,label);document.getElementById('metaCache').textContent=d.generated_at||'-';document.getElementById('statusMeta').textContent=`${d.affaires_count||0} affaires · ${d.rows_kept||0} lignes utiles · ${d.generated_at||'pas encore généré'}`;}
+async function loadCacheStatus(){const d=await api('/api/finance/cache-status');state.cacheStatus=d;const label=d.status==='ready'?`Cache prêt · ${d.affaires_count} affaires`:d.status==='building'?'Cache en reconstruction…':`Cache : ${d.status}`;setCacheBadge(d.status,label);document.getElementById('statusMeta').textContent=`${d.affaires_count||0} affaires · ${d.rows_kept||0} lignes utiles · ${d.generated_at||'pas encore généré'}`;}
 async function loadAffairesList(search=''){const d=await api(`/api/finance/affaires?search=${encodeURIComponent(search)}`);state.affaires=d.items||[];const sel=document.getElementById('affaireSelect');const prev=state.selectedAffaireId;sel.innerHTML=`<option value=''>Sélectionnez une affaire</option>`+state.affaires.map(x=>`<option value="${esc(x.affaire_id)}">${esc(x.display_name)}</option>`).join('');if(prev&&state.affaires.some(x=>x.affaire_id===prev)){sel.value=prev;}else{state.selectedAffaireId='';state.selectedAffaire=null;}showNotice(state.affaires.length?`${state.affaires.length} affaire(s) disponible(s)`:'Aucune affaire trouvée pour ce filtre.');}
 async function loadSelectedAffaire(id){if(!id){state.selectedAffaireId='';state.selectedAffaire=null;renderAll();return;}const d=await api(`/api/finance/affaire/${encodeURIComponent(id)}`);state.selectedAffaireId=id;state.selectedAffaire=d.affaire||null;renderAll();localStorage.setItem('selectedAffaireId',id);}
 function setHeroEmpty(){document.getElementById('heroTitle').textContent='Sélectionnez une affaire';document.getElementById('heroSubtitle').textContent='Le cockpit se remplit à partir du cache du tableau activité.';document.getElementById('metaClient').textContent='-';document.getElementById('metaProject').textContent='-';document.getElementById('metaMissions').textContent='-';document.getElementById('metaStatus').textContent='🟠 Attention';const h=document.getElementById('heroHealth');h.textContent='En attente';h.className='health warn';}
@@ -710,7 +877,7 @@ function renderCumulativeChart(){const root=document.getElementById('cumulativeC
 function renderMonthlyTable(){const root=document.getElementById('monthlyTableWrap');const a=state.selectedAffaire;if(!a){root.innerHTML=`<div class='empty'>Sélectionnez une affaire pour afficher le détail mensuel.</div>`;return;}let rows='';MONTHS.forEach(m=>{const pre=Number((((a.mensuel||{})[m]||{}).previsionnel)||0),fac=Number((((a.mensuel||{})[m]||{}).facture)||0),ec=fac-pre;rows+=`<tr><td>${MONTH_LABELS[m]}</td><td class='num'>${euro(pre)}</td><td class='num'>${euro(fac)}</td><td class='num delta ${ec>=0?'pos':'neg'}'>${euro(ec)}</td></tr>`;});rows+=`<tr><td><strong>Total</strong></td><td class='num'><strong>${euro(a.total_previsionnel||0)}</strong></td><td class='num'><strong>${euro(a.total_facture||0)}</strong></td><td class='num delta ${Number(a.ecart_previsionnel_vs_facture||0)>=0?'pos':'neg'}'><strong>${euro(a.ecart_previsionnel_vs_facture||0)}</strong></td></tr>`;root.innerHTML=`<table><thead><tr><th>Mois</th><th class='num'>Prévisionnel</th><th class='num'>Facturé</th><th class='num'>Écart</th></tr></thead><tbody>${rows}</tbody></table>`;}
 function renderMissions(){const root=document.getElementById('missionsTableWrap');const meta=document.getElementById('missionsMeta');const a=state.selectedAffaire;if(!a){meta.textContent='0 mission';root.innerHTML=`<div class='empty'>Sélectionnez une affaire pour afficher les missions.</div>`;return;}const missions=a.missions||[];meta.textContent=`${missions.length} mission(s)`;if(!missions.length){root.innerHTML=`<div class='empty'>Aucune mission détaillée sur cette affaire.</div>`;return;}root.innerHTML=`<table><thead><tr><th>Tag</th><th>Mission</th><th>N°</th><th class='num'>Commande</th><th class='num'>🧾 Facturation totale</th><th class='num'>Reste</th><th class='num'>Prévisionnel</th><th class='num'>Facturé</th></tr></thead><tbody>${missions.map(m=>`<tr><td>${esc(m.tag||'')}</td><td>${esc(m.label||'')}</td><td>${esc(m.numero||'')}</td><td class='num'>${euro(m.commande_ht)}</td><td class='num'>${euro(m.facturation_totale||((m.anteriorite||0)+(m.facture_2026||m.facturation_cumulee_2026||0)))}</td><td class='num'>${euro(m.reste_a_facturer)}</td><td class='num'>${euro(m.total_previsionnel)}</td><td class='num'>${euro(m.total_facture)}</td></tr>`).join('')}</tbody></table>`;}
 function renderInsights(){const root=document.getElementById('insightsBox');const a=state.selectedAffaire;if(!a){root.innerHTML=`<div class='empty' style='width:100%'>Sélectionnez une affaire.</div>`;return;}const items=a.insights||[];root.innerHTML=items.map(x=>`<div class='insight'>${esc(x)}</div>`).join('');}
-function renderAll(){renderHero();renderKpis();renderFinanceChart();renderCumulativeChart();renderMonthlyTable();renderMissions();renderInsights();document.getElementById('exportBtn').disabled=!state.selectedAffaireId;const dash=document.getElementById('dashboardBtn');dash.href=state.selectedAffaireId?`/dashboard?affaire_id=${encodeURIComponent(state.selectedAffaireId)}`:'/dashboard';}
+function renderAll(){renderHero();renderKpis();renderFinanceChart();renderCumulativeChart();renderMonthlyTable();renderMissions();renderInsights();document.getElementById('exportBtn').disabled=!state.selectedAffaireId;const dash=document.getElementById('dashboardBtn');dash.href=state.selectedAffaireId?`/dashboard?affaire_id=${encodeURIComponent(state.selectedAffaireId)}`:'/dashboard';const pm=document.getElementById('pmBtn');pm.href=state.selectedAffaireId?`/gestion-projet?affaire_id=${encodeURIComponent(state.selectedAffaireId)}`:'/gestion-projet';}
 async function rebuildCache(){clearError();showNotice('Reconstruction du cache en cours…');await api('/api/finance/rebuild-cache',{method:'POST'});await loadCacheStatus();await loadAffairesList(document.getElementById('searchInput').value||'');if(state.selectedAffaireId&&state.affaires.some(x=>x.affaire_id===state.selectedAffaireId)){await loadSelectedAffaire(state.selectedAffaireId);}else{state.selectedAffaireId='';state.selectedAffaire=null;renderAll();}showNotice('Cache reconstruit avec succès.');}
 async function initFinancePage(){clearError();try{await loadCacheStatus();await loadAffairesList('');const params=new URLSearchParams(window.location.search);const affairFromUrl=params.get('affaire_id');const affairFromStorage=localStorage.getItem('selectedAffaireId')||'';const preselected=affairFromUrl||affairFromStorage;if(preselected&&state.affaires.some(x=>x.affaire_id===preselected)){document.getElementById('affaireSelect').value=preselected;await loadSelectedAffaire(preselected);}else{renderAll();}}catch(err){showError(err.message||'Erreur de chargement');}
 document.getElementById('searchInput').addEventListener('input',async ev=>{clearError();try{await loadAffairesList(ev.target.value||'');if(state.selectedAffaireId&&!state.affaires.some(x=>x.affaire_id===state.selectedAffaireId)){state.selectedAffaireId='';state.selectedAffaire=null;document.getElementById('affaireSelect').value='';renderAll();}}catch(err){showError(err.message||'Erreur de recherche');}});
@@ -722,6 +889,63 @@ initFinancePage();
 </body>
 </html>
 """
+
+
+def gestion_projet_html() -> str:
+    return """<!doctype html>
+<html lang='fr'>
+<head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Gestion de projet</title>
+<style>
+:root{--line:#dfe5ef;--ink:#122033;--muted:#6e7a90;--accent:#ef8d00;--panel:#fff;--shadow:0 12px 34px rgba(18,32,51,.07)}
+*{box-sizing:border-box}body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:#f3f6fb;color:var(--ink)}
+.wrap{max-width:1480px;margin:20px auto;padding:0 16px}.top,.kpis,.section{background:var(--panel);border:1px solid var(--line);border-radius:22px;box-shadow:var(--shadow)}
+.top{padding:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}.search,.select{height:44px;border:1px solid var(--line);border-radius:12px;padding:0 12px;min-width:280px}
+.btn{height:44px;border-radius:12px;border:none;padding:0 14px;background:var(--accent);color:#fff;text-decoration:none;display:inline-flex;align-items:center;font-weight:800;cursor:pointer}
+.kpis{margin-top:12px;padding:14px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.k{border:1px solid var(--line);border-radius:14px;padding:14px;background:#fbfdff}.k .v{font-size:34px;font-weight:900;margin-top:6px}
+.section{margin-top:12px;padding:14px}.subgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:14px}table{width:100%;border-collapse:collapse}th,td{padding:10px 12px;border-bottom:1px solid var(--line);font-size:13px;text-align:left}th{background:#f7f9fc;font-size:12px;color:#5b6880;text-transform:uppercase}.small{color:var(--muted);font-size:13px}
+.bar{height:10px;background:#edf1f8;border-radius:999px;overflow:hidden}.fill{height:100%;background:#ef8d00}
+@media (max-width:980px){.grid{grid-template-columns:repeat(2,1fr)}.subgrid{grid-template-columns:1fr}}@media (max-width:640px){.grid{grid-template-columns:1fr}}
+</style></head>
+<body><div class='wrap'>
+  <div class='top'>
+    <a class='btn' href='/'>Accueil</a>
+    <input id='searchInput' class='search' type='search' placeholder='Rechercher une affaire'>
+    <select id='affaireSelect' class='select'><option value=''>Sélectionnez une affaire</option></select>
+    <a id='financeBtn' class='btn' href='/finance'>Finances</a>
+    <a id='dashboardBtn' class='btn' href='/dashboard'>Tableau de bord</a>
+  </div>
+
+  <div class='kpis'><div class='grid'>
+    <div class='k'><div class='small'>Sujets ouverts</div><div id='kOpen' class='v'>0</div></div>
+    <div class='k'><div class='small'>Sujets en retard</div><div id='kLate' class='v'>0</div></div>
+    <div class='k'><div class='small'>Projet METRONOME</div><div id='kProject' class='v' style='font-size:22px'>-</div></div>
+    <div class='k'><div class='small'>Chargement</div><div id='kLoad' class='v' style='font-size:18px'>-</div></div>
+  </div></div>
+
+  <div class='section'><div class='subgrid'>
+    <div><h3>🔴 Heatmap entreprises</h3><div id='byCompany'></div></div>
+    <div><h3>🟠 Heatmap lots</h3><div id='byPackage'></div></div>
+  </div></div>
+
+  <div class='section'><h3>🔵 Évolution des sujets (par réunion)</h3><div id='byMeeting'></div></div>
+
+  <div class='section'><h3>Tableau de pilotage projet</h3><div id='boardTable' class='table-wrap'><div class='small' style='padding:12px'>Sélectionnez une affaire.</div></div></div>
+</div>
+<script>
+const state={affaires:[],selectedId:'',board:null};
+function esc(v){return String(v??'').replace(/[&<>]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[ch]||ch));}
+async function api(u){const r=await fetch(u);const d=await r.json();if(!r.ok) throw new Error(d.detail||'Erreur API');return d;}
+function renderBars(id,items){const root=document.getElementById(id);if(!items||!items.length){root.innerHTML="<div class='small'>Aucune donnée</div>";return;}const max=Math.max(1,...items.map(x=>Number(x.count||0)));root.innerHTML=items.map(x=>`<div style='margin:8px 0'><div style='display:flex;justify-content:space-between;gap:8px'><span>${esc(x.label)}</span><strong>${x.count}</strong></div><div class='bar'><div class='fill' style='width:${(Number(x.count||0)/max)*100}%'></div></div></div>`).join('');}
+function renderTable(rows){const root=document.getElementById('boardTable');if(!rows||!rows.length){root.innerHTML="<div class='small' style='padding:12px'>Aucun sujet ouvert.</div>";return;}root.innerHTML=`<table><thead><tr><th>Zone</th><th>Lot</th><th>Sujet</th><th>Entreprise</th><th>Responsable</th><th>Statut</th><th>Date échéance</th><th>Réunion origine</th><th>Commentaire</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${esc(r.zone)}</td><td>${esc(r.lot)}</td><td>${esc(r.sujet)}</td><td>${esc(r.entreprise)}</td><td>${esc(r.responsable)}</td><td>${esc(r.statut)}</td><td>${esc(r.date_echeance)}</td><td>${esc(r.reunion_origine)}</td><td>${esc(r.commentaire)}</td></tr>`).join('')}</tbody></table>`;}
+function renderBoard(){const b=state.board;if(!b||!b.ok){document.getElementById('kOpen').textContent='0';document.getElementById('kLate').textContent='0';document.getElementById('kProject').textContent='Non trouvé';renderBars('byCompany',[]);renderBars('byPackage',[]);renderBars('byMeeting',[]);renderTable([]);return;}const k=b.kpis||{};document.getElementById('kOpen').textContent=String(k.open_topics||0);document.getElementById('kLate').textContent=String(k.overdue_topics||0);document.getElementById('kProject').textContent=b.project_name||'-';document.getElementById('kLoad').textContent=b.loaded_at||'-';renderBars('byCompany',k.by_company||[]);renderBars('byPackage',k.by_package||[]);renderBars('byMeeting',k.by_meeting||[]);renderTable(b.rows||[]);} 
+async function loadAffaires(search=''){const d=await api(`/api/finance/affaires?search=${encodeURIComponent(search)}`);state.affaires=d.items||[];const sel=document.getElementById('affaireSelect');sel.innerHTML=`<option value=''>Sélectionnez une affaire</option>`+state.affaires.map(x=>`<option value="${esc(x.affaire_id)}">${esc(x.display_name)}</option>`).join('');if(state.selectedId&&state.affaires.some(x=>x.affaire_id===state.selectedId)){sel.value=state.selectedId;}}
+async function loadBoard(id){if(!id){state.selectedId='';state.board=null;renderBoard();return;}state.selectedId=id;localStorage.setItem('selectedAffaireId',id);document.getElementById('financeBtn').href=`/finance?affaire_id=${encodeURIComponent(id)}`;document.getElementById('dashboardBtn').href=`/dashboard?affaire_id=${encodeURIComponent(id)}`;state.board=await api(`/api/project-management/board?affaire_id=${encodeURIComponent(id)}`);renderBoard();}
+async function init(){await loadAffaires('');const params=new URLSearchParams(window.location.search);const pre=params.get('affaire_id')||localStorage.getItem('selectedAffaireId')||'';if(pre&&state.affaires.some(x=>x.affaire_id===pre)){document.getElementById('affaireSelect').value=pre;await loadBoard(pre);}else{renderBoard();}
+document.getElementById('searchInput').addEventListener('input',async e=>loadAffaires(e.target.value||''));document.getElementById('affaireSelect').addEventListener('change',async e=>loadBoard(e.target.value||''));}
+init();
+</script></body></html>"""
+
 
 
 def dashboard_html() -> str:
@@ -747,6 +971,7 @@ def dashboard_html() -> str:
     <input id='searchInput' class='search' type='search' placeholder='Rechercher une affaire'>
     <select id='affaireSelect' class='select'><option value=''>Sélectionnez une affaire</option></select>
     <a id='financeBtn' class='btn' href='/finance'>Finances</a>
+    <a id='pmBtn' class='btn' href='/gestion-projet'>Gestion de projet</a>
     <button id='exportBtn' class='btn' disabled>Exporter CSV</button>
   </div>
   <div class='hero'>
@@ -771,7 +996,7 @@ async function api(u){const r=await fetch(u);const d=await r.json();if(!r.ok) th
 async function loadAffairesList(search=''){const d=await api(`/api/finance/affaires?search=${encodeURIComponent(search)}`);state.affaires=d.items||[];const sel=document.getElementById('affaireSelect');sel.innerHTML=`<option value=''>Sélectionnez une affaire</option>`+state.affaires.map(x=>`<option value="${esc(x.affaire_id)}">${esc(x.display_name)}</option>`).join('');if(state.selectedId&&state.affaires.some(x=>x.affaire_id===state.selectedId)){sel.value=state.selectedId;}}
 async function loadSelectedAffaire(id){if(!id){state.selectedId='';state.selected=null;render();return;}const d=await api(`/api/finance/affaire/${encodeURIComponent(id)}`);state.selectedId=id;state.selected=d.affaire;localStorage.setItem('selectedAffaireId',id);render();}
 function renderChart(){const root=document.getElementById('chart');const a=state.selected;if(!a){root.innerHTML='';return;}const monthIdx=(new Date().getMonth());const data=MONTHS.slice(monthIdx).map(m=>({label:MONTH_LABELS[m],pre:Number(((a.mensuel||{})[m]||{}).previsionnel||0),fac:Number(((a.mensuel||{})[m]||{}).facture||0)}));const max=Math.max(1,...data.flatMap(x=>[x.pre,x.fac]));const left=56,top=20,width=880,height=240,step=width/Math.max(1,data.length),bw=step*0.46;let out='';for(let i=0;i<=4;i++){const y=top+(height/4)*i;out+=`<line x1="${left}" y1="${y}" x2="${left+width}" y2="${y}" stroke="#dfe5ef"/><text x="${left-8}" y="${y+4}" text-anchor="end" fill="#8190a8" font-size="12">${Math.round(max*(1-i/4))}</text>`;}const pts=[];data.forEach((d,i)=>{const x=left+i*step+(step-bw)/2;const h=(d.pre/max)*height;const y=top+height-h;const py=top+height-(d.fac/max)*height;out+=`<rect x="${x}" y="${y}" width="${bw}" height="${Math.max(h,1)}" rx="7" fill="#fbd8a8"></rect><text x="${x+bw/2}" y="${top+height+18}" text-anchor="middle" fill="#6f7f98" font-size="12">${d.label}</text>`;pts.push(`${x+bw/2},${py}`);});out+=`<polyline points="${pts.join(' ')}" fill="none" stroke="#ef8d00" stroke-width="4"/>`;root.innerHTML=out;}
-function render(){const a=state.selected;document.getElementById('financeBtn').href=state.selectedId?`/finance?affaire_id=${encodeURIComponent(state.selectedId)}`:'/finance';document.getElementById('exportBtn').disabled=!state.selectedId;document.getElementById('title').textContent=a?(a.display_name||'-'):'Sélectionnez une affaire';document.getElementById('subtitle').textContent=a?`Client ${a.client||'-'} · ${a.affaire||'-'}`:'Synthèse principale : client, commande, antériorité, facturé 2026, facturation totale et reste à facturer.';document.getElementById('kCommande').textContent=euro(a?a.commande_ht:0);document.getElementById('kFacture').textContent=euro(a?(a.facturation_totale||((a.anteriorite||0)+(a.facture_2026||a.facturation_cumulee_2026||0))):0);document.getElementById('kReste').textContent=euro(a?a.reste_a_facturer:0);renderChart();}
+function render(){const a=state.selected;document.getElementById('financeBtn').href=state.selectedId?`/finance?affaire_id=${encodeURIComponent(state.selectedId)}`:'/finance';document.getElementById('pmBtn').href=state.selectedId?`/gestion-projet?affaire_id=${encodeURIComponent(state.selectedId)}`:'/gestion-projet';document.getElementById('exportBtn').disabled=!state.selectedId;document.getElementById('title').textContent=a?(a.display_name||'-'):'Sélectionnez une affaire';document.getElementById('subtitle').textContent=a?`Client ${a.client||'-'} · ${a.affaire||'-'}`:'Synthèse principale : client, commande, antériorité, facturé 2026, facturation totale et reste à facturer.';document.getElementById('kCommande').textContent=euro(a?a.commande_ht:0);document.getElementById('kFacture').textContent=euro(a?(a.facturation_totale||((a.anteriorite||0)+(a.facture_2026||a.facturation_cumulee_2026||0))):0);document.getElementById('kReste').textContent=euro(a?a.reste_a_facturer:0);renderChart();}
 async function init(){await loadAffairesList('');const params=new URLSearchParams(window.location.search);const pre=params.get('affaire_id')||localStorage.getItem('selectedAffaireId')||'';if(pre&&state.affaires.some(x=>x.affaire_id===pre)){document.getElementById('affaireSelect').value=pre;await loadSelectedAffaire(pre);}else{render();}document.getElementById('searchInput').addEventListener('input',async e=>{await loadAffairesList(e.target.value||'');});document.getElementById('affaireSelect').addEventListener('change',async e=>loadSelectedAffaire(e.target.value||''));document.getElementById('exportBtn').addEventListener('click',()=>{if(state.selectedId)window.location.href=`/api/finance/affaire/${encodeURIComponent(state.selectedId)}/export-csv`;});}
 init();
 </script>
@@ -802,6 +1027,11 @@ def dashboard_page():
     return dashboard_html()
 
 
+@app.get("/gestion-projet", response_class=HTMLResponse)
+def gestion_projet_page():
+    return gestion_projet_html()
+
+
 @app.get("/health", response_class=JSONResponse)
 def health():
     return {
@@ -822,6 +1052,7 @@ def finance_index():
             "landing": "/",
             "finance_ui": "/finance",
             "dashboard_ui": "/dashboard",
+            "project_management_ui": "/gestion-projet",
             "cache_status": "/api/finance/cache-status",
             "rebuild_cache": "/api/finance/rebuild-cache",
             "affaires": "/api/finance/affaires?search=...",
@@ -865,6 +1096,20 @@ def api_affaire_detail(affaire_id: str):
     if not item:
         raise HTTPException(status_code=404, detail=f"Affaire introuvable : {affaire_id}")
     return {"ok": True, "affaire": item}
+
+
+@app.get("/api/project-management/board", response_class=JSONResponse)
+def api_project_management_board(affaire_id: str = Query(default=""), affaire_name: str = Query(default="")):
+    name = clean_text(affaire_name)
+    if affaire_id and not name:
+        cache = service.get_finance_cache()
+        item = cache.get("items", {}).get(affaire_id)
+        if not item:
+            raise HTTPException(status_code=404, detail=f"Affaire introuvable : {affaire_id}")
+        name = clean_text(item.get("affaire"))
+    if not name:
+        raise HTTPException(status_code=400, detail="affaire_id ou affaire_name requis")
+    return metronome_service.build_project_board(name)
 
 
 @app.get("/api/finance/affaire/{affaire_id}/export-csv")
