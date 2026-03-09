@@ -392,6 +392,7 @@ class FinanceService:
     def _finalize_affaire(self, affaire: Dict[str, Any]) -> Dict[str, Any]:
         excel_anteriorite = anteriorite_from_row(affaire)
         excel_facture_2026 = clean_number(affaire.get("facturation_cumulee_2026"))
+        excel_reste_a_facturer = clean_number(affaire.get("reste_a_facturer"))
 
         missions = affaire.get("missions") or []
         if missions:
@@ -443,13 +444,20 @@ class FinanceService:
             affaire["anteriorite"] = excel_anteriorite
             affaire["facture_2026"] = excel_facture_2026
             affaire["facturation_totale"] = affaire["anteriorite"] + affaire["facture_2026"]
+            if abs(clean_number(affaire.get("reste_a_facturer"))) < 1e-9 and abs(clean_number(affaire.get("commande_ht"))) > 1e-9:
+                affaire["reste_a_facturer"] = clean_number(affaire.get("commande_ht")) - affaire["facturation_totale"]
             affaire["taux_avancement_financier"] = (affaire["facturation_totale"] / clean_number(affaire.get("commande_ht"))) if clean_number(affaire.get("commande_ht")) else 0.0
 
         affaire["audit"] = {
             "excel_anteriorite": excel_anteriorite,
             "excel_facture_2026": excel_facture_2026,
+            "excel_reste_a_facturer": excel_reste_a_facturer,
             "missions_anteriorite": clean_number(affaire.get("anteriorite", 0)),
             "missions_facture_2026": clean_number(affaire.get("facture_2026", 0)),
+            "missions_reste_a_facturer": clean_number(affaire.get("reste_a_facturer", 0)),
+            "ecart_anteriorite": clean_number(affaire.get("anteriorite", 0)) - excel_anteriorite,
+            "ecart_facture_2026": clean_number(affaire.get("facture_2026", 0)) - excel_facture_2026,
+            "ecart_reste_a_facturer": clean_number(affaire.get("reste_a_facturer", 0)) - excel_reste_a_facturer,
         }
         affaire["insights"] = self.compute_insights(affaire)
         affaire.pop("has_reste_value", None)
