@@ -262,7 +262,6 @@ class FinanceService:
                 current_parent = self._normalize_row(row, current_client=current_client)
                 current_parent["missions"] = []
                 current_parent["_row_index"] = row_index
-                current_parent["_is_parent_row"] = True
                 parent_rows.append(current_parent)
                 rows_kept += 1
                 continue
@@ -281,7 +280,6 @@ class FinanceService:
             if current_parent is None:
                 mission["missions"] = [self._mission_payload_from_affaire(mission)]
                 mission["_row_index"] = row_index
-                mission["_is_parent_row"] = False
                 parent_rows.append(mission)
                 current_parent = mission
             else:
@@ -392,6 +390,9 @@ class FinanceService:
         }
 
     def _finalize_affaire(self, affaire: Dict[str, Any]) -> Dict[str, Any]:
+        excel_anteriorite = anteriorite_from_row(affaire)
+        excel_facture_2026 = clean_number(affaire.get("facturation_cumulee_2026"))
+
         missions = affaire.get("missions") or []
         if missions:
             monthly = month_payload()
@@ -439,13 +440,14 @@ class FinanceService:
             affaire["missions"] = []
             if affaire.get("tag") and not affaire.get("tags"):
                 affaire["tags"] = [affaire["tag"]]
+            affaire["anteriorite"] = excel_anteriorite
+            affaire["facture_2026"] = excel_facture_2026
+            affaire["facturation_totale"] = affaire["anteriorite"] + affaire["facture_2026"]
+            affaire["taux_avancement_financier"] = (affaire["facturation_totale"] / clean_number(affaire.get("commande_ht"))) if clean_number(affaire.get("commande_ht")) else 0.0
 
-        affaire["anteriorite"] = clean_number(affaire.get("anteriorite")) or anteriorite_from_row(affaire)
-        affaire["facture_2026"] = clean_number(affaire.get("facture_2026", affaire.get("facturation_cumulee_2026")))
-        affaire["facturation_totale"] = clean_number(affaire.get("facturation_totale")) or (affaire["anteriorite"] + affaire["facture_2026"])
         affaire["audit"] = {
-            "excel_anteriorite": anteriorite_from_row(affaire),
-            "excel_facture_2026": clean_number(affaire.get("facturation_cumulee_2026")),
+            "excel_anteriorite": excel_anteriorite,
+            "excel_facture_2026": excel_facture_2026,
             "missions_anteriorite": clean_number(affaire.get("anteriorite", 0)),
             "missions_facture_2026": clean_number(affaire.get("facture_2026", 0)),
         }
@@ -453,7 +455,6 @@ class FinanceService:
         affaire.pop("has_reste_value", None)
         affaire.pop("tag", None)
         affaire.pop("_row_index", None)
-        affaire.pop("_is_parent_row", None)
         return affaire
 
     @staticmethod
