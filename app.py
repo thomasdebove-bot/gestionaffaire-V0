@@ -108,11 +108,16 @@ def row_tuple_to_dict(values: tuple) -> Dict[str, Any]:
 
 
 def anteriorite_from_row(row: Dict[str, Any]) -> float:
-    return sum(clean_number(row.get(k)) for k in [
-        "facturation_cumulee_2017", "facturation_cumulee_2018", "facturation_cumulee_2021",
-        "facturation_cumulee_2022", "facturation_cumulee_2023", "facturation_cumulee_2024",
+    keys = [
+        "facturation_cumulee_2017",
+        "facturation_cumulee_2018",
+        "facturation_cumulee_2021",
+        "facturation_cumulee_2022",
+        "facturation_cumulee_2023",
+        "facturation_cumulee_2024",
         "facturation_cumulee_2025",
-    ])
+    ]
+    return sum(clean_number(row.get(k)) for k in keys)
 
 
 def facture_2026_from_row(row: Dict[str, Any]) -> float:
@@ -313,9 +318,8 @@ class FinanceService:
 
         mensuel = month_payload()
         for month in MONTHS:
-            pre_raw = clean_number(row.get(f"{month}_previsionnel"))
+            pre = clean_number(row.get(f"{month}_previsionnel"))
             fac = clean_number(row.get(f"{month}_facture"))
-            pre = pre_raw if abs(fac) < 1e-9 else 0.0
             mensuel[month]["previsionnel"] = pre
             mensuel[month]["facture"] = fac
             mensuel[month]["ecart"] = fac - pre
@@ -397,20 +401,23 @@ class FinanceService:
             facture_2026 = 0.0
             anteriorite = 0.0
             delai_values = []
+
             for mission in missions:
                 commande += clean_number(mission.get("commande_ht"))
-                facture_2026 += clean_number(mission.get("facture_2026", mission.get("facturation_cumulee_2026")))
                 anteriorite += clean_number(mission.get("anteriorite"))
+                facture_2026 += clean_number(mission.get("facture_2026", mission.get("facturation_cumulee_2026")))
                 if clean_number(mission.get("delai_reglement_jours")) > 0:
                     delai_values.append(safe_int(mission.get("delai_reglement_jours")))
                 if mission.get("tag"):
                     tags.append(clean_text(mission["tag"]))
                 if not numero and mission.get("numero"):
                     numero = clean_text(mission["numero"])
+
                 mm = mission.get("mensuel") or {}
                 for month in MONTHS:
-                    monthly[month]["previsionnel"] += clean_number(((mm.get(month) or {}).get("previsionnel")))
-                    monthly[month]["facture"] += clean_number(((mm.get(month) or {}).get("facture")))
+                    monthly[month]["previsionnel"] += clean_number((mm.get(month) or {}).get("previsionnel"))
+                    monthly[month]["facture"] += clean_number((mm.get(month) or {}).get("facture"))
+
             for month in MONTHS:
                 monthly[month]["ecart"] = monthly[month]["facture"] - monthly[month]["previsionnel"]
 
@@ -418,13 +425,10 @@ class FinanceService:
             affaire["anteriorite"] = anteriorite
             affaire["facture_2026"] = facture_2026
             affaire["facturation_totale"] = anteriorite + facture_2026
-            affaire["reste_a_facturer"] = sum(
-                clean_number(m.get("reste_a_facturer"))
-                for m in missions
-            )
-            affaire["facturation_cumulee_2026"] = affaire.get("facture_2026", 0.0)
+            affaire["reste_a_facturer"] = sum(clean_number(m.get("reste_a_facturer")) for m in missions)
+            affaire["facturation_cumulee_2026"] = affaire["facture_2026"]
             affaire["mensuel"] = monthly
-            affaire["tags"] = sorted(set([t for t in tags if t]))
+            affaire["tags"] = sorted(set(t for t in tags if t))
             affaire["numero"] = numero
             affaire["total_previsionnel"] = sum(monthly[m]["previsionnel"] for m in MONTHS)
             affaire["total_facture"] = sum(monthly[m]["facture"] for m in MONTHS)
@@ -439,6 +443,12 @@ class FinanceService:
         affaire["anteriorite"] = clean_number(affaire.get("anteriorite")) or anteriorite_from_row(affaire)
         affaire["facture_2026"] = clean_number(affaire.get("facture_2026", affaire.get("facturation_cumulee_2026")))
         affaire["facturation_totale"] = clean_number(affaire.get("facturation_totale")) or (affaire["anteriorite"] + affaire["facture_2026"])
+        affaire["audit"] = {
+            "excel_anteriorite": anteriorite_from_row(affaire),
+            "excel_facture_2026": clean_number(affaire.get("facturation_cumulee_2026")),
+            "missions_anteriorite": clean_number(affaire.get("anteriorite", 0)),
+            "missions_facture_2026": clean_number(affaire.get("facture_2026", 0)),
+        }
         affaire["insights"] = self.compute_insights(affaire)
         affaire.pop("has_reste_value", None)
         affaire.pop("tag", None)
@@ -455,22 +465,23 @@ class FinanceService:
         prev = clean_number(affaire.get("total_previsionnel"))
         fact_total = clean_number(affaire.get("total_facture"))
         taux = float(affaire.get("taux_avancement_financier") or 0.0)
-        active_months = [m for m in MONTHS if clean_number((affaire.get("mensuel", {}).get(m) or {}).get("previsionnel")) > 0]
 
         if commande > 0 and facture <= 0:
-            insights.append("Aucune facturation 2026 détectée malgré une commande active.")
-        if prev > 0 and fact_total < prev * 0.8:
-            insights.append("Le facturé est en retard sur le prévisionnel annuel.")
-        if prev > 0 and fact_total > prev * 1.1:
-            insights.append("Le facturé dépasse sensiblement le prévisionnel.")
-        if commande > 0 and reste / commande > 0.5:
-            insights.append("Le reste à facturer reste élevé.")
+            insights.append("Aucune facturation enregistrée alors qu'une commande existe.")
+
+        if reste > max(1000.0, commande * 0.4):
+            insights.append("Le reste à facturer est élevé.")
+
+        if prev > 0 and fact_total < prev * 0.75:
+            insights.append("La facturation est en retard par rapport au prévisionnel.")
+        elif prev > 0 and fact_total > prev * 1.1:
+            insights.append("La facturation est en avance par rapport au prévisionnel.")
+
         if commande > 0 and taux >= 0.9:
-            insights.append("Affaire presque soldée financièrement.")
-        if prev > 0 and len(active_months) <= 2:
-            insights.append("Le prévisionnel est concentré sur très peu de mois.")
+            insights.append("L'affaire est presque finalisée financièrement.")
+
         if not insights:
-            insights.append("Situation globalement stable selon les données disponibles.")
+            insights.append("Situation financière stable selon les données disponibles.")
         return insights
 
     @staticmethod
