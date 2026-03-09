@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import re
 import urllib.parse
@@ -38,6 +39,9 @@ from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
 app = FastAPI(title="TEMPO • CR Synthèse (METRONOME)")
+logger = logging.getLogger("tempo_app")
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO)
 
 # -------------------------
 # PATHS (UNC)
@@ -86,6 +90,59 @@ USERS_PATH = os.getenv(
     "METRONOME_USERS",
     r"\\192.168.10.100\02 - affaires\02.2 - SYNTHESE\ZZ - METRONOME\Users.csv",
 )
+
+FINANCE_WORKBOOK_PATH = os.getenv(
+    "METRONOME_FINANCE_WORKBOOK",
+    r"\\192.168.10.100\03 - finances\10 - TABLEAU DE BORD\01 - TABLEAU ACTIVITEE\TABLEAU ACTIVITEE.xlsx",
+)
+FINANCE_SHEET_NAME = "AFFAIRES 2026"
+
+FINANCE_COLUMN_MAPPING = {
+    "A": "client",
+    "B": "affaire",
+    "C": "tag",
+    "D": "numero",
+    "E": "delai_reglement_jours",
+    "F": "commande_ht",
+    "G": "facturation_cumulee_2017",
+    "H": "facturation_cumulee_2018",
+    "I": "facturation_cumulee_2021",
+    "J": "facturation_cumulee_2022",
+    "K": "facturation_cumulee_2023",
+    "L": "facturation_cumulee_2024",
+    "M": "facturation_cumulee_2025",
+    "N": "facturation_cumulee_2026",
+    "O": "reste_a_facturer",
+    "P": "janvier_previsionnel",
+    "Q": "janvier_facture",
+    "R": "fevrier_previsionnel",
+    "S": "fevrier_facture",
+    "T": "mars_previsionnel",
+    "U": "mars_facture",
+    "V": "avril_previsionnel",
+    "W": "avril_facture",
+    "X": "mai_previsionnel",
+    "Y": "mai_facture",
+    "Z": "juin_previsionnel",
+    "AA": "juin_facture",
+    "AB": "juillet_previsionnel",
+    "AC": "juillet_facture",
+    "AD": "aout_previsionnel",
+    "AE": "aout_facture",
+    "AF": "septembre_previsionnel",
+    "AG": "septembre_facture",
+    "AH": "octobre_previsionnel",
+    "AI": "octobre_facture",
+    "AJ": "novembre_previsionnel",
+    "AK": "novembre_facture",
+    "AL": "decembre_previsionnel",
+    "AM": "decembre_facture",
+    "AN": "total_previsionnel",
+    "AO": "total_facture",
+}
+FINANCE_DATA_START_ROW = 14
+FINANCE_HEADERS_ROW = 11
+FINANCE_SUBHEADERS_ROW = 12
 
 # -------------------------
 # COLUMN NAMES (METRONOME EXPORTS)
@@ -147,6 +204,7 @@ _cache = {
     "projects": (None, None),
     "documents": (None, None),
     "users": (None, None),
+    "finance": (None, None),
 }
 
 
@@ -235,6 +293,209 @@ def get_users() -> pd.DataFrame:
         df = _load_csv(USERS_PATH)
         _cache["users"] = (m, df)
     return df
+
+
+def _normalize_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+def _normalize_number(value):
+    if value is None:
+        return None
+    if isinstance(value, float) and pd.isna(value):
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    raw = str(value).strip().replace(" ", "")
+    if not raw:
+        return None
+    raw = raw.replace(",", ".")
+    try:
+        number = float(raw)
+        return int(number) if number.is_integer() else number
+    except ValueError:
+        return _normalize_text(value)
+
+
+def _row_to_finance_payload(row: dict, is_sub_line: bool, row_kind: str) -> dict:
+    payload = {
+        "is_sub_line": is_sub_line,
+        "row_kind": row_kind,
+    }
+    for key, value in row.items():
+        if key in {"client", "affaire", "tag", "numero"}:
+            payload[key] = _normalize_text(value)
+        else:
+            payload[key] = _normalize_number(value)
+    return payload
+
+
+def _is_total_line(row: dict) -> bool:
+    joined = " ".join(
+        _normalize_text(row.get(field)).lower()
+        for field in ["client", "affaire", "tag", "numero"]
+    )
+    return bool(joined) and any(token in joined for token in ["total", "totaux", "sous-total"])
+
+
+def _is_detail_line(row: dict) -> bool:
+    if _is_total_line(row):
+        return True
+    affaire = _normalize_text(row.get("affaire"))
+    numero = _normalize_text(row.get("numero"))
+    metrics = [
+        row.get("commande_ht"),
+        row.get("reste_a_facturer"),
+        row.get("total_previsionnel"),
+        row.get("total_facture"),
+    ]
+    has_metrics = any(_normalize_number(m) is not None for m in metrics)
+    return bool(affaire or numero or has_metrics)
+
+
+def _parse_finance_workbook() -> dict:
+    _require_csv(FINANCE_WORKBOOK_PATH, "Finance workbook", "METRONOME_FINANCE_WORKBOOK")
+    try:
+        from openpyxl import load_workbook
+    except ImportError as exc:
+        raise RuntimeError("Le module openpyxl est requis pour lire le fichier FINANCE (.xlsx).") from exc
+    wb = load_workbook(FINANCE_WORKBOOK_PATH, data_only=True, read_only=True)
+    if FINANCE_SHEET_NAME not in wb.sheetnames:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Onglet introuvable: {FINANCE_SHEET_NAME}",
+        )
+
+    ws = wb[FINANCE_SHEET_NAME]
+    main_headers = {
+        col: _normalize_text(ws[f"{col}{FINANCE_HEADERS_ROW}"].value)
+        for col in FINANCE_COLUMN_MAPPING
+    }
+    sub_headers = {
+        col: _normalize_text(ws[f"{col}{FINANCE_SUBHEADERS_ROW}"].value)
+        for col in FINANCE_COLUMN_MAPPING
+    }
+
+    logger.info(
+        "[FINANCE] Parsing %s!%s from row %s",
+        FINANCE_WORKBOOK_PATH,
+        FINANCE_SHEET_NAME,
+        FINANCE_DATA_START_ROW,
+    )
+    logger.debug("[FINANCE] Main headers row %s: %s", FINANCE_HEADERS_ROW, main_headers)
+    logger.debug("[FINANCE] Sub headers row %s: %s", FINANCE_SUBHEADERS_ROW, sub_headers)
+
+    affaires: dict[str, dict] = {}
+    current_affaire_key = None
+    parsed_rows = 0
+    skipped_rows = 0
+
+    for row_idx in range(FINANCE_DATA_START_ROW, ws.max_row + 1):
+        raw = {
+            field: ws[f"{col}{row_idx}"].value
+            for col, field in FINANCE_COLUMN_MAPPING.items()
+        }
+        if all(v is None or (isinstance(v, str) and not v.strip()) for v in raw.values()):
+            continue
+
+        if not _is_detail_line(raw):
+            skipped_rows += 1
+            logger.debug("[FINANCE] Skip row=%s raw=%s", row_idx, raw)
+            continue
+
+        is_sub_line = not bool(_normalize_text(raw.get("affaire"))) and current_affaire_key is not None
+        row_kind = "sub_line" if is_sub_line else "parent"
+        if _is_total_line(raw):
+            row_kind = "total"
+
+        normalized = _row_to_finance_payload(raw, is_sub_line=is_sub_line, row_kind=row_kind)
+        if not is_sub_line:
+            affaire_key = _normalize_text(raw.get("numero")) or _normalize_text(raw.get("affaire"))
+            if not affaire_key:
+                skipped_rows += 1
+                logger.debug("[FINANCE] Parent row without key row=%s raw=%s", row_idx, raw)
+                continue
+            current_affaire_key = affaire_key
+            if affaire_key not in affaires:
+                affaires[affaire_key] = {
+                    "affaire_id": affaire_key,
+                    "client": normalized.get("client", ""),
+                    "affaire": normalized.get("affaire", ""),
+                    "tag": normalized.get("tag", ""),
+                    "numero": normalized.get("numero", ""),
+                    "parent": normalized,
+                    "totals": [],
+                    "missions": [],
+                }
+            else:
+                affaires[affaire_key]["parent"] = normalized
+            parsed_rows += 1
+            logger.debug("[FINANCE] Parent row=%s affaire=%s", row_idx, affaire_key)
+            continue
+
+        if current_affaire_key is None:
+            skipped_rows += 1
+            logger.debug("[FINANCE] Sub-line without parent row=%s raw=%s", row_idx, raw)
+            continue
+
+        if row_kind == "total":
+            affaires[current_affaire_key]["totals"].append(normalized)
+        else:
+            affaires[current_affaire_key]["missions"].append(normalized)
+        parsed_rows += 1
+        logger.debug("[FINANCE] %s row=%s affaire=%s", row_kind, row_idx, current_affaire_key)
+
+    affair_list = []
+    for key, item in affaires.items():
+        affair_list.append(
+            {
+                "affaire_id": key,
+                "label": f"{item.get('numero') or key} - {item.get('affaire') or ''}".strip(" -"),
+                "client": item.get("client", ""),
+                "affaire": item.get("affaire", ""),
+                "tag": item.get("tag", ""),
+                "numero": item.get("numero", ""),
+            }
+        )
+
+    affair_list.sort(key=lambda x: (x.get("client", ""), x.get("label", "")))
+    logger.info(
+        "[FINANCE] Parsing done: %s affaires, %s rows parsed, %s rows skipped",
+        len(affaires),
+        parsed_rows,
+        skipped_rows,
+    )
+    wb.close()
+
+    return {
+        "metadata": {
+            "source": FINANCE_WORKBOOK_PATH,
+            "sheet": FINANCE_SHEET_NAME,
+            "headers_row": FINANCE_HEADERS_ROW,
+            "subheaders_row": FINANCE_SUBHEADERS_ROW,
+            "data_start_row": FINANCE_DATA_START_ROW,
+            "column_mapping": FINANCE_COLUMN_MAPPING,
+            "main_headers": main_headers,
+            "sub_headers": sub_headers,
+            "parsed_rows": parsed_rows,
+            "skipped_rows": skipped_rows,
+        },
+        "affaires": affaires,
+        "affaire_list": affair_list,
+    }
+
+
+def get_finance_data() -> dict:
+    m = _mtime(FINANCE_WORKBOOK_PATH)
+    old_m, data = _cache["finance"]
+    if data is None or m != old_m:
+        data = _parse_finance_workbook()
+        _cache["finance"] = (m, data)
+    return data
 
 
 # -------------------------
@@ -5700,4 +5961,54 @@ def api_analysis(
             status_code=503,
         )
     except Exception as ex:
+        return JSONResponse({"error": str(ex)}, status_code=500)
+
+@app.get("/api/finance/affaires", response_class=JSONResponse)
+def api_finance_affaires(debug: bool = Query(default=False)):
+    try:
+        data = get_finance_data()
+        payload = {
+            "count": len(data["affaire_list"]),
+            "items": data["affaire_list"],
+        }
+        if debug:
+            payload["metadata"] = data["metadata"]
+        return payload
+    except MissingDataError as err:
+        return JSONResponse(
+            {"error": str(err), "label": err.label, "path": err.path, "env_var": err.env_var},
+            status_code=503,
+        )
+    except Exception as ex:
+        logger.exception("[FINANCE] Failed to list affaires")
+        return JSONResponse({"error": str(ex)}, status_code=500)
+
+
+@app.get("/api/finance/affaires/{affaire_id}", response_class=JSONResponse)
+def api_finance_affaire_detail(affaire_id: str, debug: bool = Query(default=False)):
+    try:
+        key = str(affaire_id or "").strip()
+        if not key:
+            raise HTTPException(status_code=400, detail="affaire_id est requis")
+
+        data = get_finance_data()
+        affaire = data["affaires"].get(key)
+        if affaire is None:
+            raise HTTPException(status_code=404, detail=f"Affaire introuvable: {key}")
+
+        payload = {
+            "affaire": affaire,
+        }
+        if debug:
+            payload["metadata"] = data["metadata"]
+        return payload
+    except HTTPException:
+        raise
+    except MissingDataError as err:
+        return JSONResponse(
+            {"error": str(err), "label": err.label, "path": err.path, "env_var": err.env_var},
+            status_code=503,
+        )
+    except Exception as ex:
+        logger.exception("[FINANCE] Failed to get affaire detail for %s", affaire_id)
         return JSONResponse({"error": str(ex)}, status_code=500)
