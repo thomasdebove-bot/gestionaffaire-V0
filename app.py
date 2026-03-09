@@ -376,7 +376,10 @@ class FinanceService:
             "facturation_cumulee_2026": data.get("facturation_cumulee_2026", 0.0),
             "anteriorite": data.get("anteriorite", 0.0),
             "facture_2026": data.get("facture_2026", data.get("facturation_cumulee_2026", 0.0)),
-            "facturation_totale": data.get("facturation_totale", data.get("anteriorite", 0.0) + data.get("facture_2026", data.get("facturation_cumulee_2026", 0.0))),
+            "facturation_totale": (
+                clean_number(data.get("anteriorite", 0.0))
+                + clean_number(data.get("facture_2026", data.get("facturation_cumulee_2026", 0.0)))
+            ),
             "reste_a_facturer": data.get("reste_a_facturer", 0.0),
             "has_reste_value": data.get("has_reste_value", False),
             "total_previsionnel": data.get("total_previsionnel", 0.0),
@@ -411,19 +414,14 @@ class FinanceService:
             for month in MONTHS:
                 monthly[month]["ecart"] = monthly[month]["facture"] - monthly[month]["previsionnel"]
 
-            has_parent_recap = bool(affaire.get("_is_parent_row", False))
-            if has_parent_recap:
-                affaire["commande_ht"] = clean_number(affaire.get("commande_ht"))
-                affaire["anteriorite"] = clean_number(affaire.get("anteriorite"))
-                affaire["facture_2026"] = clean_number(affaire.get("facture_2026", affaire.get("facturation_cumulee_2026")))
-                affaire["facturation_totale"] = affaire["anteriorite"] + affaire["facture_2026"]
-                affaire["reste_a_facturer"] = clean_number(affaire.get("reste_a_facturer"))
-            else:
-                affaire["commande_ht"] = commande
-                affaire["anteriorite"] = anteriorite
-                affaire["facture_2026"] = facture_2026
-                affaire["facturation_totale"] = anteriorite + facture_2026
-                affaire["reste_a_facturer"] = sum(clean_number(m.get("reste_a_facturer")) for m in missions)
+            affaire["commande_ht"] = commande
+            affaire["anteriorite"] = anteriorite
+            affaire["facture_2026"] = facture_2026
+            affaire["facturation_totale"] = anteriorite + facture_2026
+            affaire["reste_a_facturer"] = sum(
+                clean_number(m.get("reste_a_facturer"))
+                for m in missions
+            )
             affaire["facturation_cumulee_2026"] = affaire.get("facture_2026", 0.0)
             affaire["mensuel"] = monthly
             affaire["tags"] = sorted(set([t for t in tags if t]))
