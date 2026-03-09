@@ -529,6 +529,11 @@ class FinanceService:
 
 
 class MetronomeService:
+    _PROJECT_MATCH_IGNORED_TOKENS = {
+        "de", "du", "des", "la", "le", "les", "a", "au", "aux", "et",
+        "reunion", "syt", "projet", "affaire",
+    }
+
     def __init__(self, base_path: str) -> None:
         self.base_path = Path(base_path)
         self._lock = Lock()
@@ -593,6 +598,70 @@ class MetronomeService:
                 out[k] = r
         return out
 
+    def _tokenize_project_name(self, value: str) -> set[str]:
+        return {
+            token for token in slugify(value).split("-")
+            if token and token not in self._PROJECT_MATCH_IGNORED_TOKENS and len(token) > 1
+        }
+
+    def _find_best_project_match(self, projects: List[Dict[str, str]], project_name: str) -> tuple[Optional[Dict[str, str]], Dict[str, Any]]:
+        target_name = clean_text(project_name)
+        target_slug = slugify(target_name)
+        target_tokens = self._tokenize_project_name(target_name)
+        debug: Dict[str, Any] = {
+            "searched_project_name": target_name,
+            "searched_project_slug": target_slug,
+        }
+        if not target_slug:
+            return None, debug
+
+        best_project: Optional[Dict[str, str]] = None
+        best_score = 0
+        best_len = 10**9
+
+        for project in projects:
+            project_name_csv = clean_text(project.get("Name"))
+            project_slug = slugify(project_name_csv)
+            if not project_slug:
+                continue
+
+            score = 0
+            if project_slug == target_slug:
+                score = 100
+            else:
+                if target_slug in project_slug:
+                    score = max(score, 80)
+                if project_slug in target_slug:
+                    score = max(score, 78)
+
+                project_tokens = self._tokenize_project_name(project_name_csv)
+                common_tokens = target_tokens & project_tokens
+                if common_tokens:
+                    token_score = 45 + len(common_tokens) * 12
+                    if target_tokens and project_tokens and common_tokens == target_tokens == project_tokens:
+                        token_score += 10
+                    score = max(score, min(token_score, 95))
+
+            if score <= 0:
+                continue
+
+            slug_len_delta = abs(len(project_slug) - len(target_slug))
+            if score > best_score or (score == best_score and slug_len_delta < best_len):
+                best_project = project
+                best_score = score
+                best_len = slug_len_delta
+
+        min_reliable_score = 55
+        if not best_project or best_score < min_reliable_score:
+            return None, debug
+
+        debug.update({
+            "matched_project_name": clean_text(best_project.get("Name")),
+            "matched_project_slug": slugify(best_project.get("Name")),
+            "match_score": best_score,
+        })
+        return best_project, debug
+
     def build_project_board(self, project_name: str) -> Dict[str, Any]:
         cache = self._ensure_loaded()
         t = cache.get("tables", {})
@@ -611,17 +680,14 @@ class MetronomeService:
             if eid and txt:
                 comments_by_entry.setdefault(eid, []).append(txt)
 
-        proj = None
         target = clean_text(project_name)
-        for p in projects:
-            if clean_text(p.get("Name")) == target:
-                proj = p
-                break
+        proj, match_debug = self._find_best_project_match(projects, target)
         if not proj:
             return {
                 "ok": False,
                 "project_name": target,
                 "reason": "project_not_found",
+                "match_debug": match_debug,
                 "missing_files": cache.get("missing", []),
             }
 
@@ -679,6 +745,7 @@ class MetronomeService:
             "ok": True,
             "project_name": target,
             "project_id": project_id,
+            "match_debug": match_debug,
             "kpis": {
                 "open_topics": len(rows),
                 "overdue_topics": sum(1 for r in rows if r.get("overdue")),
