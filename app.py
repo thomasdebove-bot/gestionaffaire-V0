@@ -25,6 +25,17 @@ SHEET_NAME = os.getenv("ACTIVITE_SHEET_NAME", DEFAULT_SHEET_NAME)
 CACHE_FILE = os.getenv("FINANCE_CACHE_FILE", DEFAULT_CACHE_FILE)
 EXPECTED_SCHEMA_VERSION = "finance_affaires_dataset_v4"
 TEMPO_LOGO_PATH = os.getenv("TEMPO_LOGO_PATH", r"\\192.168.10.100\02 - affaires\02.2 - SYNTHESE\ZZ - METRONOME\Content\T logo.png")
+METRONOME_BASE_PATH = os.getenv("METRONOME_BASE_PATH", r"\\192.168.10.100\02 - affaires\02.2 - SYNTHESE\ZZ - METRONOME")
+METRONOME_FILES = {
+    "projects": "Projects.csv",
+    "entries": "Entries (Tasks & Memos).csv",
+    "meetings": "Meetings.csv",
+    "areas": "Areas.csv",
+    "packages": "Packages.csv",
+    "companies": "Companies.csv",
+    "users": "Users.csv",
+    "comments": "Comments.csv",
+}
 
 MONTHS = [
     "janvier", "fevrier", "mars", "avril", "mai", "juin",
