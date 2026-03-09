@@ -441,15 +441,114 @@ service = FinanceService(WORKBOOK_PATH, SHEET_NAME, CACHE_FILE)
 
 def landing_html() -> str:
     return """<!doctype html>
-<html lang='fr'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
-<title>Gestion Affaire - Finance</title>
+<html lang='fr'>
+<head>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Gestion Affaire - Accueil</title>
 <style>
-body{font-family:Inter,Segoe UI,Arial,sans-serif;margin:0;background:#f4f7fb;color:#152033}
-.wrap{max-width:1080px;margin:48px auto;padding:0 24px}.card{background:#fff;border-radius:24px;padding:32px;box-shadow:0 20px 60px rgba(20,32,51,.08)}
-h1{font-size:54px;line-height:1.02;margin:0 0 16px}p{font-size:20px;color:#5f6b80}
-a.btn{display:inline-flex;align-items:center;gap:10px;text-decoration:none;background:#2d5bff;color:#fff;padding:14px 18px;border-radius:14px;font-weight:700}
-.meta{margin-top:18px;color:#6c7890;font-size:14px}
-</style></head><body><div class='wrap'><div class='card'><div style='font-size:13px;font-weight:700;color:#2d5bff;letter-spacing:.12em;text-transform:uppercase'>Gestion affaire</div><h1>Finance cockpit</h1><p>Volet Finance connecté au tableau activité, avec cache, API et cockpit par affaire.</p><div style='display:flex;gap:12px;flex-wrap:wrap;margin-top:24px'><a class='btn' href='/finance'>Ouvrir le cockpit</a><a class='btn' style='background:#142033' href='/api/finance'>Index API</a></div><div class='meta'>Source attendue : TABLEAU ACTIVITEE.xlsx · Onglet : AFFAIRES 2026</div></div></div></body></html>"""
+:root{--bg:#eef2f7;--panel:#fff;--line:#dfe5ef;--ink:#122033;--muted:#6e7a90;--blue:#2d5bff;--dark:#142033;--shadow:0 16px 48px rgba(18,32,51,.09)}
+*{box-sizing:border-box}body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:linear-gradient(180deg,#f5f7fb 0%,#eef2f7 100%);color:var(--ink)}
+.wrap{max-width:1160px;margin:34px auto 52px;padding:0 20px}.hero,.card{background:var(--panel);border:1px solid rgba(20,32,51,.05);border-radius:24px;box-shadow:var(--shadow)}
+.hero{padding:30px}.eyebrow{font-size:12px;font-weight:800;color:var(--blue);text-transform:uppercase;letter-spacing:.14em}h1{margin:8px 0 12px;font-size:44px;line-height:1.05}.sub{font-size:18px;color:var(--muted);max-width:840px}
+.selector{margin-top:24px;display:flex;gap:12px;flex-wrap:wrap}.select{height:52px;border:1px solid var(--line);border-radius:14px;padding:0 14px;font-size:16px;min-width:320px;flex:1}
+.badge{display:inline-flex;align-items:center;justify-content:center;padding:0 14px;height:52px;border-radius:14px;background:#f5f8ff;color:#41547b;font-weight:700}
+.grid{margin-top:18px;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{padding:20px}.card h3{margin:0;font-size:21px}.card p{margin:10px 0 18px;color:var(--muted);font-size:14px;min-height:60px}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;height:44px;padding:0 16px;border-radius:12px;text-decoration:none;border:none;font-weight:800;cursor:pointer}
+.btn.primary{background:var(--blue);color:#fff}.btn.dark{background:var(--dark);color:#fff}.btn.disabled{background:#ecf0f7;color:#8a94a8;cursor:not-allowed}
+.state{margin-top:18px;padding:14px 16px;border-radius:14px;background:#f8faff;border:1px solid var(--line);color:#4f5d78;font-weight:600}
+@media (max-width:980px){.grid{grid-template-columns:repeat(2,1fr)}}@media (max-width:640px){h1{font-size:34px}.grid{grid-template-columns:1fr}.select{min-width:100%}}
+</style>
+</head>
+<body>
+  <div class='wrap'>
+    <section class='hero'>
+      <div class='eyebrow'>Gestion affaire</div>
+      <h1>Accueil multi-projets</h1>
+      <div class='sub'>Choisissez le projet qui vous intéresse, puis accédez aux fonctions disponibles : finances, gestion de projet, imputation et tableau de bord.</div>
+      <div class='selector'>
+        <select id='projectSelect' class='select'>
+          <option value=''>Chargement des projets…</option>
+        </select>
+        <div id='projectBadge' class='badge'>Aucun projet sélectionné</div>
+      </div>
+      <div id='state' class='state'>Sélectionnez un projet pour activer les modules.</div>
+    </section>
+
+    <section class='grid'>
+      <article class='card'>
+        <h3>Finances</h3>
+        <p>Module déjà disponible dans l'application : cockpit financier, suivi mensuel, export CSV et état du cache.</p>
+        <a id='financeLink' class='btn disabled' href='javascript:void(0)' aria-disabled='true'>Ouvrir Finances</a>
+      </article>
+      <article class='card'>
+        <h3>Gestion de projet</h3>
+        <p>Prévu pour piloter les tâches, jalons, risques et coordination opérationnelle par projet.</p>
+        <button class='btn disabled' disabled>Bientôt disponible</button>
+      </article>
+      <article class='card'>
+        <h3>Imputation</h3>
+        <p>Prévu pour centraliser les temps, affectations de ressources et ventilation des charges.</p>
+        <button class='btn disabled' disabled>Bientôt disponible</button>
+      </article>
+      <article class='card'>
+        <h3>Tableau de bord</h3>
+        <p>Espace de synthèse transverse qui regroupera les informations clés du projet (à préciser ensuite).</p>
+        <button class='btn disabled' disabled>À construire</button>
+      </article>
+    </section>
+  </div>
+<script>
+const state={projects:[],selected:''};
+function esc(v){return String(v||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
+function updateUi(){
+  const badge=document.getElementById('projectBadge');
+  const txt=state.selected?`Projet : ${state.selected}`:'Aucun projet sélectionné';
+  badge.textContent=txt;
+  const message=state.selected
+    ? `Modules disponibles pour ${state.selected}. Le module Finances est actif.`
+    : 'Sélectionnez un projet pour activer les modules.';
+  document.getElementById('state').textContent=message;
+  const financeLink=document.getElementById('financeLink');
+  if(state.selected){
+    financeLink.className='btn primary';
+    financeLink.href='/finance';
+    financeLink.removeAttribute('aria-disabled');
+    localStorage.setItem('selectedProject',state.selected);
+  }else{
+    financeLink.className='btn disabled';
+    financeLink.href='javascript:void(0)';
+    financeLink.setAttribute('aria-disabled','true');
+  }
+}
+async function loadProjects(){
+  try{
+    const res=await fetch('/api/finance/affaires');
+    if(!res.ok) throw new Error('API indisponible');
+    const data=await res.json();
+    const list=(data.items||[]).map(x=>x.display_name).filter(Boolean);
+    state.projects=[...new Set(list)].sort((a,b)=>a.localeCompare(b,'fr'));
+  }catch(_){
+    state.projects=[];
+  }
+  const select=document.getElementById('projectSelect');
+  const options=["<option value=''>Sélectionnez un projet</option>"];
+  if(state.projects.length===0){
+    options.push("<option value='' disabled>Aucun projet disponible pour le moment</option>");
+  }else{
+    options.push(...state.projects.map(name=>`<option value="${esc(name)}">${esc(name)}</option>`));
+  }
+  select.innerHTML=options.join('');
+  const saved=localStorage.getItem('selectedProject')||'';
+  if(saved&&state.projects.includes(saved)){state.selected=saved;select.value=saved;}
+  updateUi();
+}
+document.getElementById('projectSelect').addEventListener('change',ev=>{state.selected=ev.target.value||'';updateUi();});
+loadProjects();
+</script>
+</body>
+</html>"""
+
 
 
 def finance_html() -> str:
