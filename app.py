@@ -37,6 +37,12 @@ METRONOME_FILES = {
     "comments": "Comments.csv",
 }
 
+METRONOME_COLUMN_ALIASES = {
+    "project_title_entries": ["Project/Title", "Project/Title (dev)", "Project"],
+    "project_title_projects": ["Title", "Name"],
+    "project_name_projects": ["Name", "Title"],
+}
+
 MONTHS = [
     "janvier", "fevrier", "mars", "avril", "mai", "juin",
     "juillet", "aout", "septembre", "octobre", "novembre", "decembre",
@@ -604,63 +610,112 @@ class MetronomeService:
             if token and token not in self._PROJECT_MATCH_IGNORED_TOKENS and len(token) > 1
         }
 
-    def _find_best_project_match(self, projects: List[Dict[str, str]], project_name: str) -> tuple[Optional[Dict[str, str]], Dict[str, Any]]:
+    @staticmethod
+    def _get_first_value(row: Dict[str, str], keys: List[str]) -> str:
+        for key in keys:
+            val = clean_text(row.get(key))
+            if val:
+                return val
+        return ""
+
+    def _score_project_match(self, target_slug: str, target_tokens: set[str], candidate_name: str) -> int:
+        candidate_slug = slugify(candidate_name)
+        if not candidate_slug:
+            return 0
+        score = 0
+        if candidate_slug == target_slug:
+            score = 100
+        else:
+            if target_slug and target_slug in candidate_slug:
+                score = max(score, 80)
+            if candidate_slug and candidate_slug in target_slug:
+                score = max(score, 78)
+            candidate_tokens = self._tokenize_project_name(candidate_name)
+            common_tokens = target_tokens & candidate_tokens
+            if common_tokens:
+                token_score = 45 + len(common_tokens) * 12
+                if target_tokens and candidate_tokens and common_tokens == target_tokens == candidate_tokens:
+                    token_score += 10
+                score = max(score, min(token_score, 95))
+        return score
+
+    def _resolve_project(self, projects: List[Dict[str, str]], entries: List[Dict[str, str]], project_name: str) -> Dict[str, Any]:
         target_name = clean_text(project_name)
         target_slug = slugify(target_name)
         target_tokens = self._tokenize_project_name(target_name)
-        debug: Dict[str, Any] = {
+        resolved: Dict[str, Any] = {
             "searched_project_name": target_name,
             "searched_project_slug": target_slug,
+            "resolved_project_title": "",
+            "resolved_project_id": "",
+            "matched_project_name": "",
+            "matched_project_slug": "",
+            "match_score": 0,
+            "resolution_mode": "fallback",
         }
         if not target_slug:
-            return None, debug
+            return resolved
 
         best_project: Optional[Dict[str, str]] = None
+        best_name = ""
         best_score = 0
         best_len = 10**9
 
         for project in projects:
-            project_name_csv = clean_text(project.get("Name"))
-            project_slug = slugify(project_name_csv)
-            if not project_slug:
-                continue
-
-            score = 0
-            if project_slug == target_slug:
-                score = 100
-            else:
-                if target_slug in project_slug:
-                    score = max(score, 80)
-                if project_slug in target_slug:
-                    score = max(score, 78)
-
-                project_tokens = self._tokenize_project_name(project_name_csv)
-                common_tokens = target_tokens & project_tokens
-                if common_tokens:
-                    token_score = 45 + len(common_tokens) * 12
-                    if target_tokens and project_tokens and common_tokens == target_tokens == project_tokens:
-                        token_score += 10
-                    score = max(score, min(token_score, 95))
-
-            if score <= 0:
-                continue
-
-            slug_len_delta = abs(len(project_slug) - len(target_slug))
-            if score > best_score or (score == best_score and slug_len_delta < best_len):
-                best_project = project
-                best_score = score
-                best_len = slug_len_delta
+            title = self._get_first_value(project, METRONOME_COLUMN_ALIASES["project_title_projects"])
+            name = self._get_first_value(project, METRONOME_COLUMN_ALIASES["project_name_projects"])
+            for candidate_name in [title, name]:
+                if not candidate_name:
+                    continue
+                score = self._score_project_match(target_slug, target_tokens, candidate_name)
+                if score <= 0:
+                    continue
+                slug_len_delta = abs(len(slugify(candidate_name)) - len(target_slug))
+                if score > best_score or (score == best_score and slug_len_delta < best_len):
+                    best_project = project
+                    best_name = candidate_name
+                    best_score = score
+                    best_len = slug_len_delta
 
         min_reliable_score = 55
-        if not best_project or best_score < min_reliable_score:
-            return None, debug
+        if best_project and best_score >= min_reliable_score:
+            resolved_title = self._get_first_value(best_project, METRONOME_COLUMN_ALIASES["project_title_projects"])
+            resolved_id = self._get_first_value(best_project, ["ID"])
+            mode = "title" if clean_text(best_project.get("Title")) else "name"
+            if resolved_id:
+                mode = "id"
+            resolved.update({
+                "resolved_project_title": resolved_title,
+                "resolved_project_id": resolved_id,
+                "matched_project_name": best_name,
+                "matched_project_slug": slugify(best_name),
+                "match_score": best_score,
+                "resolution_mode": mode,
+            })
+            return resolved
 
-        debug.update({
-            "matched_project_name": clean_text(best_project.get("Name")),
-            "matched_project_slug": slugify(best_project.get("Name")),
-            "match_score": best_score,
-        })
-        return best_project, debug
+        best_entry_title = ""
+        best_entry_slug = ""
+        best_entry_score = 0
+        for e in entries:
+            entry_title = self._get_first_value(e, METRONOME_COLUMN_ALIASES["project_title_entries"])
+            if not entry_title:
+                continue
+            score = self._score_project_match(target_slug, target_tokens, entry_title)
+            if score > best_entry_score:
+                best_entry_title = entry_title
+                best_entry_slug = slugify(entry_title)
+                best_entry_score = score
+
+        if best_entry_title and best_entry_score >= min_reliable_score:
+            resolved.update({
+                "resolved_project_title": best_entry_title,
+                "matched_project_name": best_entry_title,
+                "matched_project_slug": best_entry_slug,
+                "match_score": best_entry_score,
+                "resolution_mode": "fallback",
+            })
+        return resolved
 
     def build_project_board(self, project_name: str) -> Dict[str, Any]:
         cache = self._ensure_loaded()
@@ -681,23 +736,62 @@ class MetronomeService:
                 comments_by_entry.setdefault(eid, []).append(txt)
 
         target = clean_text(project_name)
-        proj, match_debug = self._find_best_project_match(projects, target)
-        if not proj:
+        match_debug = self._resolve_project(projects, entries, target)
+        resolved_title = clean_text(match_debug.get("resolved_project_title"))
+        resolved_id = clean_text(match_debug.get("resolved_project_id"))
+
+        project_info: Dict[str, str] = {}
+        if resolved_title:
+            for p in projects:
+                pt = self._get_first_value(p, METRONOME_COLUMN_ALIASES["project_title_projects"])
+                if clean_text(pt) == resolved_title:
+                    project_info = p
+                    if not resolved_id:
+                        resolved_id = clean_text(p.get("ID"))
+                        match_debug["resolved_project_id"] = resolved_id
+                    break
+        if not project_info and resolved_id:
+            for p in projects:
+                if clean_text(p.get("ID")) == resolved_id:
+                    project_info = p
+                    if not resolved_title:
+                        resolved_title = self._get_first_value(p, METRONOME_COLUMN_ALIASES["project_title_projects"])
+                        match_debug["resolved_project_title"] = resolved_title
+                    break
+
+        if not resolved_title and not resolved_id:
             return {
                 "ok": False,
                 "project_name": target,
                 "reason": "project_not_found",
                 "match_debug": match_debug,
                 "missing_files": cache.get("missing", []),
+                "loaded_at": cache.get("loaded_at"),
             }
 
-        project_id = clean_text(proj.get("ID"))
         rows = []
         today = datetime.now().date()
+        rows_filtered_by_title = 0
+        rows_filtered_by_id = 0
 
         for e in entries:
-            if clean_text(e.get("Project")) != project_id:
+            entry_project_title = self._get_first_value(e, METRONOME_COLUMN_ALIASES["project_title_entries"])
+            entry_project_id = clean_text(e.get("Project"))
+
+            use_row = False
+            if resolved_title and entry_project_title == resolved_title:
+                rows_filtered_by_title += 1
+                use_row = True
+            elif not resolved_title and resolved_id and entry_project_id == resolved_id:
+                rows_filtered_by_id += 1
+                use_row = True
+            elif resolved_id and entry_project_id == resolved_id and rows_filtered_by_title == 0:
+                rows_filtered_by_id += 1
+                use_row = True
+
+            if not use_row:
                 continue
+
             status = clean_text(e.get("Status")).lower()
             if status in {"closed", "close", "done", "termine", "terminé"}:
                 continue
@@ -733,6 +827,9 @@ class MetronomeService:
                 "overdue": overdue,
             })
 
+        match_debug["rows_filtered_by_title"] = rows_filtered_by_title
+        match_debug["rows_filtered_by_id"] = rows_filtered_by_id
+
         def count_by(field: str) -> List[Dict[str, Any]]:
             agg: Dict[str, int] = {}
             for r in rows:
@@ -741,9 +838,11 @@ class MetronomeService:
             return [{"label": k, "count": v} for k, v in sorted(agg.items(), key=lambda x: (-x[1], x[0]))]
 
         by_meeting = count_by("reunion_origine")
+        project_display_name = resolved_title or target
+        project_id = resolved_id or clean_text(project_info.get("ID"))
         return {
             "ok": True,
-            "project_name": target,
+            "project_name": project_display_name,
             "project_id": project_id,
             "match_debug": match_debug,
             "kpis": {
@@ -1009,7 +1108,11 @@ def gestion_projet_html() -> str:
         <div id='matchSearchSlug' class='match-item'><b>Slug recherché</b><span class='mono'>-</span></div>
         <div id='matchFoundName' class='match-item'><b>Projet matché</b>-</div>
         <div id='matchFoundSlug' class='match-item'><b>Slug matché</b><span class='mono'>-</span></div>
+        <div id='matchResolvedTitle' class='match-item'><b>Projet résolu (title)</b>-</div>
+        <div id='matchResolutionMode' class='match-item'><b>Mode de résolution</b>-</div>
         <div id='matchScore' class='match-item'><b>Score de match</b>-</div>
+        <div id='rowsByTitle' class='match-item'><b>Lignes filtrées par titre</b>-</div>
+        <div id='rowsById' class='match-item'><b>Lignes filtrées par ID</b>-</div>
         <div id='missingFiles' class='match-item'><b>Fichiers CSV manquants</b>-</div>
       </div>
     </div>
@@ -1037,7 +1140,11 @@ function renderMatchDiagnostics(b){const md=(b&&b.match_debug)||{};const box=doc
   setHtml('matchSearchSlug',`<b>Slug recherché</b><span class='mono'>${esc(md.searched_project_slug||'-')}</span>`);
   setHtml('matchFoundName',`<b>Projet matché</b>${esc(md.matched_project_name||'-')}`);
   setHtml('matchFoundSlug',`<b>Slug matché</b><span class='mono'>${esc(md.matched_project_slug||'-')}</span>`);
+  setHtml('matchResolvedTitle',`<b>Projet résolu (title)</b>${esc(md.resolved_project_title||'-')}`);
+  setHtml('matchResolutionMode',`<b>Mode de résolution</b>${esc(md.resolution_mode||'-')}`);
   setHtml('matchScore',`<b>Score de match</b>${md.match_score===0||md.match_score?esc(String(md.match_score)):'-'}`);
+  setHtml('rowsByTitle',`<b>Lignes filtrées par titre</b>${md.rows_filtered_by_title===0||md.rows_filtered_by_title?esc(String(md.rows_filtered_by_title)):'-'}`);
+  setHtml('rowsById',`<b>Lignes filtrées par ID</b>${md.rows_filtered_by_id===0||md.rows_filtered_by_id?esc(String(md.rows_filtered_by_id)):'-'}`);
   const missing=(b&&Array.isArray(b.missing_files)&&b.missing_files.length)?b.missing_files.map(x=>esc(x)).join(' | '):'-';
   setHtml('missingFiles',`<b>Fichiers CSV manquants</b>${missing}`);
   if(!b||!b.ok){
