@@ -983,6 +983,7 @@ def gestion_projet_html() -> str:
 .kpis{margin-top:12px;padding:14px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.k{border:1px solid var(--line);border-radius:14px;padding:14px;background:#fbfdff}.k .v{font-size:34px;font-weight:900;margin-top:6px}
 .section{margin-top:12px;padding:14px}.subgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:14px}table{width:100%;border-collapse:collapse}th,td{padding:10px 12px;border-bottom:1px solid var(--line);font-size:13px;text-align:left}th{background:#f7f9fc;font-size:12px;color:#5b6880;text-transform:uppercase}.small{color:var(--muted);font-size:13px}
 .bar{height:10px;background:#edf1f8;border-radius:999px;overflow:hidden}.fill{height:100%;background:#ef8d00}
+.match-box{margin-top:12px;border:1px solid var(--line);border-radius:14px;padding:12px;background:#fffaf2}.match-box.ok{border-color:#49a66a;background:#f4fcf6}.match-box.warn{border-color:#ef8d00;background:#fff7ec}.match-title{font-weight:800;margin-bottom:8px}.match-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.match-item{font-size:13px;color:#30425f}.match-item b{display:block;color:#6e7a90;font-size:12px;margin-bottom:2px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-word}
 @media (max-width:980px){.grid{grid-template-columns:repeat(2,1fr)}.subgrid{grid-template-columns:1fr}}@media (max-width:640px){.grid{grid-template-columns:1fr}}
 </style></head>
 <body><div class='wrap'>
@@ -999,7 +1000,20 @@ def gestion_projet_html() -> str:
     <div class='k'><div class='small'>Sujets en retard</div><div id='kLate' class='v'>0</div></div>
     <div class='k'><div class='small'>Projet METRONOME</div><div id='kProject' class='v' style='font-size:22px'>-</div></div>
     <div class='k'><div class='small'>Chargement</div><div id='kLoad' class='v' style='font-size:18px'>-</div></div>
-  </div></div>
+  </div>
+    <div id='matchBox' class='match-box warn'>
+      <div id='matchStatus' class='match-title'>Diagnostic de matching METRONOME</div>
+      <div id='matchReason' class='small'>Aucune affaire sélectionnée.</div>
+      <div class='match-grid'>
+        <div id='matchSearchName' class='match-item'><b>Projet recherché</b>-</div>
+        <div id='matchSearchSlug' class='match-item'><b>Slug recherché</b><span class='mono'>-</span></div>
+        <div id='matchFoundName' class='match-item'><b>Projet matché</b>-</div>
+        <div id='matchFoundSlug' class='match-item'><b>Slug matché</b><span class='mono'>-</span></div>
+        <div id='matchScore' class='match-item'><b>Score de match</b>-</div>
+        <div id='missingFiles' class='match-item'><b>Fichiers CSV manquants</b>-</div>
+      </div>
+    </div>
+  </div>
 
   <div class='section'><div class='subgrid'>
     <div><h3>🔴 Heatmap entreprises</h3><div id='byCompany'></div></div>
@@ -1016,8 +1030,30 @@ function esc(v){return String(v??'').replace(/[&<>]/g,ch=>({'&':'&amp;','<':'&lt
 async function api(u){const r=await fetch(u);const d=await r.json();if(!r.ok) throw new Error(d.detail||'Erreur API');return d;}
 function renderBars(id,items){const root=document.getElementById(id);if(!items||!items.length){root.innerHTML="<div class='small'>Aucune donnée</div>";return;}const max=Math.max(1,...items.map(x=>Number(x.count||0)));root.innerHTML=items.map(x=>`<div style='margin:8px 0'><div style='display:flex;justify-content:space-between;gap:8px'><span>${esc(x.label)}</span><strong>${x.count}</strong></div><div class='bar'><div class='fill' style='width:${(Number(x.count||0)/max)*100}%'></div></div></div>`).join('');}
 function renderTable(rows){const root=document.getElementById('boardTable');if(!rows||!rows.length){root.innerHTML="<div class='small' style='padding:12px'>Aucun sujet ouvert.</div>";return;}root.innerHTML=`<table><thead><tr><th>Zone</th><th>Lot</th><th>Sujet</th><th>Entreprise</th><th>Responsable</th><th>Statut</th><th>Date échéance</th><th>Réunion origine</th><th>Commentaire</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${esc(r.zone)}</td><td>${esc(r.lot)}</td><td>${esc(r.sujet)}</td><td>${esc(r.entreprise)}</td><td>${esc(r.responsable)}</td><td>${esc(r.statut)}</td><td>${esc(r.date_echeance)}</td><td>${esc(r.reunion_origine)}</td><td>${esc(r.commentaire)}</td></tr>`).join('')}</tbody></table>`;}
-function renderBoard(){const b=state.board;if(!b||!b.ok){document.getElementById('kOpen').textContent='0';document.getElementById('kLate').textContent='0';document.getElementById('kProject').textContent='Non trouvé';renderBars('byCompany',[]);renderBars('byPackage',[]);renderBars('byMeeting',[]);renderTable([]);return;}const k=b.kpis||{};document.getElementById('kOpen').textContent=String(k.open_topics||0);document.getElementById('kLate').textContent=String(k.overdue_topics||0);document.getElementById('kProject').textContent=b.project_name||'-';document.getElementById('kLoad').textContent=b.loaded_at||'-';renderBars('byCompany',k.by_company||[]);renderBars('byPackage',k.by_package||[]);renderBars('byMeeting',k.by_meeting||[]);renderTable(b.rows||[]);} 
-async function loadAffaires(search=''){const d=await api(`/api/finance/affaires?search=${encodeURIComponent(search)}`);state.affaires=d.items||[];const sel=document.getElementById('affaireSelect');sel.innerHTML=`<option value=''>Sélectionnez une affaire</option>`+state.affaires.map(x=>`<option value="${esc(x.affaire_id)}">${esc(x.display_name)}</option>`).join('');if(state.selectedId&&state.affaires.some(x=>x.affaire_id===state.selectedId)){sel.value=state.selectedId;}}
+function setText(id,value){const el=document.getElementById(id);if(el) el.textContent=value;}
+function setHtml(id,value){const el=document.getElementById(id);if(el) el.innerHTML=value;}
+function renderMatchDiagnostics(b){const md=(b&&b.match_debug)||{};const box=document.getElementById('matchBox');
+  setHtml('matchSearchName',`<b>Projet recherché</b>${esc(md.searched_project_name||b?.project_name||'-')}`);
+  setHtml('matchSearchSlug',`<b>Slug recherché</b><span class='mono'>${esc(md.searched_project_slug||'-')}</span>`);
+  setHtml('matchFoundName',`<b>Projet matché</b>${esc(md.matched_project_name||'-')}`);
+  setHtml('matchFoundSlug',`<b>Slug matché</b><span class='mono'>${esc(md.matched_project_slug||'-')}</span>`);
+  setHtml('matchScore',`<b>Score de match</b>${md.match_score===0||md.match_score?esc(String(md.match_score)):'-'}`);
+  const missing=(b&&Array.isArray(b.missing_files)&&b.missing_files.length)?b.missing_files.map(x=>esc(x)).join(' | '):'-';
+  setHtml('missingFiles',`<b>Fichiers CSV manquants</b>${missing}`);
+  if(!b||!b.ok){
+    box.classList.remove('ok');box.classList.add('warn');
+    setText('matchStatus','⚠ Projet METRONOME non trouvé');
+    const reason=b?.reason||'project_not_found';
+    const loaded=b?.loaded_at?` · Chargement: ${b.loaded_at}`:'';
+    setText('matchReason',`Raison: ${reason}${loaded}`);
+    return;
+  }
+  box.classList.remove('warn');box.classList.add('ok');
+  setText('matchStatus','✅ Matching METRONOME OK');
+  const loaded=b.loaded_at?` · Chargement: ${b.loaded_at}`:'';
+  setText('matchReason',`Projet recherché et projet matché résolus.${loaded}`);
+}
+function renderBoard(){const b=state.board;if(!b||!b.ok){setText('kOpen','0');setText('kLate','0');setText('kProject','Projet METRONOME non trouvé');setText('kLoad',b&&b.loaded_at?b.loaded_at:'-');renderBars('byCompany',[]);renderBars('byPackage',[]);renderBars('byMeeting',[]);renderTable([]);renderMatchDiagnostics(b||{});return;}const k=b.kpis||{};setText('kOpen',String(k.open_topics||0));setText('kLate',String(k.overdue_topics||0));setText('kProject',b.project_name||'-');setText('kLoad',b.loaded_at||'-');renderBars('byCompany',k.by_company||[]);renderBars('byPackage',k.by_package||[]);renderBars('byMeeting',k.by_meeting||[]);renderTable(b.rows||[]);renderMatchDiagnostics(b);} 
 async function loadBoard(id){if(!id){state.selectedId='';state.board=null;renderBoard();return;}state.selectedId=id;localStorage.setItem('selectedAffaireId',id);document.getElementById('financeBtn').href=`/finance?affaire_id=${encodeURIComponent(id)}`;document.getElementById('dashboardBtn').href=`/dashboard?affaire_id=${encodeURIComponent(id)}`;state.board=await api(`/api/project-management/board?affaire_id=${encodeURIComponent(id)}`);renderBoard();}
 async function init(){await loadAffaires('');const params=new URLSearchParams(window.location.search);const pre=params.get('affaire_id')||localStorage.getItem('selectedAffaireId')||'';if(pre&&state.affaires.some(x=>x.affaire_id===pre)){document.getElementById('affaireSelect').value=pre;await loadBoard(pre);}else{renderBoard();}
 document.getElementById('searchInput').addEventListener('input',async e=>loadAffaires(e.target.value||''));document.getElementById('affaireSelect').addEventListener('change',async e=>loadBoard(e.target.value||''));}
@@ -1184,7 +1220,7 @@ def api_project_management_board(affaire_id: str = Query(default=""), affaire_na
         item = cache.get("items", {}).get(affaire_id)
         if not item:
             raise HTTPException(status_code=404, detail=f"Affaire introuvable : {affaire_id}")
-        name = clean_text(item.get("affaire"))
+        name = clean_text(item.get("display_name")) or clean_text(item.get("affaire"))
     if not name:
         raise HTTPException(status_code=400, detail="affaire_id ou affaire_name requis")
     return metronome_service.build_project_board(name)
