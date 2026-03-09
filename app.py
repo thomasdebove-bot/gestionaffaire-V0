@@ -1162,8 +1162,23 @@ function renderMatchDiagnostics(b){const md=(b&&b.match_debug)||{};const box=doc
 }
 function renderBoard(){const b=state.board;if(!b||!b.ok){setText('kOpen','0');setText('kLate','0');setText('kProject','Projet METRONOME non trouvé');setText('kLoad',b&&b.loaded_at?b.loaded_at:'-');renderBars('byCompany',[]);renderBars('byPackage',[]);renderBars('byMeeting',[]);renderTable([]);renderMatchDiagnostics(b||{});return;}const k=b.kpis||{};setText('kOpen',String(k.open_topics||0));setText('kLate',String(k.overdue_topics||0));setText('kProject',b.project_name||'-');setText('kLoad',b.loaded_at||'-');renderBars('byCompany',k.by_company||[]);renderBars('byPackage',k.by_package||[]);renderBars('byMeeting',k.by_meeting||[]);renderTable(b.rows||[]);renderMatchDiagnostics(b);} 
 async function loadBoard(id){if(!id){state.selectedId='';state.board=null;renderBoard();return;}state.selectedId=id;localStorage.setItem('selectedAffaireId',id);document.getElementById('financeBtn').href=`/finance?affaire_id=${encodeURIComponent(id)}`;document.getElementById('dashboardBtn').href=`/dashboard?affaire_id=${encodeURIComponent(id)}`;state.board=await api(`/api/project-management/board?affaire_id=${encodeURIComponent(id)}`);renderBoard();}
-async function init(){await loadAffaires('');const params=new URLSearchParams(window.location.search);const pre=params.get('affaire_id')||localStorage.getItem('selectedAffaireId')||'';if(pre&&state.affaires.some(x=>x.affaire_id===pre)){document.getElementById('affaireSelect').value=pre;await loadBoard(pre);}else{renderBoard();}
-document.getElementById('searchInput').addEventListener('input',async e=>loadAffaires(e.target.value||''));document.getElementById('affaireSelect').addEventListener('change',async e=>loadBoard(e.target.value||''));}
+async function loadAffaires(search=''){const d=await api(`/api/finance/affaires?search=${encodeURIComponent(search)}`);state.affaires=d.items||[];const sel=document.getElementById('affaireSelect');sel.innerHTML=`<option value=''>Sélectionnez une affaire</option>`+state.affaires.map(x=>`<option value="${esc(x.affaire_id)}">${esc(x.display_name)}</option>`).join('');if(state.selectedId&&state.affaires.some(x=>x.affaire_id===state.selectedId)){sel.value=state.selectedId;}}
+function showPageError(err){const box=document.getElementById('matchBox');if(box){box.classList.remove('ok');box.classList.add('warn');}setText('matchStatus','⚠ Erreur de chargement');setText('matchReason','Erreur de chargement : '+((err&&err.message)?err.message:String(err||'Erreur inconnue')));}
+async function init(){
+  try{
+    await loadAffaires('');
+    const params=new URLSearchParams(window.location.search);
+    const pre=params.get('affaire_id')||localStorage.getItem('selectedAffaireId')||'';
+    if(pre){
+      state.selectedId=pre;
+      const sel=document.getElementById('affaireSelect');
+      if(state.affaires.some(x=>x.affaire_id===pre)){sel.value=pre;}
+      await loadBoard(pre);
+    }else{renderBoard();}
+    document.getElementById('searchInput').addEventListener('input',async e=>{await loadAffaires(e.target.value||'');});
+    document.getElementById('affaireSelect').addEventListener('change',async e=>{await loadBoard(e.target.value||'');});
+  }catch(err){console.error(err);renderBoard();showPageError(err);}
+}
 init();
 </script></body></html>"""
 
