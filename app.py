@@ -12,7 +12,7 @@ from threading import Lock
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from openpyxl import load_workbook
 
 APP_TITLE = "Gestion Affaire - Finance"
@@ -23,6 +23,7 @@ DEFAULT_CACHE_FILE = "finance_cache.json"
 WORKBOOK_PATH = os.getenv("ACTIVITE_XLSX_PATH", DEFAULT_WORKBOOK_PATH)
 SHEET_NAME = os.getenv("ACTIVITE_SHEET_NAME", DEFAULT_SHEET_NAME)
 CACHE_FILE = os.getenv("FINANCE_CACHE_FILE", DEFAULT_CACHE_FILE)
+TEMPO_LOGO_PATH = os.getenv("TEMPO_LOGO_PATH", r"\\192.168.10.100\02 - affaires\02.2 - SYNTHESE\ZZ - METRONOME\Content\T logo.png")
 
 MONTHS = [
     "janvier", "fevrier", "mars", "avril", "mai", "juin",
@@ -308,9 +309,14 @@ class FinanceService:
         total_facture = clean_number(row.get("total_facture")) or sum(mensuel[m]["facture"] for m in MONTHS)
         commande_ht = clean_number(row.get("commande_ht"))
         fact_2026 = clean_number(row.get("facturation_cumulee_2026"))
+        total_facturation_cumulee = sum(clean_number(row.get(k)) for k in [
+            "facturation_cumulee_2017", "facturation_cumulee_2018", "facturation_cumulee_2021",
+            "facturation_cumulee_2022", "facturation_cumulee_2023", "facturation_cumulee_2024",
+            "facturation_cumulee_2025", "facturation_cumulee_2026",
+        ])
         reste_col = clean_number(row.get("reste_a_facturer"))
-        reste_calc = commande_ht - fact_2026
-        reste = reste_calc if (abs(reste_col) < 1e-9 or abs(reste_col + fact_2026) < 1e-9 or abs(reste_col - reste_calc) > max(1.0, commande_ht * 0.5)) else reste_col
+        reste_calc = commande_ht - total_facturation_cumulee
+        reste = reste_calc if (abs(reste_col) < 1e-9 or abs(reste_col - reste_calc) > max(1.0, commande_ht * 0.35)) else reste_col
 
         return {
             "affaire_id": affaire_id,
@@ -332,12 +338,13 @@ class FinanceService:
             "facturation_cumulee_2024": clean_number(row.get("facturation_cumulee_2024")),
             "facturation_cumulee_2025": clean_number(row.get("facturation_cumulee_2025")),
             "facturation_cumulee_2026": fact_2026,
+            "total_facturation_cumulee": total_facturation_cumulee,
             "reste_a_facturer": reste,
             "mensuel": mensuel,
             "total_previsionnel": total_previsionnel,
             "total_facture": total_facture,
             "ecart_previsionnel_vs_facture": total_facture - total_previsionnel,
-            "taux_avancement_financier": (fact_2026 / commande_ht) if commande_ht else 0.0,
+            "taux_avancement_financier": (total_facturation_cumulee / commande_ht) if commande_ht else 0.0,
         }
 
     def _mission_payload_from_affaire(self, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -347,6 +354,7 @@ class FinanceService:
             "numero": data.get("numero", ""),
             "commande_ht": data.get("commande_ht", 0.0),
             "facturation_cumulee_2026": data.get("facturation_cumulee_2026", 0.0),
+            "total_facturation_cumulee": data.get("total_facturation_cumulee", data.get("facturation_cumulee_2026", 0.0)),
             "reste_a_facturer": data.get("reste_a_facturer", 0.0),
             "total_previsionnel": data.get("total_previsionnel", 0.0),
             "total_facture": data.get("total_facture", 0.0),
@@ -361,9 +369,18 @@ class FinanceService:
             numero = affaire.get("numero", "")
             commande = 0.0
             facture_2026 = 0.0
+            facture_cumulee = 0.0
+            delai_values = []
             for mission in missions:
                 commande += clean_number(mission.get("commande_ht"))
                 facture_2026 += clean_number(mission.get("facturation_cumulee_2026"))
+                facture_cumulee += sum(clean_number(mission.get(k)) for k in [
+                    "facturation_cumulee_2017", "facturation_cumulee_2018", "facturation_cumulee_2021",
+                    "facturation_cumulee_2022", "facturation_cumulee_2023", "facturation_cumulee_2024",
+                    "facturation_cumulee_2025", "facturation_cumulee_2026",
+                ])
+                if clean_number(mission.get("delai_reglement_jours")) > 0:
+                    delai_values.append(safe_int(mission.get("delai_reglement_jours")))
                 if mission.get("tag"):
                     tags.append(clean_text(mission["tag"]))
                 if not numero and mission.get("numero"):
@@ -377,19 +394,32 @@ class FinanceService:
 
             affaire["commande_ht"] = commande or affaire.get("commande_ht", 0.0)
             affaire["facturation_cumulee_2026"] = facture_2026 or affaire.get("facturation_cumulee_2026", 0.0)
-            affaire["reste_a_facturer"] = affaire["commande_ht"] - affaire["facturation_cumulee_2026"]
+            affaire["total_facturation_cumulee"] = facture_cumulee or sum(clean_number(affaire.get(k)) for k in [
+                "facturation_cumulee_2017", "facturation_cumulee_2018", "facturation_cumulee_2021",
+                "facturation_cumulee_2022", "facturation_cumulee_2023", "facturation_cumulee_2024",
+                "facturation_cumulee_2025", "facturation_cumulee_2026",
+            ])
+            affaire["reste_a_facturer"] = affaire["commande_ht"] - affaire["total_facturation_cumulee"]
             affaire["mensuel"] = monthly
             affaire["tags"] = sorted(set([t for t in tags if t]))
             affaire["numero"] = numero
             affaire["total_previsionnel"] = sum(monthly[m]["previsionnel"] for m in MONTHS)
             affaire["total_facture"] = sum(monthly[m]["facture"] for m in MONTHS)
             affaire["ecart_previsionnel_vs_facture"] = affaire["total_facture"] - affaire["total_previsionnel"]
-            affaire["taux_avancement_financier"] = (affaire["facturation_cumulee_2026"] / affaire["commande_ht"]) if affaire["commande_ht"] else 0.0
+            affaire["delai_reglement_jours"] = affaire.get("delai_reglement_jours") or (max(delai_values) if delai_values else 0)
+            affaire["taux_avancement_financier"] = (affaire["total_facturation_cumulee"] / affaire["commande_ht"]) if affaire["commande_ht"] else 0.0
         else:
             affaire["missions"] = []
             if affaire.get("tag") and not affaire.get("tags"):
                 affaire["tags"] = [affaire["tag"]]
 
+        affaire["total_facturation_cumulee"] = clean_number(affaire.get("total_facturation_cumulee")) or sum(clean_number(affaire.get(k)) for k in [
+            "facturation_cumulee_2017", "facturation_cumulee_2018", "facturation_cumulee_2021",
+            "facturation_cumulee_2022", "facturation_cumulee_2023", "facturation_cumulee_2024",
+            "facturation_cumulee_2025", "facturation_cumulee_2026",
+        ])
+        if not clean_number(affaire.get("reste_a_facturer")) and clean_number(affaire.get("commande_ht")):
+            affaire["reste_a_facturer"] = clean_number(affaire.get("commande_ht")) - clean_number(affaire.get("total_facturation_cumulee"))
         affaire["insights"] = self.compute_insights(affaire)
         affaire.pop("tag", None)
         affaire.pop("_row_index", None)
@@ -399,7 +429,7 @@ class FinanceService:
     def compute_insights(affaire: Dict[str, Any]) -> List[str]:
         insights: List[str] = []
         commande = clean_number(affaire.get("commande_ht"))
-        facture = clean_number(affaire.get("facturation_cumulee_2026"))
+        facture = clean_number(affaire.get("total_facturation_cumulee"))
         reste = clean_number(affaire.get("reste_a_facturer"))
         prev = clean_number(affaire.get("total_previsionnel"))
         fact_total = clean_number(affaire.get("total_facture"))
@@ -447,114 +477,57 @@ def landing_html() -> str:
 <meta name='viewport' content='width=device-width, initial-scale=1'>
 <title>Gestion Affaire - Accueil</title>
 <style>
-:root{--bg:#eef2f7;--panel:#fff;--line:#dfe5ef;--ink:#122033;--muted:#6e7a90;--blue:#2d5bff;--dark:#142033;--shadow:0 16px 48px rgba(18,32,51,.09)}
+:root{--panel:#fff;--line:#dfe5ef;--ink:#122033;--muted:#6e7a90;--accent:#ef8d00;--shadow:0 16px 48px rgba(18,32,51,.09)}
 *{box-sizing:border-box}body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:linear-gradient(180deg,#f5f7fb 0%,#eef2f7 100%);color:var(--ink)}
-.wrap{max-width:1160px;margin:34px auto 52px;padding:0 20px}.hero,.card{background:var(--panel);border:1px solid rgba(20,32,51,.05);border-radius:24px;box-shadow:var(--shadow)}
-.hero{padding:30px}.eyebrow{font-size:12px;font-weight:800;color:var(--blue);text-transform:uppercase;letter-spacing:.14em}h1{margin:8px 0 12px;font-size:44px;line-height:1.05}.sub{font-size:18px;color:var(--muted);max-width:840px}
-.selector{margin-top:24px;display:flex;gap:12px;flex-wrap:wrap}.select{height:52px;border:1px solid var(--line);border-radius:14px;padding:0 14px;font-size:16px;min-width:320px;flex:1}
-.badge{display:inline-flex;align-items:center;justify-content:center;padding:0 14px;height:52px;border-radius:14px;background:#f5f8ff;color:#41547b;font-weight:700}
+.wrap{max-width:1260px;margin:30px auto 52px;padding:0 20px}.hero,.card{background:var(--panel);border:1px solid rgba(20,32,51,.05);border-radius:24px;box-shadow:var(--shadow)}
+.hero{padding:28px}.hero-top{display:flex;align-items:center;gap:16px}.logo{width:56px;height:56px;object-fit:contain;border-radius:10px;background:#fff7ef;border:1px solid #f8ddb4;padding:6px}
+.eyebrow{font-size:12px;font-weight:800;color:var(--accent);text-transform:uppercase;letter-spacing:.14em}h1{margin:8px 0 12px;font-size:44px;line-height:1.05}.sub{font-size:20px;color:var(--muted);max-width:930px}
+.selector{margin-top:22px;display:grid;grid-template-columns:2fr 1fr;gap:12px}.search{height:52px;border:1px solid var(--line);border-radius:14px;padding:0 14px;font-size:16px;width:100%}
+.badge{display:inline-flex;align-items:center;justify-content:center;padding:0 14px;height:52px;border-radius:14px;background:#f9fbff;color:#41547b;font-weight:700;border:1px solid var(--line)}
 .grid{margin-top:18px;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{padding:20px}.card h3{margin:0;font-size:21px}.card p{margin:10px 0 18px;color:var(--muted);font-size:14px;min-height:60px}
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;height:44px;padding:0 16px;border-radius:12px;text-decoration:none;border:none;font-weight:800;cursor:pointer}
-.btn.primary{background:var(--blue);color:#fff}.btn.dark{background:var(--dark);color:#fff}.btn.disabled{background:#ecf0f7;color:#8a94a8;cursor:not-allowed}
-.state{margin-top:18px;padding:14px 16px;border-radius:14px;background:#f8faff;border:1px solid var(--line);color:#4f5d78;font-weight:600}
-@media (max-width:980px){.grid{grid-template-columns:repeat(2,1fr)}}@media (max-width:640px){h1{font-size:34px}.grid{grid-template-columns:1fr}.select{min-width:100%}}
+.btn.primary,.btn.dark{background:var(--accent);color:#fff}.btn.disabled{background:#ecf0f7;color:#8a94a8;cursor:not-allowed}
+.state{margin-top:14px;padding:14px 16px;border-radius:14px;background:#f8faff;border:1px solid var(--line);color:#4f5d78;font-weight:600}
+@media (max-width:980px){.grid{grid-template-columns:repeat(2,1fr)}.selector{grid-template-columns:1fr}}@media (max-width:640px){h1{font-size:34px}.grid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
   <div class='wrap'>
     <section class='hero'>
-      <div class='eyebrow'>Gestion affaire</div>
-      <h1>Accueil multi-projets</h1>
-      <div class='sub'>Choisissez le projet qui vous intéresse, puis accédez aux fonctions disponibles : finances, gestion de projet, imputation et tableau de bord.</div>
-      <div class='selector'>
-        <select id='projectSelect' class='select'>
-          <option value=''>Chargement des projets…</option>
-        </select>
-        <div id='projectBadge' class='badge'>Aucun projet sélectionné</div>
+      <div class='hero-top'>
+        <img class='logo' src='/assets/logo-tempo' alt='Logo Tempo'>
+        <div><div class='eyebrow'>Gestion affaire</div><h1>Accueil multiprojets</h1></div>
       </div>
-      <div id='state' class='state'>Sélectionnez un projet pour activer les modules.</div>
+      <div class='sub'>Choisissez une affaire en saisissant ses premières lettres, puis accédez directement aux modules disponibles.</div>
+      <div class='selector'>
+        <input id='projectSearch' class='search' list='projectList' placeholder='Tapez les premières lettres de l'affaire'>
+        <datalist id='projectList'></datalist>
+        <div id='projectBadge' class='badge'>Aucune affaire sélectionnée</div>
+      </div>
+      <div id='state' class='state'>Sélectionnez une affaire pour activer les modules.</div>
     </section>
 
     <section class='grid'>
       <article class='card'>
-        <h3>Tableau de bord</h3>
-        <p>Point d'entrée principal pour la synthèse de pilotage. Le module sera enrichi au fur et à mesure des besoins.</p>
-        <a class='btn dark' href='/dashboard'>Ouvrir le tableau de bord</a>
+        <h3>Tableau de bord</h3><p>Porte d'entrée de pilotage de l'affaire.</p>
+        <a id='dashboardLink' class='btn disabled' href='javascript:void(0)' aria-disabled='true'>Ouvrir le tableau de bord</a>
       </article>
       <article class='card'>
-        <h3>Finances</h3>
-        <p>Module déjà disponible dans l'application : cockpit financier, suivi mensuel, export CSV et état du cache.</p>
+        <h3>Finances</h3><p>Cockpit financier détaillé de l'affaire.</p>
         <a id='financeLink' class='btn disabled' href='javascript:void(0)' aria-disabled='true'>Ouvrir Finances</a>
       </article>
-      <article class='card'>
-        <h3>Gestion de projet</h3>
-        <p>Prévu pour piloter les tâches, jalons, risques et coordination opérationnelle par projet.</p>
-        <button class='btn disabled' disabled>Bientôt disponible</button>
-      </article>
-      <article class='card'>
-        <h3>Imputation</h3>
-        <p>Prévu pour centraliser les temps, affectations de ressources et ventilation des charges.</p>
-        <button class='btn disabled' disabled>Bientôt disponible</button>
-      </article>
+      <article class='card'><h3>Gestion de projet</h3><p>Bientôt disponible.</p><button class='btn disabled' disabled>Bientôt disponible</button></article>
+      <article class='card'><h3>Imputation</h3><p>Bientôt disponible.</p><button class='btn disabled' disabled>Bientôt disponible</button></article>
     </section>
   </div>
 <script>
 const state={projects:[],selectedId:'',selectedLabel:''};
 function esc(v){return String(v||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
-function updateUi(){
-  const badge=document.getElementById('projectBadge');
-  const txt=state.selectedLabel?`Projet : ${state.selectedLabel}`:'Aucun projet sélectionné';
-  badge.textContent=txt;
-  const message=state.selectedLabel
-    ? `Modules disponibles pour ${state.selectedLabel}. Le module Finances est actif.`
-    : 'Sélectionnez un projet pour activer les modules.';
-  document.getElementById('state').textContent=message;
-  const financeLink=document.getElementById('financeLink');
-  if(state.selectedId){
-    financeLink.className='btn primary';
-    financeLink.href=`/finance?affaire_id=${encodeURIComponent(state.selectedId)}`;
-    financeLink.removeAttribute('aria-disabled');
-    localStorage.setItem('selectedAffaireId',state.selectedId);
-  }else{
-    financeLink.className='btn disabled';
-    financeLink.href='javascript:void(0)';
-    financeLink.setAttribute('aria-disabled','true');
-    localStorage.removeItem('selectedAffaireId');
-  }
-}
-async function loadProjects(){
-  try{
-    const res=await fetch('/api/finance/affaires');
-    if(!res.ok) throw new Error('API indisponible');
-    const data=await res.json();
-    state.projects=(data.items||[]).map(x=>({id:x.affaire_id,label:x.display_name})).filter(x=>x.id&&x.label);
-    state.projects.sort((a,b)=>a.label.localeCompare(b.label,'fr'));
-  }catch(_){
-    state.projects=[];
-  }
-  const select=document.getElementById('projectSelect');
-  const options=["<option value=''>Sélectionnez un projet</option>"];
-  if(state.projects.length===0){
-    options.push("<option value='' disabled>Aucun projet disponible pour le moment</option>");
-  }else{
-    options.push(...state.projects.map(p=>`<option value="${esc(p.id)}">${esc(p.label)}</option>`));
-  }
-  select.innerHTML=options.join('');
-  const savedId=localStorage.getItem('selectedAffaireId')||'';
-  const preselected=state.projects.find(p=>p.id===savedId);
-  if(preselected){
-    state.selectedId=preselected.id;
-    state.selectedLabel=preselected.label;
-    select.value=preselected.id;
-  }
-  updateUi();
-}
-document.getElementById('projectSelect').addEventListener('change',ev=>{
-  const selected=state.projects.find(p=>p.id===ev.target.value);
-  state.selectedId=selected?.id||'';
-  state.selectedLabel=selected?.label||'';
-  updateUi();
-});
+function setModuleLink(id,base){const el=document.getElementById(id);if(state.selectedId){el.className='btn primary';el.href=`/${base}?affaire_id=${encodeURIComponent(state.selectedId)}`;el.removeAttribute('aria-disabled');}else{el.className='btn disabled';el.href='javascript:void(0)';el.setAttribute('aria-disabled','true');}}
+function updateUi(){document.getElementById('projectBadge').textContent=state.selectedLabel?`Affaire : ${state.selectedLabel}`:'Aucune affaire sélectionnée';document.getElementById('state').textContent=state.selectedLabel?`Vous naviguez sur l'affaire ${state.selectedLabel}.`:'Sélectionnez une affaire pour activer les modules.';setModuleLink('financeLink','finance');setModuleLink('dashboardLink','dashboard');if(state.selectedId){localStorage.setItem('selectedAffaireId',state.selectedId);} }
+async function loadProjects(){try{const res=await fetch('/api/finance/affaires');const data=await res.json();state.projects=(data.items||[]).map(x=>({id:x.affaire_id,label:x.display_name})).filter(x=>x.id&&x.label).sort((a,b)=>a.label.localeCompare(b.label,'fr'));}catch(_){state.projects=[];}
+const list=document.getElementById('projectList');list.innerHTML=state.projects.map(p=>`<option value="${esc(p.label)}"></option>`).join('');const savedId=localStorage.getItem('selectedAffaireId')||'';const selected=state.projects.find(x=>x.id===savedId);if(selected){state.selectedId=selected.id;state.selectedLabel=selected.label;document.getElementById('projectSearch').value=selected.label;}updateUi();}
+document.getElementById('projectSearch').addEventListener('input',ev=>{const q=(ev.target.value||'').trim().toLowerCase();const selected=state.projects.find(p=>p.label.toLowerCase()===q)||state.projects.find(p=>p.label.toLowerCase().startsWith(q));state.selectedId=selected?.id||'';state.selectedLabel=selected?.label||'';updateUi();});
 loadProjects();
 </script>
 </body>
@@ -571,12 +544,12 @@ def finance_html() -> str:
 <meta name='viewport' content='width=device-width, initial-scale=1'>
 <title>Finance Cockpit</title>
 <style>
-:root{--bg:#eef2f7;--panel:#fff;--panel2:#f7f9fc;--line:#dfe5ef;--ink:#122033;--muted:#6e7a90;--blue:#2d5bff;--green:#1d9a5b;--amber:#c48716;--red:#c84c4c;--shadow:0 14px 40px rgba(19,31,53,.08)}
+:root{--bg:#eef2f7;--panel:#fff;--panel2:#f7f9fc;--line:#dfe5ef;--ink:#122033;--muted:#6e7a90;--blue:#ef8d00;--green:#1d9a5b;--amber:#c48716;--red:#c84c4c;--shadow:0 14px 40px rgba(19,31,53,.08)}
 *{box-sizing:border-box}body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:linear-gradient(180deg,#f5f7fb 0%,#eef2f7 100%);color:var(--ink)}
 .container{max-width:1440px;margin:22px auto 36px;padding:0 18px}.topbar,.hero,.section,.kpis{background:var(--panel);border:1px solid rgba(22,34,51,.04);box-shadow:var(--shadow);border-radius:24px}
 .topbar{display:flex;gap:16px;align-items:center;padding:18px 20px;position:sticky;top:14px;z-index:10}.brand{min-width:200px}.brand h1{margin:0;font-size:36px;line-height:1}.brand p{margin:6px 0 0;color:var(--muted);font-size:14px}
 .controls{display:flex;gap:12px;align-items:center;flex:1;flex-wrap:wrap}.search,.select{height:48px;border-radius:14px;border:1px solid var(--line);background:#fff;padding:0 14px;color:var(--ink);font-size:15px}.search{min-width:280px;flex:1}.select{min-width:340px;flex:1}
-.btn{height:48px;border:none;border-radius:14px;padding:0 16px;font-weight:700;cursor:pointer}.btn.primary{background:var(--blue);color:#fff}.btn.dark{background:#13213a;color:#fff}
+.btn{height:48px;border:none;border-radius:14px;padding:0 16px;font-weight:700;cursor:pointer}.btn.primary{background:var(--blue);color:#fff}.btn.dark{background:#ef8d00;color:#fff}
 .badge{display:inline-flex;align-items:center;gap:8px;padding:10px 12px;border-radius:999px;background:var(--panel2);color:var(--muted);font-size:13px;font-weight:700}.dot{width:10px;height:10px;border-radius:50%}.dot.ready{background:var(--green)}.dot.building{background:var(--amber)}.dot.error{background:var(--red)}.dot.idle{background:#9aa6b8}
 .hero{margin-top:18px;padding:26px 28px}.hero-top{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap}.hero h2{margin:8px 0 4px;font-size:42px;line-height:1.02}.eyebrow{font-size:12px;font-weight:800;color:var(--blue);letter-spacing:.14em;text-transform:uppercase}
 .meta-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin-top:18px}.meta-pill{background:var(--panel2);border:1px solid var(--line);border-radius:18px;padding:14px 16px}.meta-pill .label{font-size:12px;color:var(--muted);text-transform:uppercase;font-weight:800;letter-spacing:.08em}.meta-pill .value{margin-top:6px;font-size:16px;font-weight:700}
@@ -601,6 +574,8 @@ def finance_html() -> str:
       <select id='affaireSelect' class='select'><option value=''>Sélectionnez une affaire</option></select>
       <button id='reloadBtn' class='btn primary'>Reconstruire le cache</button>
       <button id='exportBtn' class='btn dark' disabled>Exporter CSV</button>
+      <a id='dashboardBtn' class='btn dark' href='/dashboard'>Tableau de bord</a>
+      <a class='btn dark' href='/'>Accueil</a>
       <div id='cacheBadge' class='badge'><span class='dot idle'></span><span>Cache : attente</span></div>
     </div>
   </div>
@@ -628,7 +603,7 @@ def finance_html() -> str:
 
   <div class='kpis'><div class='kpi-grid'>
     <div class='kpi' id='kpiCommandeCard'><div class='label'>Commande HT</div><div class='value' id='kpiCommande'>0 €</div><div class='sub'>Montant contractualisé</div></div>
-    <div class='kpi' id='kpiFactureCard'><div class='label'>Facturation cumulée 2026</div><div class='value' id='kpiFacture'>0 €</div><div class='sub'>Montant déjà facturé</div></div>
+    <div class='kpi' id='kpiFactureCard'><div class='label'>Facturation cumulée 2017-2026</div><div class='value' id='kpiFacture'>0 €</div><div class='sub'>Antériorité incluse</div></div>
     <div class='kpi' id='kpiResteCard'><div class='label'>Reste à facturer</div><div class='value' id='kpiReste'>0 €</div><div class='sub'>Solde estimé</div></div>
     <div class='kpi' id='kpiAvanceCard'><div class='label'>Avancement financier</div><div class='value' id='kpiAvance'>0 %</div><div class='sub'>Facturé / commande</div></div>
     <div class='kpi' id='kpiPrevCard'><div class='label'>Total prévisionnel</div><div class='value' id='kpiPrev'>0 €</div><div class='sub'>Somme mensuelle prévue</div></div>
@@ -637,9 +612,9 @@ def finance_html() -> str:
 
   <div class='layout'>
     <div class='section chart-card'>
-      <h3>Rythme mensuel</h3>
+      <h3>Facturation mensuelle</h3>
       <div class='chart-wrap'><svg id='monthlyChart' width='100%' height='100%' viewBox='0 0 980 320' preserveAspectRatio='none'></svg></div>
-      <div class='legend'><span><i class='swatch' style='background:#dbe6ff'></i>Prévisionnel</span><span><i class='swatch' style='background:#2d5bff'></i>Facturé</span></div>
+      <div class='legend'><span><i class='swatch' style='background:#dbe6ff'></i>Prévisionnel</span><span><i class='swatch' style='background:#ef8d00'></i>Facturation</span></div>
     </div>
     <div class='section'><h3>Insights / alertes</h3><div id='insightsBox' class='insights'><div class='empty' style='width:100%'>Sélectionnez une affaire.</div></div><div class='footer-row'><div class='small' id='statusMeta'>Cache en attente.</div></div></div>
   </div>
@@ -668,12 +643,12 @@ async function loadSelectedAffaire(id){if(!id){state.selectedAffaireId='';state.
 function setHeroEmpty(){document.getElementById('heroTitle').textContent='Sélectionnez une affaire';document.getElementById('heroSubtitle').textContent='Le cockpit se remplit à partir du cache du tableau activité.';document.getElementById('metaClient').textContent='-';document.getElementById('metaAffaire').textContent='-';document.getElementById('metaTags').textContent='-';document.getElementById('metaDelay').textContent='-';const h=document.getElementById('heroHealth');h.textContent='En attente';h.className='health warn';}
 function cardTone(id,tone){const el=document.getElementById(id);el.classList.remove('good','warn','bad');if(tone)el.classList.add(tone);}
 function renderHero(){const a=state.selectedAffaire;if(!a){setHeroEmpty();return;}document.getElementById('heroTitle').textContent=a.display_name||'-';document.getElementById('heroSubtitle').textContent=`Client ${a.client||'-'} · ${(a.missions||[]).length} mission(s)`;document.getElementById('metaClient').textContent=a.client||'-';document.getElementById('metaAffaire').textContent=a.affaire||'-';document.getElementById('metaTags').textContent=(a.tags||[]).join(' · ')||'-';document.getElementById('metaDelay').textContent=a.delai_reglement_jours?`${a.delai_reglement_jours} jours`:'-';document.getElementById('metaCache').textContent=(state.cacheStatus&&state.cacheStatus.generated_at)||'-';const hh=healthClass(a),el=document.getElementById('heroHealth');el.textContent=hh.label;el.className=`health ${hh.cls}`;}
-function renderKpis(){const a=state.selectedAffaire||{commande_ht:0,facturation_cumulee_2026:0,reste_a_facturer:0,taux_avancement_financier:0,total_previsionnel:0,ecart_previsionnel_vs_facture:0};document.getElementById('kpiCommande').textContent=euro(a.commande_ht);document.getElementById('kpiFacture').textContent=euro(a.facturation_cumulee_2026);document.getElementById('kpiReste').textContent=euro(a.reste_a_facturer);document.getElementById('kpiAvance').textContent=pct(a.taux_avancement_financier);document.getElementById('kpiPrev').textContent=euro(a.total_previsionnel);document.getElementById('kpiEcart').textContent=euro(a.ecart_previsionnel_vs_facture);cardTone('kpiCommandeCard','good');cardTone('kpiFactureCard',a.facturation_cumulee_2026>0?'good':'warn');cardTone('kpiResteCard',a.reste_a_facturer<0?'bad':(a.reste_a_facturer>(a.commande_ht||0)*0.5?'warn':'good'));cardTone('kpiAvanceCard',a.taux_avancement_financier>0.85?'good':(a.taux_avancement_financier<0.35?'warn':''));cardTone('kpiPrevCard','good');cardTone('kpiEcartCard',a.ecart_previsionnel_vs_facture>=0?'good':'bad');}
-function renderFinanceChart(){const root=document.getElementById('monthlyChart');const a=state.selectedAffaire;if(!a){root.innerHTML=`<text x="490" y="160" text-anchor="middle" fill="#6e7a90" font-size="18">Sélectionnez une affaire</text>`;return;}const s=MONTHS.map(m=>({label:MONTH_LABELS[m],pre:Number((((a.mensuel||{})[m]||{}).previsionnel)||0),fac:Number((((a.mensuel||{})[m]||{}).facture)||0)}));const maxVal=Math.max(1,...s.flatMap(x=>[x.pre,x.fac]));const left=56,top=16,width=880,height=250,step=width/s.length,barW=step*0.48;let grid='',bars='',labels='';const points=[];for(let i=0;i<=4;i++){const y=top+(height/4)*i,val=Math.round(maxVal*(1-i/4));grid+=`<line x1="${left}" y1="${y}" x2="${left+width}" y2="${y}" stroke="#dfe5ef" stroke-width="1"/><text x="${left-10}" y="${y+4}" text-anchor="end" fill="#8090a8" font-size="12">${fmt(val)}</text>`;}s.forEach((it,i)=>{const x=left+i*step+(step-barW)/2;const h=(it.pre/maxVal)*height;const y=top+height-h;const py=top+height-(it.fac/maxVal)*height;bars+=`<rect x="${x}" y="${y}" width="${barW}" height="${Math.max(h,0.5)}" rx="8" fill="#dbe6ff"><title>${it.label} prévisionnel: ${euro(it.pre)}</title></rect>`;points.push(`${x+barW/2},${py}`);labels+=`<text x="${x+barW/2}" y="${top+height+22}" text-anchor="middle" fill="#66748b" font-size="12">${it.label}</text>`;});root.innerHTML=`${grid}<line x1="${left}" y1="${top+height}" x2="${left+width}" y2="${top+height}" stroke="#b8c3d4" stroke-width="1.2"/>${bars}<polyline points="${points.join(' ')}" fill="none" stroke="#2d5bff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>${points.map((p,i)=>{const q=p.split(',');return `<circle cx="${q[0]}" cy="${q[1]}" r="4.5" fill="#fff" stroke="#2d5bff" stroke-width="3"><title>${s[i].label} facturé: ${euro(s[i].fac)}</title></circle>`;}).join('')}${labels}`;}
+function renderKpis(){const a=state.selectedAffaire||{commande_ht:0,total_facturation_cumulee:0,reste_a_facturer:0,taux_avancement_financier:0,total_previsionnel:0,ecart_previsionnel_vs_facture:0};document.getElementById('kpiCommande').textContent=euro(a.commande_ht);document.getElementById('kpiFacture').textContent=euro(a.total_facturation_cumulee||a.facturation_cumulee_2026||0);document.getElementById('kpiReste').textContent=euro(a.reste_a_facturer);document.getElementById('kpiAvance').textContent=pct(a.taux_avancement_financier);document.getElementById('kpiPrev').textContent=euro(a.total_previsionnel);document.getElementById('kpiEcart').textContent=euro(a.ecart_previsionnel_vs_facture);cardTone('kpiCommandeCard','good');cardTone('kpiFactureCard',a.facturation_cumulee_2026>0?'good':'warn');cardTone('kpiResteCard',a.reste_a_facturer<0?'bad':(a.reste_a_facturer>(a.commande_ht||0)*0.5?'warn':'good'));cardTone('kpiAvanceCard',a.taux_avancement_financier>0.85?'good':(a.taux_avancement_financier<0.35?'warn':''));cardTone('kpiPrevCard','good');cardTone('kpiEcartCard',a.ecart_previsionnel_vs_facture>=0?'good':'bad');}
+function renderFinanceChart(){const root=document.getElementById('monthlyChart');const a=state.selectedAffaire;if(!a){root.innerHTML=`<text x="490" y="160" text-anchor="middle" fill="#6e7a90" font-size="18">Sélectionnez une affaire</text>`;return;}const s=MONTHS.map(m=>({label:MONTH_LABELS[m],pre:Number((((a.mensuel||{})[m]||{}).previsionnel)||0),fac:Number((((a.mensuel||{})[m]||{}).facture)||0)}));const maxVal=Math.max(1,...s.flatMap(x=>[x.pre,x.fac]));const left=56,top=16,width=880,height=250,step=width/s.length,barW=step*0.48;let grid='',bars='',labels='';const points=[];for(let i=0;i<=4;i++){const y=top+(height/4)*i,val=Math.round(maxVal*(1-i/4));grid+=`<line x1="${left}" y1="${y}" x2="${left+width}" y2="${y}" stroke="#dfe5ef" stroke-width="1"/><text x="${left-10}" y="${y+4}" text-anchor="end" fill="#8090a8" font-size="12">${fmt(val)}</text>`;}s.forEach((it,i)=>{const x=left+i*step+(step-barW)/2;const h=(it.pre/maxVal)*height;const y=top+height-h;const py=top+height-(it.fac/maxVal)*height;bars+=`<rect x="${x}" y="${y}" width="${barW}" height="${Math.max(h,0.5)}" rx="8" fill="#dbe6ff"><title>${it.label} prévisionnel: ${euro(it.pre)}</title></rect>`;points.push(`${x+barW/2},${py}`);labels+=`<text x="${x+barW/2}" y="${top+height+22}" text-anchor="middle" fill="#66748b" font-size="12">${it.label}</text>`;});root.innerHTML=`${grid}<line x1="${left}" y1="${top+height}" x2="${left+width}" y2="${top+height}" stroke="#b8c3d4" stroke-width="1.2"/>${bars}<polyline points="${points.join(' ')}" fill="none" stroke="#ef8d00" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>${points.map((p,i)=>{const q=p.split(',');return `<circle cx="${q[0]}" cy="${q[1]}" r="4.5" fill="#fff" stroke="#ef8d00" stroke-width="3"><title>${s[i].label} facturé: ${euro(s[i].fac)}</title></circle>`;}).join('')}${labels}`;}
 function renderMonthlyTable(){const root=document.getElementById('monthlyTableWrap');const a=state.selectedAffaire;if(!a){root.innerHTML=`<div class='empty'>Sélectionnez une affaire pour afficher le détail mensuel.</div>`;return;}let rows='';MONTHS.forEach(m=>{const pre=Number((((a.mensuel||{})[m]||{}).previsionnel)||0),fac=Number((((a.mensuel||{})[m]||{}).facture)||0),ec=fac-pre;rows+=`<tr><td>${MONTH_LABELS[m]}</td><td class='num'>${euro(pre)}</td><td class='num'>${euro(fac)}</td><td class='num delta ${ec>=0?'pos':'neg'}'>${euro(ec)}</td></tr>`;});rows+=`<tr><td><strong>Total</strong></td><td class='num'><strong>${euro(a.total_previsionnel||0)}</strong></td><td class='num'><strong>${euro(a.total_facture||0)}</strong></td><td class='num delta ${Number(a.ecart_previsionnel_vs_facture||0)>=0?'pos':'neg'}'><strong>${euro(a.ecart_previsionnel_vs_facture||0)}</strong></td></tr>`;root.innerHTML=`<table><thead><tr><th>Mois</th><th class='num'>Prévisionnel</th><th class='num'>Facturé</th><th class='num'>Écart</th></tr></thead><tbody>${rows}</tbody></table>`;}
-function renderMissions(){const root=document.getElementById('missionsTableWrap');const meta=document.getElementById('missionsMeta');const a=state.selectedAffaire;if(!a){meta.textContent='0 mission';root.innerHTML=`<div class='empty'>Sélectionnez une affaire pour afficher les missions.</div>`;return;}const missions=a.missions||[];meta.textContent=`${missions.length} mission(s)`;if(!missions.length){root.innerHTML=`<div class='empty'>Aucune mission détaillée sur cette affaire.</div>`;return;}root.innerHTML=`<table><thead><tr><th>Tag</th><th>Mission</th><th>N°</th><th class='num'>Commande</th><th class='num'>Fact. 2026</th><th class='num'>Reste</th><th class='num'>Prévisionnel</th><th class='num'>Facturé</th></tr></thead><tbody>${missions.map(m=>`<tr><td>${esc(m.tag||'')}</td><td>${esc(m.label||'')}</td><td>${esc(m.numero||'')}</td><td class='num'>${euro(m.commande_ht)}</td><td class='num'>${euro(m.facturation_cumulee_2026)}</td><td class='num'>${euro(m.reste_a_facturer)}</td><td class='num'>${euro(m.total_previsionnel)}</td><td class='num'>${euro(m.total_facture)}</td></tr>`).join('')}</tbody></table>`;}
+function renderMissions(){const root=document.getElementById('missionsTableWrap');const meta=document.getElementById('missionsMeta');const a=state.selectedAffaire;if(!a){meta.textContent='0 mission';root.innerHTML=`<div class='empty'>Sélectionnez une affaire pour afficher les missions.</div>`;return;}const missions=a.missions||[];meta.textContent=`${missions.length} mission(s)`;if(!missions.length){root.innerHTML=`<div class='empty'>Aucune mission détaillée sur cette affaire.</div>`;return;}root.innerHTML=`<table><thead><tr><th>Tag</th><th>Mission</th><th>N°</th><th class='num'>Commande</th><th class='num'>Fact. cumulée</th><th class='num'>Reste</th><th class='num'>Prévisionnel</th><th class='num'>Facturé</th></tr></thead><tbody>${missions.map(m=>`<tr><td>${esc(m.tag||'')}</td><td>${esc(m.label||'')}</td><td>${esc(m.numero||'')}</td><td class='num'>${euro(m.commande_ht)}</td><td class='num'>${euro(m.total_facturation_cumulee||m.facturation_cumulee_2026)}</td><td class='num'>${euro(m.reste_a_facturer)}</td><td class='num'>${euro(m.total_previsionnel)}</td><td class='num'>${euro(m.total_facture)}</td></tr>`).join('')}</tbody></table>`;}
 function renderInsights(){const root=document.getElementById('insightsBox');const a=state.selectedAffaire;if(!a){root.innerHTML=`<div class='empty' style='width:100%'>Sélectionnez une affaire.</div>`;return;}const items=a.insights||[];root.innerHTML=items.map(x=>`<div class='insight'>${esc(x)}</div>`).join('');}
-function renderAll(){renderHero();renderKpis();renderFinanceChart();renderMonthlyTable();renderMissions();renderInsights();document.getElementById('exportBtn').disabled=!state.selectedAffaireId;}
+function renderAll(){renderHero();renderKpis();renderFinanceChart();renderMonthlyTable();renderMissions();renderInsights();document.getElementById('exportBtn').disabled=!state.selectedAffaireId;const dash=document.getElementById('dashboardBtn');dash.href=state.selectedAffaireId?`/dashboard?affaire_id=${encodeURIComponent(state.selectedAffaireId)}`:'/dashboard';}
 async function rebuildCache(){clearError();showNotice('Reconstruction du cache en cours…');await api('/api/finance/rebuild-cache',{method:'POST'});await loadCacheStatus();await loadAffairesList(document.getElementById('searchInput').value||'');if(state.selectedAffaireId&&state.affaires.some(x=>x.affaire_id===state.selectedAffaireId)){await loadSelectedAffaire(state.selectedAffaireId);}else{state.selectedAffaireId='';state.selectedAffaire=null;renderAll();}showNotice('Cache reconstruit avec succès.');}
 async function initFinancePage(){clearError();try{await loadCacheStatus();await loadAffairesList('');const params=new URLSearchParams(window.location.search);const affairFromUrl=params.get('affaire_id');const affairFromStorage=localStorage.getItem('selectedAffaireId')||'';const preselected=affairFromUrl||affairFromStorage;if(preselected&&state.affaires.some(x=>x.affaire_id===preselected)){document.getElementById('affaireSelect').value=preselected;await loadSelectedAffaire(preselected);}else{renderAll();}}catch(err){showError(err.message||'Erreur de chargement');}
 document.getElementById('searchInput').addEventListener('input',async ev=>{clearError();try{await loadAffairesList(ev.target.value||'');if(state.selectedAffaireId&&!state.affaires.some(x=>x.affaire_id===state.selectedAffaireId)){state.selectedAffaireId='';state.selectedAffaire=null;document.getElementById('affaireSelect').value='';renderAll();}}catch(err){showError(err.message||'Erreur de recherche');}});
@@ -693,15 +668,61 @@ def dashboard_html() -> str:
 <head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
 <title>Gestion Affaire - Tableau de bord</title>
 <style>
-body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:#f3f6fb;color:#122033}
-.wrap{max-width:1080px;margin:42px auto;padding:0 20px}
-.card{background:#fff;border:1px solid #e0e6f0;border-radius:24px;padding:28px;box-shadow:0 12px 34px rgba(18,32,51,.07)}
-h1{margin:8px 0 12px;font-size:40px}p{color:#62708a;font-size:17px;line-height:1.5}.eyebrow{font-size:12px;color:#2d5bff;font-weight:800;letter-spacing:.12em;text-transform:uppercase}
-.actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:20px}.btn{display:inline-flex;align-items:center;text-decoration:none;background:#2d5bff;color:#fff;height:46px;padding:0 16px;border-radius:12px;font-weight:700}
-.btn.secondary{background:#142033}
+:root{--line:#dfe5ef;--ink:#122033;--muted:#6e7a90;--accent:#ef8d00;--panel:#fff;--shadow:0 12px 34px rgba(18,32,51,.07)}
+*{box-sizing:border-box}body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:#f3f6fb;color:var(--ink)}
+.wrap{max-width:1320px;margin:22px auto;padding:0 16px}.top,.hero,.kpis,.chart{background:var(--panel);border:1px solid var(--line);border-radius:22px;box-shadow:var(--shadow)}
+.top{padding:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}.search,.select{height:44px;border:1px solid var(--line);border-radius:12px;padding:0 12px;min-width:280px}
+.btn{height:44px;border-radius:12px;border:none;padding:0 14px;background:var(--accent);color:#fff;text-decoration:none;display:inline-flex;align-items:center;font-weight:800;cursor:pointer}
+.hero{padding:18px;margin-top:14px}.eyeb{font-size:12px;font-weight:800;letter-spacing:.12em;color:var(--accent);text-transform:uppercase}.title{font-size:36px;font-weight:900;margin:6px 0}.muted{color:var(--muted)}
+.kpis{padding:14px;margin-top:14px}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.k{border:1px solid var(--line);border-radius:14px;padding:14px;background:#fbfdff}.k .v{font-size:36px;font-weight:900;margin-top:6px}
+.chart{padding:14px;margin-top:14px}.chart-wrap{height:340px;border:1px solid var(--line);border-radius:14px;padding:8px;background:#f9fbff}
+@media (max-width:900px){.grid{grid-template-columns:1fr}.title{font-size:28px}}
 </style></head>
-<body><div class='wrap'><div class='card'><div class='eyebrow'>Synthèse transverse</div><h1>Tableau de bord</h1><p>Ce module est volontairement positionné en premier accès : il deviendra la porte d'entrée de pilotage global de vos affaires. Les indicateurs consolidés seront ajoutés progressivement.</p><div class='actions'><a class='btn' href='/'>Retour accueil</a><a class='btn secondary' href='/finance'>Accéder au cockpit Finance</a></div></div></div></body>
+<body>
+<div class='wrap'>
+  <div class='top'>
+    <a class='btn' href='/'>Accueil</a>
+    <input id='searchInput' class='search' type='search' placeholder='Rechercher une affaire'>
+    <select id='affaireSelect' class='select'><option value=''>Sélectionnez une affaire</option></select>
+    <a id='financeBtn' class='btn' href='/finance'>Finances</a>
+    <button id='exportBtn' class='btn' disabled>Exporter CSV</button>
+  </div>
+  <div class='hero'>
+    <div class='eyeb'>Tableau de bord</div>
+    <div id='title' class='title'>Sélectionnez une affaire</div>
+    <div id='subtitle' class='muted'>Synthèse principale : client, commande, facturation cumulée, reste à facturer.</div>
+  </div>
+  <div class='kpis'><div class='grid'>
+    <div class='k'><div class='muted'>Commande HT</div><div id='kCommande' class='v'>0 €</div></div>
+    <div class='k'><div class='muted'>Facturation cumulée</div><div id='kFacture' class='v'>0 €</div></div>
+    <div class='k'><div class='muted'>Reste à facturer</div><div id='kReste' class='v'>0 €</div></div>
+  </div></div>
+  <div class='chart'><h3>Prévisionnel vs facturation (mois restants)</h3><div class='chart-wrap'><svg id='chart' width='100%' height='320' viewBox='0 0 980 320' preserveAspectRatio='none'></svg></div></div>
+</div>
+<script>
+const MONTHS=['janvier','fevrier','mars','avril','mai','juin','juillet','aout','septembre','octobre','novembre','decembre'];
+const MONTH_LABELS={janvier:'Janv.',fevrier:'Févr.',mars:'Mars',avril:'Avr.',mai:'Mai',juin:'Juin',juillet:'Juil.',aout:'Août',septembre:'Sept.',octobre:'Oct.',novembre:'Nov.',decembre:'Déc.'};
+const state={affaires:[],selectedId:'',selected:null};
+function euro(v){return new Intl.NumberFormat('fr-FR',{style:'currency',currency:'EUR',maximumFractionDigits:0}).format(Number(v||0));}
+function esc(v){return String(v||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
+async function api(u){const r=await fetch(u);const d=await r.json();if(!r.ok) throw new Error(d.detail||'Erreur API');return d;}
+async function loadAffairesList(search=''){const d=await api(`/api/finance/affaires?search=${encodeURIComponent(search)}`);state.affaires=d.items||[];const sel=document.getElementById('affaireSelect');sel.innerHTML=`<option value=''>Sélectionnez une affaire</option>`+state.affaires.map(x=>`<option value="${esc(x.affaire_id)}">${esc(x.display_name)}</option>`).join('');if(state.selectedId&&state.affaires.some(x=>x.affaire_id===state.selectedId)){sel.value=state.selectedId;}}
+async function loadSelectedAffaire(id){if(!id){state.selectedId='';state.selected=null;render();return;}const d=await api(`/api/finance/affaire/${encodeURIComponent(id)}`);state.selectedId=id;state.selected=d.affaire;localStorage.setItem('selectedAffaireId',id);render();}
+function renderChart(){const root=document.getElementById('chart');const a=state.selected;if(!a){root.innerHTML='';return;}const monthIdx=(new Date().getMonth());const data=MONTHS.slice(monthIdx).map(m=>({label:MONTH_LABELS[m],pre:Number(((a.mensuel||{})[m]||{}).previsionnel||0),fac:Number(((a.mensuel||{})[m]||{}).facture||0)}));const max=Math.max(1,...data.flatMap(x=>[x.pre,x.fac]));const left=56,top=20,width=880,height=240,step=width/Math.max(1,data.length),bw=step*0.46;let out='';for(let i=0;i<=4;i++){const y=top+(height/4)*i;out+=`<line x1="${left}" y1="${y}" x2="${left+width}" y2="${y}" stroke="#dfe5ef"/><text x="${left-8}" y="${y+4}" text-anchor="end" fill="#8190a8" font-size="12">${Math.round(max*(1-i/4))}</text>`;}const pts=[];data.forEach((d,i)=>{const x=left+i*step+(step-bw)/2;const h=(d.pre/max)*height;const y=top+height-h;const py=top+height-(d.fac/max)*height;out+=`<rect x="${x}" y="${y}" width="${bw}" height="${Math.max(h,1)}" rx="7" fill="#fbd8a8"></rect><text x="${x+bw/2}" y="${top+height+18}" text-anchor="middle" fill="#6f7f98" font-size="12">${d.label}</text>`;pts.push(`${x+bw/2},${py}`);});out+=`<polyline points="${pts.join(' ')}" fill="none" stroke="#ef8d00" stroke-width="4"/>`;root.innerHTML=out;}
+function render(){const a=state.selected;document.getElementById('financeBtn').href=state.selectedId?`/finance?affaire_id=${encodeURIComponent(state.selectedId)}`:'/finance';document.getElementById('exportBtn').disabled=!state.selectedId;document.getElementById('title').textContent=a?(a.display_name||'-'):'Sélectionnez une affaire';document.getElementById('subtitle').textContent=a?`Client ${a.client||'-'} · ${a.affaire||'-'}`:'Synthèse principale : client, commande, facturation cumulée, reste à facturer.';document.getElementById('kCommande').textContent=euro(a?a.commande_ht:0);document.getElementById('kFacture').textContent=euro(a?(a.total_facturation_cumulee||a.facturation_cumulee_2026):0);document.getElementById('kReste').textContent=euro(a?a.reste_a_facturer:0);renderChart();}
+async function init(){await loadAffairesList('');const params=new URLSearchParams(window.location.search);const pre=params.get('affaire_id')||localStorage.getItem('selectedAffaireId')||'';if(pre&&state.affaires.some(x=>x.affaire_id===pre)){document.getElementById('affaireSelect').value=pre;await loadSelectedAffaire(pre);}else{render();}document.getElementById('searchInput').addEventListener('input',async e=>{await loadAffairesList(e.target.value||'');});document.getElementById('affaireSelect').addEventListener('change',async e=>loadSelectedAffaire(e.target.value||''));document.getElementById('exportBtn').addEventListener('click',()=>{if(state.selectedId)window.location.href=`/api/finance/affaire/${encodeURIComponent(state.selectedId)}/export-csv`;});}
+init();
+</script>
+</body>
 </html>"""
+
+
+
+@app.get("/assets/logo-tempo")
+def tempo_logo():
+    if os.path.exists(TEMPO_LOGO_PATH):
+        return FileResponse(TEMPO_LOGO_PATH)
+    raise HTTPException(status_code=404, detail="Logo Tempo introuvable")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -802,14 +823,14 @@ def api_affaire_export_csv(affaire_id: str):
         row = item.get("mensuel", {}).get(month, {})
         writer.writerow([MONTH_LABELS[month], row.get("previsionnel", 0), row.get("facture", 0), row.get("ecart", 0)])
     writer.writerow([])
-    writer.writerow(["Tag", "Mission", "Numero", "Commande HT", "Facturation 2026", "Reste à facturer", "Total prévisionnel", "Total facturé"])
+    writer.writerow(["Tag", "Mission", "Numero", "Commande HT", "Facturation cumulée", "Reste à facturer", "Total prévisionnel", "Total facturé"])
     for mission in item.get("missions", []):
         writer.writerow([
             mission.get("tag", ""),
             mission.get("label", ""),
             mission.get("numero", ""),
             mission.get("commande_ht", 0),
-            mission.get("facturation_cumulee_2026", 0),
+            mission.get("total_facturation_cumulee", mission.get("facturation_cumulee_2026", 0)),
             mission.get("reste_a_facturer", 0),
             mission.get("total_previsionnel", 0),
             mission.get("total_facture", 0),
