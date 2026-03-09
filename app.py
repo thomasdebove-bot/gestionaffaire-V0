@@ -107,6 +107,14 @@ def row_tuple_to_dict(values: tuple) -> Dict[str, Any]:
     return data
 
 
+def cumulative_facturation_from_row(row: Dict[str, Any]) -> float:
+    return sum(
+        clean_number(value)
+        for key, value in row.items()
+        if isinstance(key, str) and key.startswith("facturation_cumulee_")
+    )
+
+
 class FinanceService:
     def __init__(self, workbook_path: str, sheet_name: str, cache_file: str) -> None:
         self.workbook_path = workbook_path
@@ -299,24 +307,19 @@ class FinanceService:
 
         mensuel = month_payload()
         for month in MONTHS:
-            pre = clean_number(row.get(f"{month}_previsionnel"))
+            pre_raw = clean_number(row.get(f"{month}_previsionnel"))
             fac = clean_number(row.get(f"{month}_facture"))
+            pre = pre_raw if abs(fac) < 1e-9 else 0.0
             mensuel[month]["previsionnel"] = pre
             mensuel[month]["facture"] = fac
             mensuel[month]["ecart"] = fac - pre
 
-        total_previsionnel = clean_number(row.get("total_previsionnel")) or sum(mensuel[m]["previsionnel"] for m in MONTHS)
+        total_previsionnel = sum(mensuel[m]["previsionnel"] for m in MONTHS)
         total_facture = clean_number(row.get("total_facture")) or sum(mensuel[m]["facture"] for m in MONTHS)
         commande_ht = clean_number(row.get("commande_ht"))
         fact_2026 = clean_number(row.get("facturation_cumulee_2026"))
-        total_facturation_cumulee = sum(clean_number(row.get(k)) for k in [
-            "facturation_cumulee_2017", "facturation_cumulee_2018", "facturation_cumulee_2021",
-            "facturation_cumulee_2022", "facturation_cumulee_2023", "facturation_cumulee_2024",
-            "facturation_cumulee_2025", "facturation_cumulee_2026",
-        ])
-        reste_col = clean_number(row.get("reste_a_facturer"))
-        reste_calc = commande_ht - total_facturation_cumulee
-        reste = reste_calc if (abs(reste_col) < 1e-9 or abs(reste_col - reste_calc) > max(1.0, commande_ht * 0.35)) else reste_col
+        total_facturation_cumulee = cumulative_facturation_from_row(row)
+        reste = clean_number(row.get("reste_a_facturer"))
 
         return {
             "affaire_id": affaire_id,
@@ -353,6 +356,13 @@ class FinanceService:
             "label": data.get("affaire", ""),
             "numero": data.get("numero", ""),
             "commande_ht": data.get("commande_ht", 0.0),
+            "facturation_cumulee_2017": data.get("facturation_cumulee_2017", 0.0),
+            "facturation_cumulee_2018": data.get("facturation_cumulee_2018", 0.0),
+            "facturation_cumulee_2021": data.get("facturation_cumulee_2021", 0.0),
+            "facturation_cumulee_2022": data.get("facturation_cumulee_2022", 0.0),
+            "facturation_cumulee_2023": data.get("facturation_cumulee_2023", 0.0),
+            "facturation_cumulee_2024": data.get("facturation_cumulee_2024", 0.0),
+            "facturation_cumulee_2025": data.get("facturation_cumulee_2025", 0.0),
             "facturation_cumulee_2026": data.get("facturation_cumulee_2026", 0.0),
             "total_facturation_cumulee": data.get("total_facturation_cumulee", data.get("facturation_cumulee_2026", 0.0)),
             "reste_a_facturer": data.get("reste_a_facturer", 0.0),
@@ -374,11 +384,7 @@ class FinanceService:
             for mission in missions:
                 commande += clean_number(mission.get("commande_ht"))
                 facture_2026 += clean_number(mission.get("facturation_cumulee_2026"))
-                facture_cumulee += sum(clean_number(mission.get(k)) for k in [
-                    "facturation_cumulee_2017", "facturation_cumulee_2018", "facturation_cumulee_2021",
-                    "facturation_cumulee_2022", "facturation_cumulee_2023", "facturation_cumulee_2024",
-                    "facturation_cumulee_2025", "facturation_cumulee_2026",
-                ])
+                facture_cumulee += cumulative_facturation_from_row(mission)
                 if clean_number(mission.get("delai_reglement_jours")) > 0:
                     delai_values.append(safe_int(mission.get("delai_reglement_jours")))
                 if mission.get("tag"):
@@ -394,12 +400,10 @@ class FinanceService:
 
             affaire["commande_ht"] = commande or affaire.get("commande_ht", 0.0)
             affaire["facturation_cumulee_2026"] = facture_2026 or affaire.get("facturation_cumulee_2026", 0.0)
-            affaire["total_facturation_cumulee"] = facture_cumulee or sum(clean_number(affaire.get(k)) for k in [
-                "facturation_cumulee_2017", "facturation_cumulee_2018", "facturation_cumulee_2021",
-                "facturation_cumulee_2022", "facturation_cumulee_2023", "facturation_cumulee_2024",
-                "facturation_cumulee_2025", "facturation_cumulee_2026",
-            ])
-            affaire["reste_a_facturer"] = affaire["commande_ht"] - affaire["total_facturation_cumulee"]
+            affaire["total_facturation_cumulee"] = facture_cumulee or cumulative_facturation_from_row(affaire)
+            reste_parent = clean_number(affaire.get("reste_a_facturer"))
+            reste_missions = sum(clean_number(m.get("reste_a_facturer")) for m in missions)
+            affaire["reste_a_facturer"] = reste_parent if abs(reste_parent) > 1e-9 else reste_missions
             affaire["mensuel"] = monthly
             affaire["tags"] = sorted(set([t for t in tags if t]))
             affaire["numero"] = numero
@@ -413,13 +417,7 @@ class FinanceService:
             if affaire.get("tag") and not affaire.get("tags"):
                 affaire["tags"] = [affaire["tag"]]
 
-        affaire["total_facturation_cumulee"] = clean_number(affaire.get("total_facturation_cumulee")) or sum(clean_number(affaire.get(k)) for k in [
-            "facturation_cumulee_2017", "facturation_cumulee_2018", "facturation_cumulee_2021",
-            "facturation_cumulee_2022", "facturation_cumulee_2023", "facturation_cumulee_2024",
-            "facturation_cumulee_2025", "facturation_cumulee_2026",
-        ])
-        if not clean_number(affaire.get("reste_a_facturer")) and clean_number(affaire.get("commande_ht")):
-            affaire["reste_a_facturer"] = clean_number(affaire.get("commande_ht")) - clean_number(affaire.get("total_facturation_cumulee"))
+        affaire["total_facturation_cumulee"] = clean_number(affaire.get("total_facturation_cumulee")) or cumulative_facturation_from_row(affaire)
         affaire["insights"] = self.compute_insights(affaire)
         affaire.pop("tag", None)
         affaire.pop("_row_index", None)
