@@ -1,11 +1,11 @@
 import hashlib
+import json
 import logging
 import os
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
-from flask import Flask, jsonify
-from openpyxl import load_workbook
+from urllib.parse import unquote
 
 
 DEFAULT_WORKBOOK_PATH = r"\\192.168.10.100\03 - finances\10 - TABLEAU DE BORD\01 - TABLEAU ACTIVITEE\TABLEAU ACTIVITEE.xlsx"
@@ -101,70 +101,103 @@ class InMemoryCache:
         self._store[key] = value
 
 
-fallback_cache = InMemoryCache()
+class FinanceASGIApp:
+    def __init__(self) -> None:
+        self.config = {
+            "FINANCE_WORKBOOK_PATH": os.getenv("FINANCE_WORKBOOK_PATH", DEFAULT_WORKBOOK_PATH),
+            "FINANCE_SHEET_NAME": os.getenv("FINANCE_SHEET_NAME", DEFAULT_SHEET_NAME),
+            "FINANCE_DEBUG_PARSE": os.getenv("FINANCE_DEBUG_PARSE", "0") == "1",
+        }
+        self.cache = InMemoryCache()
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+        self.logger = logging.getLogger("finance")
 
+    async def __call__(self, scope: Dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self._send_json(send, 404, {"error": "Unsupported scope"})
+            return
 
-def create_app() -> Flask:
-    app = Flask(__name__)
-    app.config.setdefault("FINANCE_WORKBOOK_PATH", os.getenv("FINANCE_WORKBOOK_PATH", DEFAULT_WORKBOOK_PATH))
-    app.config.setdefault("FINANCE_SHEET_NAME", os.getenv("FINANCE_SHEET_NAME", DEFAULT_SHEET_NAME))
-    app.config.setdefault("FINANCE_DEBUG_PARSE", os.getenv("FINANCE_DEBUG_PARSE", "0") == "1")
+        method = scope.get("method", "GET")
+        path = unquote(scope.get("path", ""))
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+        if method == "GET" and path == "/api/finance/affaires":
+            await self._handle_affaires(send)
+            return
 
-    @app.get("/api/finance/affaires")
-    def list_affaires() -> Any:
-        dataset = get_finance_dataset(app)
-        return jsonify(dataset["affaires_list"])
+        if method == "GET" and path.startswith("/api/finance/affaires/"):
+            affaire_id = path.split("/api/finance/affaires/", 1)[1]
+            await self._handle_affaire_detail(send, affaire_id)
+            return
 
-    @app.get("/api/finance/affaires/<affaire_id>")
-    def get_affaire_detail(affaire_id: str) -> Any:
-        dataset = get_finance_dataset(app)
-        affaire = dataset["affaires_by_id"].get(affaire_id)
-        if affaire is None:
-            return jsonify({"error": "Affaire introuvable", "affaire_id": affaire_id}), 404
-        return jsonify(affaire)
+        if method == "GET" and path == "/api/finance/debug/parse":
+            await self._handle_debug(send)
+            return
 
-    @app.get("/api/finance/debug/parse")
-    def get_parse_debug() -> Any:
-        dataset = get_finance_dataset(app)
-        return jsonify(dataset["debug"])
+        await self._send_json(send, 404, {"error": "Not found", "path": path})
 
-    return app
+    async def _handle_affaires(self, send: Any) -> None:
+        try:
+            dataset = self.get_finance_dataset()
+            await self._send_json(send, 200, dataset["affaires_list"])
+        except Exception as exc:
+            await self._send_json(send, 500, {"error": str(exc)})
 
+    async def _handle_affaire_detail(self, send: Any, affaire_id: str) -> None:
+        try:
+            dataset = self.get_finance_dataset()
+            affaire = dataset["affaires_by_id"].get(affaire_id)
+            if affaire is None:
+                await self._send_json(send, 404, {"error": "Affaire introuvable", "affaire_id": affaire_id})
+                return
+            await self._send_json(send, 200, affaire)
+        except Exception as exc:
+            await self._send_json(send, 500, {"error": str(exc)})
 
-def get_cache_backend(app: Flask) -> Any:
-    extensions = getattr(app, "extensions", {})
-    if "cache" in extensions:
-        return extensions["cache"]
-    return fallback_cache
+    async def _handle_debug(self, send: Any) -> None:
+        try:
+            dataset = self.get_finance_dataset()
+            await self._send_json(send, 200, dataset["debug"])
+        except Exception as exc:
+            await self._send_json(send, 500, {"error": str(exc)})
+
+    async def _send_json(self, send: Any, status: int, payload: Any) -> None:
+        body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [[b"content-type", b"application/json; charset=utf-8"]],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+    def get_finance_dataset(self) -> Dict[str, Any]:
+        workbook_path = self.config["FINANCE_WORKBOOK_PATH"]
+        sheet_name = self.config["FINANCE_SHEET_NAME"]
+        file_signature = get_file_signature(workbook_path)
+        cache_signature = f"{file_signature}:{sheet_name}"
+
+        cached_value = self.cache.get(CACHE_KEY)
+        if cached_value and cached_value.get("signature") == cache_signature:
+            self.logger.debug("Finance dataset loaded from cache")
+            return cached_value["dataset"]
+
+        self.logger.info("Parsing workbook '%s' sheet '%s'", workbook_path, sheet_name)
+        dataset = parse_finance_sheet(workbook_path, sheet_name, self.config["FINANCE_DEBUG_PARSE"], self.logger)
+        self.cache.set(CACHE_KEY, {"signature": cache_signature, "dataset": dataset})
+        return dataset
 
 
 def get_file_signature(path: str) -> str:
-    stat = os.stat(path)
-    payload = f"{path}:{stat.st_mtime_ns}:{stat.st_size}"
+    file_path = Path(path)
+    stat = file_path.stat()
+    payload = f"{file_path}:{stat.st_mtime_ns}:{stat.st_size}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def get_finance_dataset(app: Flask) -> Dict[str, Any]:
-    workbook_path = app.config["FINANCE_WORKBOOK_PATH"]
-    sheet_name = app.config["FINANCE_SHEET_NAME"]
-    cache = get_cache_backend(app)
-    file_signature = get_file_signature(workbook_path)
-    cache_signature = f"{file_signature}:{sheet_name}"
-
-    cached_value = cache.get(CACHE_KEY)
-    if cached_value and cached_value.get("signature") == cache_signature:
-        app.logger.debug("Finance dataset loaded from cache")
-        return cached_value["dataset"]
-
-    app.logger.info("Parsing workbook '%s' sheet '%s'", workbook_path, sheet_name)
-    dataset = parse_finance_sheet(workbook_path, sheet_name, app.config["FINANCE_DEBUG_PARSE"], app.logger)
-    cache.set(CACHE_KEY, {"signature": cache_signature, "dataset": dataset})
-    return dataset
-
-
 def parse_finance_sheet(workbook_path: str, sheet_name: str, debug_parse: bool, logger: logging.Logger) -> Dict[str, Any]:
+    from openpyxl import load_workbook
+
     workbook = load_workbook(filename=workbook_path, data_only=True, read_only=True)
     try:
         if sheet_name not in workbook.sheetnames:
@@ -353,7 +386,7 @@ def extract_row_data(ws: Any, row_index: int) -> Dict[str, Any]:
 def normalize_cell_value(value: Any) -> Any:
     if isinstance(value, str):
         stripped = value.strip()
-        return stripped if stripped != "" else None
+        return stripped if stripped else None
     return value
 
 
@@ -361,8 +394,4 @@ def is_row_empty(row_data: Dict[str, Any]) -> bool:
     return all(value in (None, "") for value in row_data.values())
 
 
-app = create_app()
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000, debug=True)
+app = FinanceASGIApp()
