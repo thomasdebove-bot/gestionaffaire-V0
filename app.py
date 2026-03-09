@@ -6,7 +6,7 @@ import logging
 import os
 import re
 import unicodedata
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List, Optional
@@ -837,7 +837,28 @@ class MetronomeService:
                 agg[k] = agg.get(k, 0) + 1
             return [{"label": k, "count": v} for k, v in sorted(agg.items(), key=lambda x: (-x[1], x[0]))]
 
+        def parse_date(value: str) -> Optional[date]:
+            txt = clean_text(value)
+            if not txt:
+                return None
+            for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d"):
+                try:
+                    return datetime.strptime(txt[:10], fmt).date()
+                except Exception:
+                    continue
+            return None
+
         by_meeting = count_by("reunion_origine")
+        by_company = count_by("entreprise")
+        due_rows = [r for r in rows if (parse_date(r.get("date_echeance", "")) or today) <= today]
+        due_by_company: Dict[str, int] = {}
+        for r in due_rows:
+            label = clean_text(r.get("entreprise")) or "Non défini"
+            due_by_company[label] = due_by_company.get(label, 0) + 1
+        due_by_company_list = [
+            {"label": k, "count": v} for k, v in sorted(due_by_company.items(), key=lambda x: (-x[1], x[0]))
+        ]
+
         project_display_name = resolved_title or target
         project_id = resolved_id or clean_text(project_info.get("ID"))
         return {
@@ -848,9 +869,15 @@ class MetronomeService:
             "kpis": {
                 "open_topics": len(rows),
                 "overdue_topics": sum(1 for r in rows if r.get("overdue")),
-                "by_company": count_by("entreprise"),
+                "by_company": by_company,
                 "by_package": count_by("lot"),
                 "by_meeting": by_meeting,
+            },
+            "kpis_pilotage": {
+                "rappels_ouverts_a_date": len(due_rows),
+                "a_suivre_ouverts": len(rows),
+                "date_reference": today.isoformat(),
+                "rappels_cumules_par_entreprise": due_by_company_list,
             },
             "rows": rows,
             "missing_files": cache.get("missing", []),
@@ -1082,7 +1109,7 @@ def gestion_projet_html() -> str:
 .kpis{margin-top:12px;padding:14px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.k{border:1px solid var(--line);border-radius:14px;padding:14px;background:#fbfdff}.k .v{font-size:34px;font-weight:900;margin-top:6px}
 .section{margin-top:12px;padding:14px}.subgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:14px}table{width:100%;border-collapse:collapse}th,td{padding:10px 12px;border-bottom:1px solid var(--line);font-size:13px;text-align:left}th{background:#f7f9fc;font-size:12px;color:#5b6880;text-transform:uppercase}.small{color:var(--muted);font-size:13px}
 .bar{height:10px;background:#edf1f8;border-radius:999px;overflow:hidden}.fill{height:100%;background:#ef8d00}
-.match-box{margin-top:12px;border:1px solid var(--line);border-radius:14px;padding:12px;background:#fffaf2}.match-box.ok{border-color:#49a66a;background:#f4fcf6}.match-box.warn{border-color:#ef8d00;background:#fff7ec}.match-title{font-weight:800;margin-bottom:8px}.match-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.match-item{font-size:13px;color:#30425f}.match-item b{display:block;color:#6e7a90;font-size:12px;margin-bottom:2px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-word}
+.match-box{margin-top:12px;border:1px solid var(--line);border-radius:14px;padding:12px;background:#fffaf2}.match-box.ok{border-color:#49a66a;background:#f4fcf6}.match-box.warn{border-color:#ef8d00;background:#fff7ec}.match-title{font-weight:800;margin-bottom:8px}.match-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.match-item{font-size:13px;color:#30425f}.match-item b{display:block;color:#6e7a90;font-size:12px;margin-bottom:2px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-word}.pilot-box{margin-top:12px;border:1px solid #cfd8e8;border-radius:18px;padding:16px;background:#f8fbff}.pilot-title{font-size:34px;font-weight:900;margin:4px 0 10px}.pilot-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.pilot-card{background:#fff;border:1px solid #d8e0ee;border-radius:18px;padding:14px}.pilot-card .t{font-size:15px;color:#4b5d7a;font-weight:800}.pilot-card .v{font-size:44px;font-weight:900;margin-top:8px}.pilot-list{margin-top:12px;border:1px solid #d8e0ee;border-radius:18px;background:#fff;padding:8px 14px}.pilot-row{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px dashed #d8e0ee}.pilot-row:last-child{border-bottom:none}.pilot-row .name{font-weight:700}
 @media (max-width:980px){.grid{grid-template-columns:repeat(2,1fr)}.subgrid{grid-template-columns:1fr}}@media (max-width:640px){.grid{grid-template-columns:1fr}}
 </style></head>
 <body><div class='wrap'>
@@ -1118,6 +1145,19 @@ def gestion_projet_html() -> str:
     </div>
   </div>
 
+  <div class='section'>
+    <div class='pilot-box'>
+      <h3 style='margin:0 0 10px'>KPI réunion sélectionnée</h3>
+      <div class='pilot-grid'>
+        <div class='pilot-card'><div class='t'>Rappels ouverts à date</div><div id='kRappelsDate' class='v'>0</div></div>
+        <div class='pilot-card'><div class='t'>À suivre ouverts</div><div id='kASuivre' class='v'>0</div></div>
+        <div class='pilot-card'><div class='t'>Date de référence</div><div id='kDateRef' class='v' style='font-size:34px'>-</div></div>
+      </div>
+      <h3 style='margin:14px 0 8px'>Rappels ouverts à date cumulés par entreprise</h3>
+      <div id='pilotByCompany' class='pilot-list'><div class='small'>Aucune donnée</div></div>
+    </div>
+  </div>
+
   <div class='section'><div class='subgrid'>
     <div><h3>🔴 Heatmap entreprises</h3><div id='byCompany'></div></div>
     <div><h3>🟠 Heatmap lots</h3><div id='byPackage'></div></div>
@@ -1135,6 +1175,7 @@ function renderBars(id,items){const root=document.getElementById(id);if(!items||
 function renderTable(rows){const root=document.getElementById('boardTable');if(!rows||!rows.length){root.innerHTML="<div class='small' style='padding:12px'>Aucun sujet ouvert.</div>";return;}root.innerHTML=`<table><thead><tr><th>Zone</th><th>Lot</th><th>Sujet</th><th>Entreprise</th><th>Responsable</th><th>Statut</th><th>Date échéance</th><th>Réunion origine</th><th>Commentaire</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${esc(r.zone)}</td><td>${esc(r.lot)}</td><td>${esc(r.sujet)}</td><td>${esc(r.entreprise)}</td><td>${esc(r.responsable)}</td><td>${esc(r.statut)}</td><td>${esc(r.date_echeance)}</td><td>${esc(r.reunion_origine)}</td><td>${esc(r.commentaire)}</td></tr>`).join('')}</tbody></table>`;}
 function setText(id,value){const el=document.getElementById(id);if(el) el.textContent=value;}
 function setHtml(id,value){const el=document.getElementById(id);if(el) el.innerHTML=value;}
+function renderPilotageKpis(b){const p=(b&&b.kpis_pilotage)||{};setText('kRappelsDate',String(p.rappels_ouverts_a_date||0));setText('kASuivre',String(p.a_suivre_ouverts||0));setText('kDateRef',p.date_reference||'-');const root=document.getElementById('pilotByCompany');const items=p.rappels_cumules_par_entreprise||[];if(!items.length){root.innerHTML="<div class='small'>Aucune donnée</div>";return;}root.innerHTML=items.map(x=>`<div class='pilot-row'><span class='name'>${esc(x.label)}</span><strong>${x.count}</strong></div>`).join('');}
 function renderMatchDiagnostics(b){const md=(b&&b.match_debug)||{};const box=document.getElementById('matchBox');
   setHtml('matchSearchName',`<b>Projet recherché</b>${esc(md.searched_project_name||b?.project_name||'-')}`);
   setHtml('matchSearchSlug',`<b>Slug recherché</b><span class='mono'>${esc(md.searched_project_slug||'-')}</span>`);
@@ -1160,7 +1201,7 @@ function renderMatchDiagnostics(b){const md=(b&&b.match_debug)||{};const box=doc
   const loaded=b.loaded_at?` · Chargement: ${b.loaded_at}`:'';
   setText('matchReason',`Projet recherché et projet matché résolus.${loaded}`);
 }
-function renderBoard(){const b=state.board;if(!b||!b.ok){setText('kOpen','0');setText('kLate','0');setText('kProject','Projet METRONOME non trouvé');setText('kLoad',b&&b.loaded_at?b.loaded_at:'-');renderBars('byCompany',[]);renderBars('byPackage',[]);renderBars('byMeeting',[]);renderTable([]);renderMatchDiagnostics(b||{});return;}const k=b.kpis||{};setText('kOpen',String(k.open_topics||0));setText('kLate',String(k.overdue_topics||0));setText('kProject',b.project_name||'-');setText('kLoad',b.loaded_at||'-');renderBars('byCompany',k.by_company||[]);renderBars('byPackage',k.by_package||[]);renderBars('byMeeting',k.by_meeting||[]);renderTable(b.rows||[]);renderMatchDiagnostics(b);} 
+function renderBoard(){const b=state.board;if(!b||!b.ok){setText('kOpen','0');setText('kLate','0');setText('kProject','Projet METRONOME non trouvé');setText('kLoad',b&&b.loaded_at?b.loaded_at:'-');renderPilotageKpis({});renderBars('byCompany',[]);renderBars('byPackage',[]);renderBars('byMeeting',[]);renderTable([]);renderMatchDiagnostics(b||{});return;}const k=b.kpis||{};setText('kOpen',String(k.open_topics||0));setText('kLate',String(k.overdue_topics||0));setText('kProject',b.project_name||'-');setText('kLoad',b.loaded_at||'-');renderPilotageKpis(b);renderBars('byCompany',k.by_company||[]);renderBars('byPackage',k.by_package||[]);renderBars('byMeeting',k.by_meeting||[]);renderTable(b.rows||[]);renderMatchDiagnostics(b);} 
 async function loadBoard(id){if(!id){state.selectedId='';state.board=null;renderBoard();return;}state.selectedId=id;localStorage.setItem('selectedAffaireId',id);document.getElementById('financeBtn').href=`/finance?affaire_id=${encodeURIComponent(id)}`;document.getElementById('dashboardBtn').href=`/dashboard?affaire_id=${encodeURIComponent(id)}`;state.board=await api(`/api/project-management/board?affaire_id=${encodeURIComponent(id)}`);renderBoard();}
 async function loadAffaires(search=''){const d=await api(`/api/finance/affaires?search=${encodeURIComponent(search)}`);state.affaires=d.items||[];const sel=document.getElementById('affaireSelect');sel.innerHTML=`<option value=''>Sélectionnez une affaire</option>`+state.affaires.map(x=>`<option value="${esc(x.affaire_id)}">${esc(x.display_name)}</option>`).join('');if(state.selectedId&&state.affaires.some(x=>x.affaire_id===state.selectedId)){sel.value=state.selectedId;}}
 function showPageError(err){const box=document.getElementById('matchBox');if(box){box.classList.remove('ok');box.classList.add('warn');}setText('matchStatus','⚠ Erreur de chargement');setText('matchReason','Erreur de chargement : '+((err&&err.message)?err.message:String(err||'Erreur inconnue')));}
