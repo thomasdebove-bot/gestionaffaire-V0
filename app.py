@@ -197,6 +197,12 @@ class FinanceService:
             rows.append(row)
         return {"headers": headers, "rows": rows, "rows_read": max(ws.max_row - 13, 0)}
 
+    def _read_row_map(self, ws: Any, row_index: int) -> Dict[str, Any]:
+        return {COLUMN_MAPPING[col]: ws[f"{col}{row_index}"].value for col in COLUMN_MAPPING}
+
+    def _extract_row_data(self, ws: Any, row_index: int) -> Dict[str, Any]:
+        return {field: ws[f"{col}{row_index}"].value for col, field in COLUMN_MAPPING.items()}
+
     def normalize_finance_rows(self, raw_rows: List[Dict[str, Any]]) -> Tuple[List[NormalizedRow], List[str]]:
         normalized: List[NormalizedRow] = []
         warnings: List[str] = []
@@ -846,12 +852,6 @@ initFinancePage();
 </script>
 </body>
 </html>"""
-
-    def _read_row_map(self, ws: Any, row_index: int) -> Dict[str, Any]:
-        return {COLUMN_MAPPING[col]: ws[f"{col}{row_index}"].value for col in COLUMN_MAPPING}
-
-    def _extract_row_data(self, ws: Any, row_index: int) -> Dict[str, Any]:
-        return {field: ws[f"{col}{row_index}"].value for col, field in COLUMN_MAPPING.items()}
 
 
 app = FinanceASGIApp()
