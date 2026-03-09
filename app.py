@@ -477,6 +477,11 @@ def landing_html() -> str:
 
     <section class='grid'>
       <article class='card'>
+        <h3>Tableau de bord</h3>
+        <p>Point d'entrée principal pour la synthèse de pilotage. Le module sera enrichi au fur et à mesure des besoins.</p>
+        <a class='btn dark' href='/dashboard'>Ouvrir le tableau de bord</a>
+      </article>
+      <article class='card'>
         <h3>Finances</h3>
         <p>Module déjà disponible dans l'application : cockpit financier, suivi mensuel, export CSV et état du cache.</p>
         <a id='financeLink' class='btn disabled' href='javascript:void(0)' aria-disabled='true'>Ouvrir Finances</a>
@@ -491,34 +496,30 @@ def landing_html() -> str:
         <p>Prévu pour centraliser les temps, affectations de ressources et ventilation des charges.</p>
         <button class='btn disabled' disabled>Bientôt disponible</button>
       </article>
-      <article class='card'>
-        <h3>Tableau de bord</h3>
-        <p>Espace de synthèse transverse qui regroupera les informations clés du projet (à préciser ensuite).</p>
-        <button class='btn disabled' disabled>À construire</button>
-      </article>
     </section>
   </div>
 <script>
-const state={projects:[],selected:''};
+const state={projects:[],selectedId:'',selectedLabel:''};
 function esc(v){return String(v||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
 function updateUi(){
   const badge=document.getElementById('projectBadge');
-  const txt=state.selected?`Projet : ${state.selected}`:'Aucun projet sélectionné';
+  const txt=state.selectedLabel?`Projet : ${state.selectedLabel}`:'Aucun projet sélectionné';
   badge.textContent=txt;
-  const message=state.selected
-    ? `Modules disponibles pour ${state.selected}. Le module Finances est actif.`
+  const message=state.selectedLabel
+    ? `Modules disponibles pour ${state.selectedLabel}. Le module Finances est actif.`
     : 'Sélectionnez un projet pour activer les modules.';
   document.getElementById('state').textContent=message;
   const financeLink=document.getElementById('financeLink');
-  if(state.selected){
+  if(state.selectedId){
     financeLink.className='btn primary';
-    financeLink.href='/finance';
+    financeLink.href=`/finance?affaire_id=${encodeURIComponent(state.selectedId)}`;
     financeLink.removeAttribute('aria-disabled');
-    localStorage.setItem('selectedProject',state.selected);
+    localStorage.setItem('selectedAffaireId',state.selectedId);
   }else{
     financeLink.className='btn disabled';
     financeLink.href='javascript:void(0)';
     financeLink.setAttribute('aria-disabled','true');
+    localStorage.removeItem('selectedAffaireId');
   }
 }
 async function loadProjects(){
@@ -526,8 +527,8 @@ async function loadProjects(){
     const res=await fetch('/api/finance/affaires');
     if(!res.ok) throw new Error('API indisponible');
     const data=await res.json();
-    const list=(data.items||[]).map(x=>x.display_name).filter(Boolean);
-    state.projects=[...new Set(list)].sort((a,b)=>a.localeCompare(b,'fr'));
+    state.projects=(data.items||[]).map(x=>({id:x.affaire_id,label:x.display_name})).filter(x=>x.id&&x.label);
+    state.projects.sort((a,b)=>a.label.localeCompare(b.label,'fr'));
   }catch(_){
     state.projects=[];
   }
@@ -536,14 +537,24 @@ async function loadProjects(){
   if(state.projects.length===0){
     options.push("<option value='' disabled>Aucun projet disponible pour le moment</option>");
   }else{
-    options.push(...state.projects.map(name=>`<option value="${esc(name)}">${esc(name)}</option>`));
+    options.push(...state.projects.map(p=>`<option value="${esc(p.id)}">${esc(p.label)}</option>`));
   }
   select.innerHTML=options.join('');
-  const saved=localStorage.getItem('selectedProject')||'';
-  if(saved&&state.projects.includes(saved)){state.selected=saved;select.value=saved;}
+  const savedId=localStorage.getItem('selectedAffaireId')||'';
+  const preselected=state.projects.find(p=>p.id===savedId);
+  if(preselected){
+    state.selectedId=preselected.id;
+    state.selectedLabel=preselected.label;
+    select.value=preselected.id;
+  }
   updateUi();
 }
-document.getElementById('projectSelect').addEventListener('change',ev=>{state.selected=ev.target.value||'';updateUi();});
+document.getElementById('projectSelect').addEventListener('change',ev=>{
+  const selected=state.projects.find(p=>p.id===ev.target.value);
+  state.selectedId=selected?.id||'';
+  state.selectedLabel=selected?.label||'';
+  updateUi();
+});
 loadProjects();
 </script>
 </body>
@@ -652,28 +663,45 @@ function setCacheBadge(status,label){const c=status==='ready'?'ready':status==='
 async function api(url,options){const r=await fetch(url,options||{});const data=await r.json().catch(()=>({}));if(!r.ok) throw new Error(data.error||data.detail||data.message||`HTTP ${r.status}`);return data;}
 function healthClass(a){const reste=Number(a.reste_a_facturer||0),taux=Number(a.taux_avancement_financier||0);if(taux>=0.9)return{label:'Presque soldée',cls:'ok'};if(reste>0&&taux<0.35)return{label:'À surveiller',cls:'warn'};if(reste<0)return{label:'Incohérence à vérifier',cls:'bad'};return{label:'Stable',cls:'ok'};}
 async function loadCacheStatus(){const d=await api('/api/finance/cache-status');state.cacheStatus=d;const label=d.status==='ready'?`Cache prêt · ${d.affaires_count} affaires`:d.status==='building'?'Cache en reconstruction…':`Cache : ${d.status}`;setCacheBadge(d.status,label);document.getElementById('metaCache').textContent=d.generated_at||'-';document.getElementById('statusMeta').textContent=`${d.affaires_count||0} affaires · ${d.rows_kept||0} lignes utiles · ${d.generated_at||'pas encore généré'}`;}
-async function loadAffaires(search=''){const d=await api(`/api/finance/affaires?search=${encodeURIComponent(search)}`);state.affaires=d.items||[];const sel=document.getElementById('affaireSelect');const prev=state.selectedAffaireId;sel.innerHTML=`<option value=''>Sélectionnez une affaire</option>`+state.affaires.map(x=>`<option value="${esc(x.affaire_id)}">${esc(x.display_name)}</option>`).join('');if(prev&&state.affaires.some(x=>x.affaire_id===prev)){sel.value=prev;}else{state.selectedAffaireId='';state.selectedAffaire=null;}showNotice(state.affaires.length?`${state.affaires.length} affaire(s) disponible(s)`:'Aucune affaire trouvée pour ce filtre.');}
-async function loadAffaire(id){if(!id){state.selectedAffaireId='';state.selectedAffaire=null;renderAll();return;}const d=await api(`/api/finance/affaire/${encodeURIComponent(id)}`);state.selectedAffaireId=id;state.selectedAffaire=d.affaire||null;renderAll();}
+async function loadAffairesList(search=''){const d=await api(`/api/finance/affaires?search=${encodeURIComponent(search)}`);state.affaires=d.items||[];const sel=document.getElementById('affaireSelect');const prev=state.selectedAffaireId;sel.innerHTML=`<option value=''>Sélectionnez une affaire</option>`+state.affaires.map(x=>`<option value="${esc(x.affaire_id)}">${esc(x.display_name)}</option>`).join('');if(prev&&state.affaires.some(x=>x.affaire_id===prev)){sel.value=prev;}else{state.selectedAffaireId='';state.selectedAffaire=null;}showNotice(state.affaires.length?`${state.affaires.length} affaire(s) disponible(s)`:'Aucune affaire trouvée pour ce filtre.');}
+async function loadSelectedAffaire(id){if(!id){state.selectedAffaireId='';state.selectedAffaire=null;renderAll();return;}const d=await api(`/api/finance/affaire/${encodeURIComponent(id)}`);state.selectedAffaireId=id;state.selectedAffaire=d.affaire||null;renderAll();localStorage.setItem('selectedAffaireId',id);}
 function setHeroEmpty(){document.getElementById('heroTitle').textContent='Sélectionnez une affaire';document.getElementById('heroSubtitle').textContent='Le cockpit se remplit à partir du cache du tableau activité.';document.getElementById('metaClient').textContent='-';document.getElementById('metaAffaire').textContent='-';document.getElementById('metaTags').textContent='-';document.getElementById('metaDelay').textContent='-';const h=document.getElementById('heroHealth');h.textContent='En attente';h.className='health warn';}
 function cardTone(id,tone){const el=document.getElementById(id);el.classList.remove('good','warn','bad');if(tone)el.classList.add(tone);}
 function renderHero(){const a=state.selectedAffaire;if(!a){setHeroEmpty();return;}document.getElementById('heroTitle').textContent=a.display_name||'-';document.getElementById('heroSubtitle').textContent=`Client ${a.client||'-'} · ${(a.missions||[]).length} mission(s)`;document.getElementById('metaClient').textContent=a.client||'-';document.getElementById('metaAffaire').textContent=a.affaire||'-';document.getElementById('metaTags').textContent=(a.tags||[]).join(' · ')||'-';document.getElementById('metaDelay').textContent=a.delai_reglement_jours?`${a.delai_reglement_jours} jours`:'-';document.getElementById('metaCache').textContent=(state.cacheStatus&&state.cacheStatus.generated_at)||'-';const hh=healthClass(a),el=document.getElementById('heroHealth');el.textContent=hh.label;el.className=`health ${hh.cls}`;}
 function renderKpis(){const a=state.selectedAffaire||{commande_ht:0,facturation_cumulee_2026:0,reste_a_facturer:0,taux_avancement_financier:0,total_previsionnel:0,ecart_previsionnel_vs_facture:0};document.getElementById('kpiCommande').textContent=euro(a.commande_ht);document.getElementById('kpiFacture').textContent=euro(a.facturation_cumulee_2026);document.getElementById('kpiReste').textContent=euro(a.reste_a_facturer);document.getElementById('kpiAvance').textContent=pct(a.taux_avancement_financier);document.getElementById('kpiPrev').textContent=euro(a.total_previsionnel);document.getElementById('kpiEcart').textContent=euro(a.ecart_previsionnel_vs_facture);cardTone('kpiCommandeCard','good');cardTone('kpiFactureCard',a.facturation_cumulee_2026>0?'good':'warn');cardTone('kpiResteCard',a.reste_a_facturer<0?'bad':(a.reste_a_facturer>(a.commande_ht||0)*0.5?'warn':'good'));cardTone('kpiAvanceCard',a.taux_avancement_financier>0.85?'good':(a.taux_avancement_financier<0.35?'warn':''));cardTone('kpiPrevCard','good');cardTone('kpiEcartCard',a.ecart_previsionnel_vs_facture>=0?'good':'bad');}
-function renderChart(){const root=document.getElementById('monthlyChart');const a=state.selectedAffaire;if(!a){root.innerHTML=`<text x="490" y="160" text-anchor="middle" fill="#6e7a90" font-size="18">Sélectionnez une affaire</text>`;return;}const s=MONTHS.map(m=>({label:MONTH_LABELS[m],pre:Number((((a.mensuel||{})[m]||{}).previsionnel)||0),fac:Number((((a.mensuel||{})[m]||{}).facture)||0)}));const maxVal=Math.max(1,...s.flatMap(x=>[x.pre,x.fac]));const left=56,top=16,width=880,height=250,step=width/s.length,barW=step*0.48;let grid='',bars='',labels='';const points=[];for(let i=0;i<=4;i++){const y=top+(height/4)*i,val=Math.round(maxVal*(1-i/4));grid+=`<line x1="${left}" y1="${y}" x2="${left+width}" y2="${y}" stroke="#dfe5ef" stroke-width="1"/><text x="${left-10}" y="${y+4}" text-anchor="end" fill="#8090a8" font-size="12">${fmt(val)}</text>`;}s.forEach((it,i)=>{const x=left+i*step+(step-barW)/2;const h=(it.pre/maxVal)*height;const y=top+height-h;const py=top+height-(it.fac/maxVal)*height;bars+=`<rect x="${x}" y="${y}" width="${barW}" height="${Math.max(h,0.5)}" rx="8" fill="#dbe6ff"/>`;points.push(`${x+barW/2},${py}`);labels+=`<text x="${x+barW/2}" y="${top+height+22}" text-anchor="middle" fill="#66748b" font-size="12">${it.label}</text>`;});root.innerHTML=`${grid}<line x1="${left}" y1="${top+height}" x2="${left+width}" y2="${top+height}" stroke="#b8c3d4" stroke-width="1.2"/>${bars}<polyline points="${points.join(' ')}" fill="none" stroke="#2d5bff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>${points.map(p=>{const q=p.split(',');return `<circle cx="${q[0]}" cy="${q[1]}" r="4.5" fill="#fff" stroke="#2d5bff" stroke-width="3"/>`;}).join('')}${labels}`;}
+function renderFinanceChart(){const root=document.getElementById('monthlyChart');const a=state.selectedAffaire;if(!a){root.innerHTML=`<text x="490" y="160" text-anchor="middle" fill="#6e7a90" font-size="18">Sélectionnez une affaire</text>`;return;}const s=MONTHS.map(m=>({label:MONTH_LABELS[m],pre:Number((((a.mensuel||{})[m]||{}).previsionnel)||0),fac:Number((((a.mensuel||{})[m]||{}).facture)||0)}));const maxVal=Math.max(1,...s.flatMap(x=>[x.pre,x.fac]));const left=56,top=16,width=880,height=250,step=width/s.length,barW=step*0.48;let grid='',bars='',labels='';const points=[];for(let i=0;i<=4;i++){const y=top+(height/4)*i,val=Math.round(maxVal*(1-i/4));grid+=`<line x1="${left}" y1="${y}" x2="${left+width}" y2="${y}" stroke="#dfe5ef" stroke-width="1"/><text x="${left-10}" y="${y+4}" text-anchor="end" fill="#8090a8" font-size="12">${fmt(val)}</text>`;}s.forEach((it,i)=>{const x=left+i*step+(step-barW)/2;const h=(it.pre/maxVal)*height;const y=top+height-h;const py=top+height-(it.fac/maxVal)*height;bars+=`<rect x="${x}" y="${y}" width="${barW}" height="${Math.max(h,0.5)}" rx="8" fill="#dbe6ff"><title>${it.label} prévisionnel: ${euro(it.pre)}</title></rect>`;points.push(`${x+barW/2},${py}`);labels+=`<text x="${x+barW/2}" y="${top+height+22}" text-anchor="middle" fill="#66748b" font-size="12">${it.label}</text>`;});root.innerHTML=`${grid}<line x1="${left}" y1="${top+height}" x2="${left+width}" y2="${top+height}" stroke="#b8c3d4" stroke-width="1.2"/>${bars}<polyline points="${points.join(' ')}" fill="none" stroke="#2d5bff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>${points.map((p,i)=>{const q=p.split(',');return `<circle cx="${q[0]}" cy="${q[1]}" r="4.5" fill="#fff" stroke="#2d5bff" stroke-width="3"><title>${s[i].label} facturé: ${euro(s[i].fac)}</title></circle>`;}).join('')}${labels}`;}
 function renderMonthlyTable(){const root=document.getElementById('monthlyTableWrap');const a=state.selectedAffaire;if(!a){root.innerHTML=`<div class='empty'>Sélectionnez une affaire pour afficher le détail mensuel.</div>`;return;}let rows='';MONTHS.forEach(m=>{const pre=Number((((a.mensuel||{})[m]||{}).previsionnel)||0),fac=Number((((a.mensuel||{})[m]||{}).facture)||0),ec=fac-pre;rows+=`<tr><td>${MONTH_LABELS[m]}</td><td class='num'>${euro(pre)}</td><td class='num'>${euro(fac)}</td><td class='num delta ${ec>=0?'pos':'neg'}'>${euro(ec)}</td></tr>`;});rows+=`<tr><td><strong>Total</strong></td><td class='num'><strong>${euro(a.total_previsionnel||0)}</strong></td><td class='num'><strong>${euro(a.total_facture||0)}</strong></td><td class='num delta ${Number(a.ecart_previsionnel_vs_facture||0)>=0?'pos':'neg'}'><strong>${euro(a.ecart_previsionnel_vs_facture||0)}</strong></td></tr>`;root.innerHTML=`<table><thead><tr><th>Mois</th><th class='num'>Prévisionnel</th><th class='num'>Facturé</th><th class='num'>Écart</th></tr></thead><tbody>${rows}</tbody></table>`;}
 function renderMissions(){const root=document.getElementById('missionsTableWrap');const meta=document.getElementById('missionsMeta');const a=state.selectedAffaire;if(!a){meta.textContent='0 mission';root.innerHTML=`<div class='empty'>Sélectionnez une affaire pour afficher les missions.</div>`;return;}const missions=a.missions||[];meta.textContent=`${missions.length} mission(s)`;if(!missions.length){root.innerHTML=`<div class='empty'>Aucune mission détaillée sur cette affaire.</div>`;return;}root.innerHTML=`<table><thead><tr><th>Tag</th><th>Mission</th><th>N°</th><th class='num'>Commande</th><th class='num'>Fact. 2026</th><th class='num'>Reste</th><th class='num'>Prévisionnel</th><th class='num'>Facturé</th></tr></thead><tbody>${missions.map(m=>`<tr><td>${esc(m.tag||'')}</td><td>${esc(m.label||'')}</td><td>${esc(m.numero||'')}</td><td class='num'>${euro(m.commande_ht)}</td><td class='num'>${euro(m.facturation_cumulee_2026)}</td><td class='num'>${euro(m.reste_a_facturer)}</td><td class='num'>${euro(m.total_previsionnel)}</td><td class='num'>${euro(m.total_facture)}</td></tr>`).join('')}</tbody></table>`;}
 function renderInsights(){const root=document.getElementById('insightsBox');const a=state.selectedAffaire;if(!a){root.innerHTML=`<div class='empty' style='width:100%'>Sélectionnez une affaire.</div>`;return;}const items=a.insights||[];root.innerHTML=items.map(x=>`<div class='insight'>${esc(x)}</div>`).join('');}
-function renderAll(){renderHero();renderKpis();renderChart();renderMonthlyTable();renderMissions();renderInsights();document.getElementById('exportBtn').disabled=!state.selectedAffaireId;}
-async function rebuildCache(){clearError();showNotice('Reconstruction du cache en cours…');await api('/api/finance/rebuild-cache',{method:'POST'});await loadCacheStatus();await loadAffaires(document.getElementById('searchInput').value||'');if(state.selectedAffaireId&&state.affaires.some(x=>x.affaire_id===state.selectedAffaireId)){await loadAffaire(state.selectedAffaireId);}else{state.selectedAffaireId='';state.selectedAffaire=null;renderAll();}showNotice('Cache reconstruit avec succès.');}
-async function init(){clearError();try{await loadCacheStatus();await loadAffaires('');renderAll();}catch(err){showError(err.message||'Erreur de chargement');}
-document.getElementById('searchInput').addEventListener('input',async ev=>{clearError();try{await loadAffaires(ev.target.value||'');if(state.selectedAffaireId&&!state.affaires.some(x=>x.affaire_id===state.selectedAffaireId)){state.selectedAffaireId='';state.selectedAffaire=null;document.getElementById('affaireSelect').value='';renderAll();}}catch(err){showError(err.message||'Erreur de recherche');}});
-document.getElementById('affaireSelect').addEventListener('change',async ev=>{clearError();try{await loadAffaire(ev.target.value||'');}catch(err){showError(err.message||'Erreur de chargement affaire');}});
+function renderAll(){renderHero();renderKpis();renderFinanceChart();renderMonthlyTable();renderMissions();renderInsights();document.getElementById('exportBtn').disabled=!state.selectedAffaireId;}
+async function rebuildCache(){clearError();showNotice('Reconstruction du cache en cours…');await api('/api/finance/rebuild-cache',{method:'POST'});await loadCacheStatus();await loadAffairesList(document.getElementById('searchInput').value||'');if(state.selectedAffaireId&&state.affaires.some(x=>x.affaire_id===state.selectedAffaireId)){await loadSelectedAffaire(state.selectedAffaireId);}else{state.selectedAffaireId='';state.selectedAffaire=null;renderAll();}showNotice('Cache reconstruit avec succès.');}
+async function initFinancePage(){clearError();try{await loadCacheStatus();await loadAffairesList('');const params=new URLSearchParams(window.location.search);const affairFromUrl=params.get('affaire_id');const affairFromStorage=localStorage.getItem('selectedAffaireId')||'';const preselected=affairFromUrl||affairFromStorage;if(preselected&&state.affaires.some(x=>x.affaire_id===preselected)){document.getElementById('affaireSelect').value=preselected;await loadSelectedAffaire(preselected);}else{renderAll();}}catch(err){showError(err.message||'Erreur de chargement');}
+document.getElementById('searchInput').addEventListener('input',async ev=>{clearError();try{await loadAffairesList(ev.target.value||'');if(state.selectedAffaireId&&!state.affaires.some(x=>x.affaire_id===state.selectedAffaireId)){state.selectedAffaireId='';state.selectedAffaire=null;document.getElementById('affaireSelect').value='';renderAll();}}catch(err){showError(err.message||'Erreur de recherche');}});
+document.getElementById('affaireSelect').addEventListener('change',async ev=>{clearError();try{await loadSelectedAffaire(ev.target.value||'');}catch(err){showError(err.message||'Erreur de chargement affaire');}});
 document.getElementById('reloadBtn').addEventListener('click',async()=>{try{await rebuildCache();}catch(err){showError(err.message||'Erreur de reconstruction du cache');}});
 document.getElementById('exportBtn').addEventListener('click',()=>{if(!state.selectedAffaireId)return;window.location.href=`/api/finance/affaire/${encodeURIComponent(state.selectedAffaireId)}/export-csv`;});}
-init();
+initFinancePage();
 </script>
 </body>
 </html>
 """
+
+
+def dashboard_html() -> str:
+    return """<!doctype html>
+<html lang='fr'>
+<head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Gestion Affaire - Tableau de bord</title>
+<style>
+body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:#f3f6fb;color:#122033}
+.wrap{max-width:1080px;margin:42px auto;padding:0 20px}
+.card{background:#fff;border:1px solid #e0e6f0;border-radius:24px;padding:28px;box-shadow:0 12px 34px rgba(18,32,51,.07)}
+h1{margin:8px 0 12px;font-size:40px}p{color:#62708a;font-size:17px;line-height:1.5}.eyebrow{font-size:12px;color:#2d5bff;font-weight:800;letter-spacing:.12em;text-transform:uppercase}
+.actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:20px}.btn{display:inline-flex;align-items:center;text-decoration:none;background:#2d5bff;color:#fff;height:46px;padding:0 16px;border-radius:12px;font-weight:700}
+.btn.secondary{background:#142033}
+</style></head>
+<body><div class='wrap'><div class='card'><div class='eyebrow'>Synthèse transverse</div><h1>Tableau de bord</h1><p>Ce module est volontairement positionné en premier accès : il deviendra la porte d'entrée de pilotage global de vos affaires. Les indicateurs consolidés seront ajoutés progressivement.</p><div class='actions'><a class='btn' href='/'>Retour accueil</a><a class='btn secondary' href='/finance'>Accéder au cockpit Finance</a></div></div></div></body>
+</html>"""
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -684,6 +712,11 @@ def landing_page():
 @app.get("/finance", response_class=HTMLResponse)
 def finance_page():
     return finance_html()
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard_page():
+    return dashboard_html()
 
 
 @app.get("/health", response_class=JSONResponse)
@@ -705,6 +738,7 @@ def finance_index():
         "endpoints": {
             "landing": "/",
             "finance_ui": "/finance",
+            "dashboard_ui": "/dashboard",
             "cache_status": "/api/finance/cache-status",
             "rebuild_cache": "/api/finance/rebuild-cache",
             "affaires": "/api/finance/affaires?search=...",
