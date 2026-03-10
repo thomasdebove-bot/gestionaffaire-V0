@@ -2427,7 +2427,7 @@ function hideReminderModal(){const modal=document.getElementById('reminderModal'
 async function loadBoard(id){const aid=id||state.selectedId||'';if(!aid){state.selectedId='';state.board=null;renderBoard();return;}state.selectedId=aid;const sel=document.getElementById('affaireSelect');if(sel)sel.value=aid;localStorage.setItem('selectedAffaireId',aid);showLoading(true,'Chargement de la vue projet…');try{const b=await api(`/api/project-management/board?affaire_id=${encodeURIComponent(aid)}`);state.board=b;renderBoard();}catch(err){console.error(err);state.board=null;renderBoard();showPageError(err);}finally{showLoading(false);}}
 function renderBoard(){const b=state.board||{};const p=b.kpis_pilotage||{};setText('kOpen',Number(p.tasks_open||0));setText('kOverdue',Number(p.tasks_overdue||0));setText('kTopRappels',Number(p.reminders_open_now||0));setText('kDateRef',p.reference_date||'-');setText('kRappelsDate',Number(p.reminders_open_now||0));setText('kASuivre',Number(p.followups_open_now||0));renderBars('kByStatus',p.by_status||[]);renderTable(b.rows||[]);renderProjectTimeline(b);renderCompanyChart(b);renderReactivity(b);const companyRows=(p.reminders_by_company||[]);setHtml('pilotByCompany',companyRows.length?companyRows.map(r=>`<button class='pilot-row-btn' data-company='${esc(r.company)}'><span class='company-cell'>${companyLogoHtml({name:r.company,logo:r.logo||''})}<span class='name'>${esc(r.company)}</span></span><span><strong>${Number(r.count||0)}</strong> rappels</span></button>`).join(''):"<div class='small'>Aucune donnée</div>");Array.from(document.querySelectorAll('.pilot-row-btn')).forEach(btn=>btn.addEventListener('click',()=>showReminderModal(btn.getAttribute('data-company')||'',b)));}
 function showPageError(err){const root=document.getElementById('boardTable');if(root)root.innerHTML=`<div class='small' style='padding:12px;color:#b42318'>${esc(err?.message||'Erreur de chargement')}</div>`;}
-async function loadAffaires(q){const data=await api(`/api/affaires?search=${encodeURIComponent(q||'')}`);state.affaires=data.items||[];const sel=document.getElementById('affaireSelect');if(!sel)return;sel.innerHTML=`<option value=''>Sélectionner une affaire…</option>${state.affaires.map(a=>`<option value='${esc(a.affaire_id)}'>${esc(a.affaire_id)} — ${esc(a.nom_affaire)}</option>`).join('')}`;}
+async function loadAffaires(q){const data=await api(`/api/finance/affaires?search=${encodeURIComponent(q||'')}`);state.affaires=data.items||[];const sel=document.getElementById('affaireSelect');if(!sel)return;sel.innerHTML=`<option value=''>Sélectionner une affaire…</option>${state.affaires.map(a=>`<option value='${esc(a.affaire_id)}'>${esc(a.display_name||a.affaire_id)}</option>`).join('')}`;}
 function getProjectKey(){return state.selectedId?`id::${state.selectedId}`:'';}
 async function pointageApi(url,opts){const r=await fetch(url,opts);const d=await r.json();if(!r.ok) throw new Error(d.detail||'Erreur pointage');return d;}
 async function loadPointage(){if(!state.selectedId)return;try{const d=await pointageApi(`/api/project-management/pointage?affaire_id=${encodeURIComponent(state.selectedId)}`);state.pointage=d;renderPointage();}catch(e){console.warn(e);}}
@@ -2452,7 +2452,8 @@ async function init(){
         sel.value=found.affaire_id;
         localStorage.setItem('selectedAffaireId',found.affaire_id);
       }
-      await loadBoard(initialId);
+      if(!found&&state.affaires.length){state.selectedId=initialId;}
+      await loadBoard(state.selectedId||initialId);
       await loadPointage();
     }else{renderBoard();}
     document.getElementById('btnImportPlanning').addEventListener('click',()=>document.getElementById('planningCsvInput').click());
