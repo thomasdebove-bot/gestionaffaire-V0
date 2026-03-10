@@ -9,7 +9,7 @@ import unicodedata
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from threading import Lock
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import Body, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
@@ -1829,6 +1829,37 @@ class PointageService:
                     return k
         return ""
 
+    @staticmethod
+    def _parse_outline_level(raw_value: Any) -> Optional[int]:
+        text = clean_text(raw_value)
+        if not text:
+            return None
+        m = re.search(r"\d+", text)
+        if not m:
+            return None
+        try:
+            return max(0, int(m.group(0)))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _parse_duration_to_hours(raw_value: Any, default_hours_per_day: float = 8.0) -> Tuple[float, float, str]:
+        text = clean_text(raw_value)
+        if not text:
+            return 0.0, 0.0, ""
+        compact = text.lower().replace(",", ".")
+        m = re.search(r"(-?\d+(?:\.\d+)?)", compact)
+        if not m:
+            return 0.0, 0.0, ""
+        value = clean_number(m.group(1))
+        if re.search(r"\b(j|jr|jrs|jour|jours|day|days)\b", compact):
+            return value * default_hours_per_day, value, "days"
+        if re.search(r"\b(min|mn|minute|minutes)\b", compact):
+            return value / 60.0, value, "minutes"
+        if re.search(r"\b(h|hr|hrs|heure|heures|hour|hours)\b", compact):
+            return value, value, "hours"
+        return value, value, "hours"
+
     def parse_planning(self, raw: bytes) -> List[Dict[str, Any]]:
         text = self._decode_csv(raw)
         rows = self._csv_rows(text)
@@ -1839,12 +1870,20 @@ class PointageService:
         c_name = self._find_col(first, ["task name", "nom", "name", "tache"])
         c_start = self._find_col(first, ["start", "debut", "date debut"])
         c_end = self._find_col(first, ["finish", "fin", "date fin", "end"])
-        c_work = self._find_col(first, ["work", "charge", "planned hours", "travail"])
+        c_work = self._find_col(first, ["work", "charge", "planned hours", "travail", "duree", "durée", "duration"])
+        c_duration = self._find_col(first, ["duration", "duree", "durée", "planned duration"])
         c_owner = self._find_col(first, ["owner", "resource", "responsable", "ressource"])
         c_pct = self._find_col(first, ["%", "percent", "acheve", "avancement"])
+        c_outline = self._find_col(first, ["outline level", "outline", "niveau", "level", "wbs", "indent"])
+        c_summary = self._find_col(first, ["summary", "is summary", "recap", "récap"])
+        c_pred = self._find_col(first, ["predecessors", "pred", "predecesseurs", "prédécesseurs"])
+        c_unit_cost = self._find_col(first, ["unit cost", "cout unitaire", "coût unitaire", "rate"])
 
         tasks: List[Dict[str, Any]] = []
+        outlines: List[int] = []
         current_level = "Général"
+        current_process = ""
+        parent_stack: List[str] = []
         for idx, r in enumerate(rows):
             name = clean_text(r.get(c_name)) if c_name else ""
             if not name:
@@ -1852,33 +1891,68 @@ class PointageService:
             name_slug = slugify(name)
             if "synthese-technique-niveau" in name_slug or re.search(r"niveau\s+[a-z0-9-]+", name_slug):
                 current_level = name
+                current_process = ""
+            if name_slug.startswith("process"):
+                current_process = name
             task_id = clean_text(r.get(c_id)) if c_id else ""
             if not task_id:
                 task_id = f"task-{idx+1}-{slugify(name)[:24]}"
             start = MetronomeService._parse_date_only(clean_text(r.get(c_start))) if c_start else None
             end = MetronomeService._parse_date_only(clean_text(r.get(c_end))) if c_end else None
-            planned_hours = clean_number(r.get(c_work)) if c_work else 0.0
+            duration_raw = clean_text(r.get(c_duration)) if c_duration else ""
+            work_raw = clean_text(r.get(c_work)) if c_work else ""
+            duration_source = duration_raw or work_raw
+            planned_hours, planned_duration_value, planned_duration_unit = self._parse_duration_to_hours(duration_source)
             owner = clean_text(r.get(c_owner)) if c_owner else ""
             pct = clean_number(r.get(c_pct)) if c_pct else 0.0
-            is_structure = "synthese" in name_slug or "recap" in name_slug
+            outline_level = self._parse_outline_level(r.get(c_outline)) if c_outline else None
+            if outline_level is None:
+                outline_level = 0 if name_slug.startswith("valhubert-") else (1 if name_slug.startswith("process") else 2)
+            outlines.append(outline_level)
+
+            explicit_summary = clean_text(r.get(c_summary)).lower() if c_summary else ""
+            is_summary_explicit = explicit_summary in {"1", "true", "yes", "oui", "summary", "recap", "récap"}
+            is_structure = is_summary_explicit or name_slug.startswith("process") or "synthese-technique" in name_slug
             is_cst = "cst" in slugify(owner) or "cst" in name_slug
             is_cet = slugify(owner) in {"cet"} or slugify(owner).startswith("cet-")
             stable_key = f"{task_id}|{slugify(name)}|{slugify(current_level)}|{idx}"
+
+            while len(parent_stack) > outline_level:
+                parent_stack.pop()
+            parent_task_id = parent_stack[-1] if parent_stack else ""
+            parent_stack.append(task_id)
+
             tasks.append({
                 "task_id": task_id,
                 "stable_key": stable_key,
                 "name": name,
                 "level": current_level,
+                "process_label": current_process,
+                "level_label": current_level,
+                "parent_task_id": parent_task_id,
+                "outline_level": outline_level,
+                "depth": outline_level,
                 "owner": owner or "Non attribué",
                 "start": start.isoformat() if start else "",
                 "end": end.isoformat() if end else "",
                 "planned_hours": planned_hours,
+                "planned_duration_value": planned_duration_value,
+                "planned_duration_unit": planned_duration_unit,
+                "unit_cost": clean_number(r.get(c_unit_cost)) if c_unit_cost else 0.0,
+                "predecessors": clean_text(r.get(c_pred)) if c_pred else "",
                 "csv_progress": max(0.0, min(100.0, pct)),
-                "is_structure": is_structure,
+                "is_summary": is_structure,
                 "is_actionable": not is_structure,
                 "is_cst": is_cst,
                 "is_cet": is_cet,
             })
+
+        for i, task in enumerate(tasks):
+            next_outline = outlines[i + 1] if i + 1 < len(outlines) else -1
+            if next_outline > int(task.get("outline_level", 0)):
+                task["is_summary"] = True
+                task["is_actionable"] = False
+
         return tasks
 
     def _ensure_project(self, key: str) -> Dict[str, Any]:
@@ -1975,7 +2049,8 @@ class PointageService:
                 status = "future"
             else:
                 status = "current"
-            planned_cost = clean_number(t.get("planned_hours")) * cst_rate if t.get("is_cst") else 0.0
+            planned_hours = clean_number(t.get("planned_hours"))
+            planned_cost = planned_hours * cst_rate if t.get("is_cst") else 0.0
             actual_cost = planned_cost * (progress / 100.0)
             out.append({
                 **t,
@@ -1987,6 +2062,7 @@ class PointageService:
                 "delayDays": int(delay_days),
                 "plannedCostCst": round(planned_cost, 2),
                 "actualCostCst": round(actual_cost, 2),
+                "plannedHours": round(planned_hours, 2),
                 "cstRate": cst_rate,
                 "isLate": bool(delay_days > 0),
             })
@@ -2337,47 +2413,26 @@ function renderTable(rows){const root=document.getElementById('boardTable');if(!
 function setText(id,value){const el=document.getElementById(id);if(el) el.textContent=value;}
 function setHtml(id,value){const el=document.getElementById(id);if(el) el.innerHTML=value;}
 function showLoading(on,label='Chargement des indicateurs projet…'){const w=document.getElementById('loadingWrap');if(!w) return;w.style.display=on?'block':'none';setText('loadingLabel',label);}
-function fmtDateFr(v){if(!v)return '-';const d=new Date(v+'T00:00:00');if(Number.isNaN(d.getTime()))return v;return d.toLocaleDateString('fr-FR',{day:'numeric',month:'long',year:'numeric'});}function renderProjectTimeline(b){const p=((b&&b.analytics)||{}).kpi_project_progress||{};const root=document.getElementById('timelineBox');if(!root)return;const total=Number(p.total_days||0);if(!total){root.innerHTML="<div class='small'>Période projet indisponible</div>";return;}const elapsedRaw=Number(p.elapsed_days_raw||0);const over=Number(p.overrun_days||0);const overPct=Number(p.overrun_pct||0);const basePct=Math.max(0,Math.min(100,Number(p.calendar_progress_pct||0)));const fillClass=(p.is_overrun?'timeline-fill over':'timeline-fill');const extra= p.is_overrun ? ` · Dépassement: <strong>${over} jours (${overPct}%)</strong>` : '';root.innerHTML=`<div class='timeline-row'><span><strong>Progression temporelle</strong></span><span><strong>${basePct.toFixed(0)}%</strong></span></div><div class='timeline-track'><div class='${fillClass}' style='width:${basePct}%'></div></div><div class='small' style='margin-top:6px'>Commencé le ${esc(fmtDateFr(p.start_date))}.<br>Fin prévue le ${esc(fmtDateFr(p.end_date))}.<br>${elapsedRaw}/${total} jours écoulés${extra}</div>`;}function renderCompanyChart(b){const p=(b&&b.kpis_pilotage)||{};const metricEl=document.getElementById('companyMetric');const metric=(metricEl&&metricEl.value)||'open';const views=p.project_company_views||{};const items=views[metric]||[];const root=document.getElementById('companyChartList');if(!root)return;if(!items.length){root.innerHTML="<div class='small'>Aucune donnée</div>";return;}const max=Math.max(1,...items.map(x=>Number(x.count||0)));root.innerHTML=items.map(x=>`<div style='margin:8px 0'><div class='pilot-row' style='border-bottom:none;padding:0 0 4px'><span class='company-cell'>${companyLogoHtml(x)}<span class='name'>${esc(x.name)}</span></span><strong>${x.count}</strong></div><div class='bar'><div class='fill' style='width:${(Number(x.count||0)/max)*100}%'></div></div></div>`).join('');}
-function renderReactivity(b){const p=(b&&b.kpis_pilotage)||{};const items=p.reactivity_by_company||[];const root=document.getElementById('reactivityList');if(!root)return;if(!items.length){root.innerHTML="<div class='small'>Pas assez de tâches clôturées avec échéance.</div>";return;}const vals=items.map(x=>Math.abs(Number(x.avg_gap_days||0)));const max=Math.max(1,...vals);root.innerHTML=`<div style='display:flex;align-items:flex-end;gap:14px;height:240px;padding:10px 0'>${items.map(x=>{const v=Number(x.avg_gap_days||0);const h=Math.max(8,(Math.abs(v)/max)*190);const color=v>0?'#d64545':'#1b6ef3';return `<div style='flex:1;min-width:60px;text-align:center'><div title='${esc(x.name)}: ${v} j' style='margin:0 auto;width:34px;height:${h}px;background:${color};border-radius:8px 8px 0 0'></div><div style='font-size:11px;margin-top:6px;font-weight:700'>${esc(x.name)}</div><div style='font-size:11px;color:#6e7a90'>${v} j</div></div>`;}).join('')}</div>`;}function initials(v){const parts=String(v||'').trim().split(/\\s+/).slice(0,2);return parts.map(x=>x[0]||'').join('').toUpperCase()||'?';}
+function fmtDateFr(v){if(!v)return '-';const d=new Date(v+'T00:00:00');if(Number.isNaN(d.getTime()))return v;return d.toLocaleDateString('fr-FR',{day:'numeric',month:'long',year:'numeric'});} 
+function fmtDateFrShort(v){if(!v)return '';const d=new Date(v+'T00:00:00');if(Number.isNaN(d.getTime()))return String(v||'').split(' ')[0];const yy=String(d.getFullYear()).slice(-2);const mm=String(d.getMonth()+1).padStart(2,'0');const dd=String(d.getDate()).padStart(2,'0');return `${dd}/${mm}/${yy}`;}
+function parseDateOnly(v){const s=String(v||'').trim().split(' ')[0];if(!s)return null;if(/^\d{4}-\d{2}-\d{2}$/.test(s)){const d=new Date(s+'T00:00:00');return Number.isNaN(d.getTime())?null:d;}const m=s.match(/^(\d{2})\/(\d{2})\/(\d{2,4})$/);if(m){const y=m[3].length===2?Number(`20${m[3]}`):Number(m[3]);const d=new Date(`${y}-${m[2]}-${m[1]}T00:00:00`);return Number.isNaN(d.getTime())?null:d;}return null;}
+function reminderWeeks(deadline){const d=parseDateOnly(deadline);if(!d)return 0;const now=new Date();const today=new Date(now.getFullYear(),now.getMonth(),now.getDate());const diff=Math.floor((today-d)/(1000*60*60*24));if(diff<=0)return 0;return Math.floor(diff/7)+1;}
+function renderProjectTimeline(b){const p=((b&&b.analytics)||{}).kpi_project_progress||{};const root=document.getElementById('timelineBox');if(!root)return;const total=Number(p.total_days||0);if(!total){root.innerHTML="<div class='small'>Période projet indisponible</div>";return;}const elapsedRaw=Number(p.elapsed_days_raw||0);const over=Number(p.overrun_days||0);const overPct=Number(p.overrun_pct||0);const basePct=Math.max(0,Math.min(100,Number(p.calendar_progress_pct||0)));const fillClass=(p.is_overrun?'timeline-fill over':'timeline-fill');const extra= p.is_overrun ? ` · Dépassement: <strong>${over} jours (${overPct}%)</strong>` : '';root.innerHTML=`<div class='timeline-row'><span><strong>Progression temporelle</strong></span><span><strong>${basePct.toFixed(0)}%</strong></span></div><div class='timeline-track'><div class='${fillClass}' style='width:${basePct}%'></div></div><div class='small' style='margin-top:6px'>Commencé le ${esc(fmtDateFr(p.start_date))}.<br>Fin prévue le ${esc(fmtDateFr(p.end_date))}.<br>${elapsedRaw}/${total} jours écoulés${extra}</div>`;}
+function renderCompanyChart(b){const p=(b&&b.kpis_pilotage)||{};const metricEl=document.getElementById('companyMetric');const metric=(metricEl&&metricEl.value)||'open';const views=p.project_company_views||{};const items=views[metric]||[];const root=document.getElementById('companyChartList');if(!root)return;if(!items.length){root.innerHTML="<div class='small'>Aucune donnée</div>";return;}const max=Math.max(1,...items.map(x=>Number(x.count||0)));root.innerHTML=items.map(x=>`<div style='margin:8px 0'><div class='pilot-row' style='border-bottom:none;padding:0 0 4px'><span class='company-cell'>${companyLogoHtml(x)}<span class='name'>${esc(x.name)}</span></span><strong>${x.count}</strong></div><div class='bar'><div class='fill' style='width:${(Number(x.count||0)/max)*100}%'></div></div></div>`).join('');}
+function renderReactivity(b){const p=(b&&b.kpis_pilotage)||{};const items=p.reactivity_by_company||[];const root=document.getElementById('reactivityList');if(!root)return;if(!items.length){root.innerHTML="<div class='small'>Pas assez de tâches clôturées avec échéance.</div>";return;}const vals=items.map(x=>Math.abs(Number(x.avg_gap_days||0)));const max=Math.max(1,...vals);root.innerHTML=`<div style='display:flex;align-items:flex-end;gap:14px;height:240px;padding:10px 0'>${items.map(x=>{const v=Number(x.avg_gap_days||0);const h=Math.max(8,(Math.abs(v)/max)*190);const color=v>0?'#d64545':'#1b6ef3';return `<div style='flex:1;min-width:60px;text-align:center'><div title='${esc(x.name)}: ${v} j' style='margin:0 auto;width:34px;height:${h}px;background:${color};border-radius:8px 8px 0 0'></div><div style='font-size:11px;margin-top:6px;font-weight:700'>${esc(x.name)}</div><div style='font-size:11px;color:#6e7a90'>${v} j</div></div>`;}).join('')}</div>`;}
+function initials(v){const parts=String(v||'').trim().split(/\s+/).slice(0,2);return parts.map(x=>x[0]||'').join('').toUpperCase()||'?';}
 function companyLogoHtml(item){const name=item.name||item.label||'';const logo=item.logo||'';if(logo){return `<img class='company-logo' src='${esc(logo)}' alt='${esc(name)}'>`;}return `<span class='company-logo'>${esc(initials(name))}</span>`;}
-function showReminderModal(company,b){const p=(b&&b.kpis_pilotage)||{};const items=(p.reminders_open_items||[]).filter(x=>String(x.company||'')===String(company||''));const body=document.getElementById('reminderModalBody');const title=document.getElementById('reminderModalTitle');if(title)title.textContent=`Rappels ouverts - ${company}`;if(!body)return;if(!items.length){body.innerHTML="<div class='small' style='padding:10px'>Aucun rappel ouvert.</div>";}else{const byPer={};for(const it of items){const k=it.perimetre||'Général';(byPer[k]=byPer[k]||[]).push(it);}let html='';for(const per of Object.keys(byPer).sort()){html+=`<h4 style='margin:10px 0 6px'>${esc(per)}</h4><table><thead><tr><th>Lot</th><th>Tâche</th><th>Echéance</th><th>Responsable</th></tr></thead><tbody>${byPer[per].map(r=>`<tr><td>${esc(r.lot||'')}</td><td>${esc(r.task||'')}</td><td>${esc(r.deadline||'')}</td><td>${esc(r.owner||'')}</td></tr>`).join('')}</tbody></table>`;}body.innerHTML=html;}const modal=document.getElementById('reminderModal');if(modal)modal.style.display='flex';}
+function showReminderModal(company,b){const p=(b&&b.kpis_pilotage)||{};const items=(p.reminders_open_items||[]).filter(x=>String(x.company||'')===String(company||''));const body=document.getElementById('reminderModalBody');const title=document.getElementById('reminderModalTitle');if(title)title.textContent=`Rappels ouverts - ${company}`;if(!body)return;if(!items.length){body.innerHTML="<div class='small' style='padding:10px'>Aucun rappel ouvert.</div>";}else{const byPer={};for(const it of items){const k=it.perimetre||'Général';(byPer[k]=byPer[k]||[]).push(it);}let html='';for(const per of Object.keys(byPer).sort()){html+=`<h4 style='margin:10px 0 6px'>${esc(per)}</h4><table><thead><tr><th>Lot</th><th>Tâche</th><th>Échéance</th><th>Rappel</th></tr></thead><tbody>${byPer[per].map(r=>{const w=reminderWeeks(r.deadline);const warn=w>0?`<span style='color:#d64545;font-weight:800'>Rappel ${w}</span>`:'-';return `<tr><td>${esc(r.lot||'')}</td><td>${esc(r.task||'')}</td><td>${esc(fmtDateFrShort(r.deadline||''))}</td><td>${warn}</td></tr>`;}).join('')}</tbody></table>`;}body.innerHTML=html;}const modal=document.getElementById('reminderModal');if(modal)modal.style.display='flex';}
 function hideReminderModal(){const modal=document.getElementById('reminderModal');if(modal)modal.style.display='none';}
-function renderPilotageKpis(b){const p=(b&&b.kpis_pilotage)||{};setText('kRappelsDate',String(p.reminders_open_count||p.rappels_ouverts_a_date||0));setText('kASuivre',String(p.followups_open_count||p.a_suivre_ouverts||0));setText('kDateRef',String(p.reference_date_text||p.reference_date||p.date_reference||'-'));const root=document.getElementById('pilotByCompany');const items=p.reminders_by_company||p.rappels_cumules_par_entreprise||[];if(!items.length){root.innerHTML="<div class='small'>Aucune donnée</div>";}else{root.innerHTML=items.map(x=>`<button type='button' class='pilot-row' style='width:100%;background:transparent;border:none;text-align:left;cursor:pointer' data-company='${esc(x.name||x.label)}'><span class='company-cell'>${companyLogoHtml(x)}<span class='name'>${esc(x.name||x.label)}</span></span><strong>${x.count}</strong></button>`).join('');Array.from(root.querySelectorAll('button[data-company]')).forEach(btn=>btn.addEventListener('click',()=>showReminderModal(btn.getAttribute('data-company')||'',b)));}}
-function renderMatchDiagnostics(b){const md=(b&&b.match_debug)||{};const box=document.getElementById('matchBox');
-  setHtml('matchSearchName',`<b>Projet recherché</b>${esc(md.searched_project_name||b?.project_name||'-')}`);
-  setHtml('matchSearchSlug',`<b>Slug recherché</b><span class='mono'>${esc(md.searched_project_slug||'-')}</span>`);
-  setHtml('matchFoundName',`<b>Projet matché</b>${esc(md.matched_project_name||'-')}`);
-  setHtml('matchFoundSlug',`<b>Slug matché</b><span class='mono'>${esc(md.matched_project_slug||'-')}</span>`);
-  setHtml('matchResolvedTitle',`<b>Projet résolu (title)</b>${esc(md.resolved_project_title||'-')}`);
-  setHtml('matchResolutionMode',`<b>Mode de résolution</b>${esc(md.resolution_mode||'-')}`);
-  setHtml('matchScore',`<b>Score de match</b>${md.match_score===0||md.match_score?esc(String(md.match_score)):'-'}`);
-  setHtml('rowsByTitle',`<b>Lignes filtrées par titre</b>${md.rows_filtered_by_title===0||md.rows_filtered_by_title?esc(String(md.rows_filtered_by_title)):'-'}`);
-  setHtml('rowsById',`<b>Lignes filtrées par ID</b>${md.rows_filtered_by_id===0||md.rows_filtered_by_id?esc(String(md.rows_filtered_by_id)):'-'}`);
-  const missing=(b&&Array.isArray(b.missing_files)&&b.missing_files.length)?b.missing_files.map(x=>esc(x)).join(' | '):'-';
-  setHtml('missingFiles',`<b>Fichiers CSV manquants</b>${missing}`);
-  if(!b||!b.ok){
-    box.classList.remove('ok');box.classList.add('warn');
-    const cf=esc((b&&b.confidence_level)||'low');setHtml('matchStatus',`⚠ Projet METRONOME non trouvé <span class='conf-badge'>confiance: ${cf}</span>`);
-    const reason=b?.reason||'project_not_found';
-    const loaded=b?.loaded_at?` · Chargement: ${b.loaded_at}`:'';
-    setText('matchReason',`Raison: ${reason}${loaded}`);
-    return;
-  }
-  box.classList.remove('warn');box.classList.add('ok');
-  const cf=esc((b&&b.confidence_level)||'high');setHtml('matchStatus',`✅ Matching METRONOME OK <span class='conf-badge'>confiance: ${cf}</span>`);
-  const loaded=b.loaded_at?` · Chargement: ${b.loaded_at}`:'';
-  const warn=b&&b.warning?` · ${b.warning_message||'matching partiel'}`:'';setText('matchReason',`Projet recherché et projet matché résolus.${loaded}${warn}`);
-}
-function renderBoard(){const b=state.board;if(!b||!b.ok){setText('kOpen','0');setText('kLate','0');setText('kTopRappels','0');setText('kTopASuivre','0');setText('projectTitle','Projet METRONOME non trouvé');setText('projectDesc','-');const im=document.getElementById('projectImage');if(im){im.src='';im.style.display='none';}renderPilotageKpis({});renderProjectTimeline({});renderCompanyChart({});renderReactivity({});renderMatchDiagnostics(b||{});return;}const k=b.kpis||{};const p=b.kpis_pilotage||{};setText('kOpen',String(k.open_topics||0));setText('kLate',String(k.overdue_topics||0));setText('kTopRappels',String(p.reminders_open_count||0));setText('kTopASuivre',String(p.followups_open_count||0));setText('projectTitle',b.warning?`${b.project_name||'-'} (partiel)`: (b.project_name||'-'));setText('projectDesc',b.project_description||'');const im=document.getElementById('projectImage');if(im){if(b.project_image){im.src=b.project_image;im.style.display='block';}else{im.src='';im.style.display='none';}}renderPilotageKpis(b);renderProjectTimeline(b);renderCompanyChart(b);renderReactivity(b);renderMatchDiagnostics(b);} 
-async function loadBoard(id){if(!id){state.selectedId='';state.board=null;renderBoard();return;}state.selectedId=id;localStorage.setItem('selectedAffaireId',id);document.getElementById('financeBtn').href=`/finance?affaire_id=${encodeURIComponent(id)}`;document.getElementById('dashboardBtn').href=`/dashboard?affaire_id=${encodeURIComponent(id)}`;showLoading(true);try{state.board=await api(`/api/project-management/board?affaire_id=${encodeURIComponent(id)}`);}catch(err){state.board=null;showPageError(err);}finally{showLoading(false);}renderBoard();}
-async function loadAffaires(search=''){const d=await api(`/api/finance/affaires?search=${encodeURIComponent(search)}`);state.affaires=d.items||[];const sel=document.getElementById('affaireSelect');sel.innerHTML=`<option value=''>Sélectionnez une affaire</option>`+state.affaires.map(x=>`<option value="${esc(x.affaire_id)}">${esc(x.display_name)}</option>`).join('');if(state.selectedId&&state.affaires.some(x=>x.affaire_id===state.selectedId)){sel.value=state.selectedId;}}
-function showPageError(err){const box=document.getElementById('matchBox');if(box){box.classList.remove('ok');box.classList.add('warn');}setText('matchStatus','⚠ Erreur de chargement');setText('matchReason','Erreur de chargement : '+((err&&err.message)?err.message:String(err||'Erreur inconnue')));}
-
-function projectKey(){return state.selectedId?`id::${state.selectedId}`:'';}
+async function loadBoard(id){const aid=id||state.selectedId||'';if(!aid){state.selectedId='';state.board=null;renderBoard();return;}state.selectedId=aid;const sel=document.getElementById('affaireSelect');if(sel)sel.value=aid;localStorage.setItem('selectedAffaireId',aid);showLoading(true,'Chargement de la vue projet…');try{const b=await api(`/api/project-management/board?affaire_id=${encodeURIComponent(aid)}`);state.board=b;renderBoard();}catch(err){console.error(err);state.board=null;renderBoard();showPageError(err);}finally{showLoading(false);}}
+function renderBoard(){const b=state.board||{};const p=b.kpis_pilotage||{};setText('kOpen',Number(p.tasks_open||0));setText('kOverdue',Number(p.tasks_overdue||0));setText('kTopRappels',Number(p.reminders_open_now||0));setText('kDateRef',p.reference_date||'-');setText('kRappelsDate',Number(p.reminders_open_now||0));setText('kASuivre',Number(p.followups_open_now||0));renderBars('kByStatus',p.by_status||[]);renderTable(b.rows||[]);renderProjectTimeline(b);renderCompanyChart(b);renderReactivity(b);const companyRows=(p.reminders_by_company||[]);setHtml('pilotByCompany',companyRows.length?companyRows.map(r=>`<button class='pilot-row-btn' data-company='${esc(r.company)}'><span class='company-cell'>${companyLogoHtml({name:r.company,logo:r.logo||''})}<span class='name'>${esc(r.company)}</span></span><span><strong>${Number(r.count||0)}</strong> rappels</span></button>`).join(''):"<div class='small'>Aucune donnée</div>");Array.from(document.querySelectorAll('.pilot-row-btn')).forEach(btn=>btn.addEventListener('click',()=>showReminderModal(btn.getAttribute('data-company')||'',b)));}
+function showPageError(err){const root=document.getElementById('boardTable');if(root)root.innerHTML=`<div class='small' style='padding:12px;color:#b42318'>${esc(err?.message||'Erreur de chargement')}</div>`;}
+async function loadAffaires(q){const data=await api(`/api/affaires?search=${encodeURIComponent(q||'')}`);state.affaires=data.items||[];const sel=document.getElementById('affaireSelect');if(!sel)return;sel.innerHTML=`<option value=''>Sélectionner une affaire…</option>${state.affaires.map(a=>`<option value='${esc(a.affaire_id)}'>${esc(a.affaire_id)} — ${esc(a.nom_affaire)}</option>`).join('')}`;}
+function getProjectKey(){return state.selectedId?`id::${state.selectedId}`:'';}
 async function pointageApi(url,opts){const r=await fetch(url,opts);const d=await r.json();if(!r.ok) throw new Error(d.detail||'Erreur pointage');return d;}
 async function loadPointage(){if(!state.selectedId)return;try{const d=await pointageApi(`/api/project-management/pointage?affaire_id=${encodeURIComponent(state.selectedId)}`);state.pointage=d;renderPointage();}catch(e){console.warn(e);}}
-function levelGroups(tasks){const g={};for(const t of (tasks||[])){const lvl=t.level||'Général';(g[lvl]=g[lvl]||[]).push(t);}return g;}
-function renderPointage(){const root=document.getElementById('pointageWrap');const d=state.pointage||{};const tasks=d.tasks||[];if(!root)return;if(!tasks.length){root.innerHTML="<div class='small' style='padding:10px'>Aucun planning importé.</div>";return;}const expanded=new Set((d.workState&&d.workState.expanded_levels)||[]);const groups=levelGroups(tasks);let html=`<table><thead><tr><th>Tâche</th><th>Niveau</th><th>Ressource</th><th>Début</th><th>Fin</th><th>% achevé</th><th>Réception réelle</th><th>Retard</th><th>Coût planifié CST</th><th>Coût pointé CST</th><th>Statut</th></tr></thead><tbody>`;for(const lvl of Object.keys(groups)){const open=expanded.has(lvl);html+=`<tr class='lvl-row'><td colspan='11'><button type='button' data-lvl='${esc(lvl)}' class='btn' style='height:28px'>${open?'−':'+'}</button> ${esc(lvl)}</td></tr>`;if(open){for(const t of groups[lvl]){const rowCls=t.isLate?'task-late':(((t.status==='future')&&t.start)?'task-soon':'');html+=`<tr class='${rowCls}'><td>${esc(t.name)}</td><td>${esc(t.level)}</td><td>${esc(t.owner)}</td><td>${esc(t.start||'')}</td><td>${esc(t.end||'')}</td><td><input data-task='${esc(t.task_id)}' data-field='progress' type='number' min='0' max='100' value='${Number(t.progress||0)}' style='width:70px'></td><td><input data-task='${esc(t.task_id)}' data-field='actualEnd' type='date' value='${esc(t.actualEnd||'')}'></td><td>${Number(t.delayDays||0)} j</td><td>${Number(t.plannedCostCst||0).toFixed(0)} €</td><td>${Number(t.actualCostCst||0).toFixed(0)} €</td><td>${esc(t.status)}</td></tr>`;if(t.is_cet&&t.cetMembers&&t.cetMembers.length){for(const m of t.cetMembers){const cm=((t.cet||{})[m]||{});html+=`<tr><td style='padding-left:28px'>↳ ${esc(m)}</td><td>${esc(t.level)}</td><td>CET</td><td></td><td></td><td><input data-task='${esc(t.task_id)}' data-cet='${esc(m)}' data-field='progress' type='number' min='0' max='100' value='${Number(cm.progress||0)}' style='width:70px'></td><td><input data-task='${esc(t.task_id)}' data-cet='${esc(m)}' data-field='actualEnd' type='date' value='${esc(cm.actualEnd||'')}'></td><td colspan='4'></td></tr>`;}}}}}html+='</tbody></table>';root.innerHTML=html;Array.from(root.querySelectorAll('button[data-lvl]')).forEach(b=>b.addEventListener('click',async()=>{const lvl=b.getAttribute('data-lvl')||'';const ws={...(d.workState||{}),expanded_levels:[...new Set([...(d.workState?.expanded_levels||[])]) ]};const set=new Set(ws.expanded_levels);if(set.has(lvl))set.delete(lvl);else set.add(lvl);ws.expanded_levels=[...set];await savePointage({},ws);}));Array.from(root.querySelectorAll('input[data-task]')).forEach(inp=>inp.addEventListener('change',async()=>{const task=inp.getAttribute('data-task')||'';const field=inp.getAttribute('data-field')||'';const cet=inp.getAttribute('data-cet')||'';const patch={};if(cet){patch[task]={cet:{[cet]:{[field]:inp.value}}};}else{patch[task]={[field]:inp.value};}await savePointage(patch,d.workState||{});}));}
+function levelGroups(tasks){const g={};for(const t of (tasks||[])){const lvl=t.level_label||t.level||'Général';(g[lvl]=g[lvl]||[]).push(t);}return g;}
+function renderPointage(){const root=document.getElementById('pointageWrap');const d=state.pointage||{};const tasks=d.tasks||[];if(!root)return;if(!tasks.length){root.innerHTML="<div class='small' style='padding:10px'>Aucun planning importé.</div>";return;}const expanded=new Set((d.workState&&d.workState.expanded_levels)||[]);const groups=levelGroups(tasks);let html=`<table><thead><tr><th>Tâche</th><th>Niveau</th><th>Ressource</th><th>Début</th><th>Fin</th><th>% achevé</th><th>Réception réelle</th><th>Retard</th><th>Coût planifié CST</th><th>Coût pointé CST</th><th>Statut</th></tr></thead><tbody>`;for(const lvl of Object.keys(groups)){const open=expanded.has(lvl);html+=`<tr class='lvl-row'><td colspan='11'><button type='button' data-lvl='${esc(lvl)}' class='btn' style='height:28px'>${open?'−':'+'}</button> ${esc(lvl)}</td></tr>`;if(open){for(const t of groups[lvl]){const isSummary=Boolean(t.is_summary);const rowCls=isSummary?'lvl-row':(t.isLate?'task-late':(((t.status==='future')&&t.start)?'task-soon':''));const label=(t.process_label&&t.process_label!==t.name&&!isSummary)?`${t.process_label} › ${t.name}`:t.name;const start=isSummary?'':fmtDateFrShort(t.start||'');const end=isSummary?'':fmtDateFrShort(t.end||'');const depth=Math.max(0,Number(t.depth||0));const pad=12+(depth*14);if(isSummary){html+=`<tr class='${rowCls}'><td style='padding-left:${pad}px;font-weight:800'>${esc(t.name)}</td><td>${esc(t.level_label||t.level||'')}</td><td>${esc(t.owner||'')}</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td>summary</td></tr>`;continue;}html+=`<tr class='${rowCls}'><td style='padding-left:${pad}px'>${esc(label)}</td><td>${esc(t.level_label||t.level||'')}</td><td>${esc(t.owner)}</td><td>${esc(start)}</td><td>${esc(end)}</td><td><input data-task='${esc(t.task_id)}' data-field='progress' type='number' min='0' max='100' value='${Number(t.progress||0)}' style='width:70px'></td><td><input data-task='${esc(t.task_id)}' data-field='actualEnd' type='date' value='${esc(t.actualEnd||'')}'></td><td>${Number(t.delayDays||0)} j</td><td>${Number(t.plannedCostCst||0).toFixed(0)} €</td><td>${Number(t.actualCostCst||0).toFixed(0)} €</td><td>${esc(t.status)}</td></tr>`;if(t.is_cet&&t.cetMembers&&t.cetMembers.length){for(const m of t.cetMembers){const cm=((t.cet||{})[m]||{});html+=`<tr><td style='padding-left:${pad+16}px'>↳ ${esc(m)}</td><td>${esc(t.level||'')}</td><td>CET</td><td></td><td></td><td><input data-task='${esc(t.task_id)}' data-cet='${esc(m)}' data-field='progress' type='number' min='0' max='100' value='${Number(cm.progress||0)}' style='width:70px'></td><td><input data-task='${esc(t.task_id)}' data-cet='${esc(m)}' data-field='actualEnd' type='date' value='${esc(cm.actualEnd||'')}'></td><td colspan='4'></td></tr>`;}}}}}html+='</tbody></table>';root.innerHTML=html;Array.from(root.querySelectorAll('button[data-lvl]')).forEach(b=>b.addEventListener('click',async()=>{const lvl=b.getAttribute('data-lvl')||'';const ws={...(d.workState||{}),expanded_levels:[...new Set([...(d.workState?.expanded_levels||[])]) ]};const set=new Set(ws.expanded_levels);if(set.has(lvl))set.delete(lvl);else set.add(lvl);ws.expanded_levels=[...set];await savePointage({},ws);}));Array.from(root.querySelectorAll('input[data-task]')).forEach(inp=>inp.addEventListener('change',async()=>{const task=inp.getAttribute('data-task')||'';const field=inp.getAttribute('data-field')||'';const cet=inp.getAttribute('data-cet')||'';const patch={};if(cet){patch[task]={cet:{[cet]:{[field]:inp.value}}};}else{patch[task]={[field]:inp.value};}await savePointage(patch,d.workState||{});}));}
 async function savePointage(pointagePatch,workState){if(!state.selectedId)return;const cetMembers=(document.getElementById('cetMembersInput')||{}).value||'';const payload={pointage_patch:{...pointagePatch,__cetMembers:cetMembers},work_state:workState||{}};const d=await pointageApi(`/api/project-management/pointage/save?affaire_id=${encodeURIComponent(state.selectedId)}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});state.pointage=d;renderPointage();}
 async function importPlanningFile(file){if(!state.selectedId||!file)return;const fd=new FormData();fd.append('file',file);const d=await fetch(`/api/project-management/pointage/planning/import?affaire_id=${encodeURIComponent(state.selectedId)}`,{method:'POST',body:fd});const j=await d.json();if(!d.ok)throw new Error(j.detail||'Import planning impossible');state.pointage=j;renderPointage();}
 async function importSuiviFile(file){if(!state.selectedId||!file)return;const fd=new FormData();fd.append('file',file);const d=await fetch(`/api/project-management/pointage/import-suivi?affaire_id=${encodeURIComponent(state.selectedId)}`,{method:'POST',body:fd});const j=await d.json();if(!d.ok)throw new Error(j.detail||'Import suivi impossible');state.pointage=j;renderPointage();}
