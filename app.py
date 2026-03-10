@@ -549,6 +549,13 @@ class FinanceService:
         if commande > 0 and taux >= 0.9:
             insights.append("L'affaire est presque finalisée financièrement.")
 
+        pointage_amount = clean_number(affaire.get("pointage_progress_amount"))
+        if commande > 0 and pointage_amount > 0:
+            gap = facture - pointage_amount
+            if abs(gap) > max(1000.0, commande * 0.1):
+                direction = "en avance" if gap > 0 else "en retard"
+                insights.append(f"La facturation cumulée est {direction} de {abs(gap):,.0f} € vs avancement pointé CST.".replace(',', ' '))
+
         if not insights:
             insights.append("Situation financière stable selon les données disponibles.")
         return insights
@@ -2094,6 +2101,25 @@ metronome_service = MetronomeService(METRONOME_BASE_PATH)
 pointage_service = PointageService(POINTAGE_STORE_FILE)
 
 
+def pointage_finance_summary(affaire_id: str, commande_ht: float) -> Dict[str, float]:
+    try:
+        data = pointage_service.get_project_data(PointageService._project_key(affaire_id, ""))
+        tasks = data.get("tasks", []) if isinstance(data, dict) else []
+    except Exception:
+        tasks = []
+    actionable = [t for t in tasks if not bool(t.get("is_summary"))]
+    planned = sum(clean_number(t.get("plannedCostCst")) for t in actionable)
+    actual = sum(clean_number(t.get("actualCostCst")) for t in actionable)
+    progress_ratio = (actual / planned) if planned > 0 else 0.0
+    progress_amount = clean_number(commande_ht) * progress_ratio if clean_number(commande_ht) > 0 else 0.0
+    return {
+        "pointage_cost_planned_cst": round(planned, 2),
+        "pointage_cost_actual_cst": round(actual, 2),
+        "pointage_progress_ratio": round(progress_ratio, 4),
+        "pointage_progress_amount": round(progress_amount, 2),
+    }
+
+
 def landing_html() -> str:
     return """<!doctype html>
 <html lang='fr'>
@@ -2277,9 +2303,9 @@ function renderKpis(){const a=state.selectedAffaire||{commande_ht:0,anteriorite:
 document.getElementById('kpiCommande').textContent=euro(a.commande_ht);
 document.getElementById('kpiAnteriorite').textContent=euro(a.anteriorite||0);
 document.getElementById('kpiFacture2026').textContent=euro(a.facture_2026||a.facturation_cumulee_2026||0);
-document.getElementById('kpiFacturationTotale').textContent=euro(a.facturation_totale||0);
+document.getElementById('kpiFacturationTotale').textContent=euro(a.facturation_totale||0);const facSub=document.querySelector('#kpiFacturationTotaleCard .sub');if(facSub){facSub.textContent=`Comparé au pointage: ${euro(a.pointage_progress_amount||0)}`;}
 document.getElementById('kpiReste').textContent=euro(a.reste_a_facturer);
-document.getElementById('kpiAvance').textContent=pct(a.taux_avancement_financier);
+document.getElementById('kpiAvance').textContent=pct(a.taux_avancement_financier);const avSub=document.querySelector('#kpiAvanceCard .sub');if(avSub){avSub.textContent=`Écart facturation vs pointage: ${euro(a.pointage_vs_facturation_gap||0)}`;}
 cardTone('kpiCommandeCard','good');
 cardTone('kpiAnterioriteCard',(a.anteriorite||0)>0?'good':'warn');
 cardTone('kpiFacture2026Card',(a.facture_2026||0)>0?'good':'warn');
@@ -2634,7 +2660,11 @@ def api_affaire_detail(affaire_id: str):
     item = cache.get("items", {}).get(affaire_id)
     if not item:
         raise HTTPException(status_code=404, detail=f"Affaire introuvable : {affaire_id}")
-    return {"ok": True, "affaire": item}
+    affaire = dict(item)
+    affaire.update(pointage_finance_summary(affaire_id, clean_number(affaire.get("commande_ht"))))
+    affaire["pointage_vs_facturation_gap"] = round(clean_number(affaire.get("facturation_totale")) - clean_number(affaire.get("pointage_progress_amount")), 2)
+    affaire["insights"] = FinanceService.compute_insights(affaire)
+    return {"ok": True, "affaire": affaire}
 
 
 @app.get("/api/project-management/board", response_class=JSONResponse)
