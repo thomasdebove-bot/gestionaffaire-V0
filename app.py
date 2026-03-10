@@ -9,9 +9,9 @@ import unicodedata
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from threading import Lock
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from openpyxl import load_workbook
 
@@ -26,6 +26,7 @@ CACHE_FILE = os.getenv("FINANCE_CACHE_FILE", DEFAULT_CACHE_FILE)
 EXPECTED_SCHEMA_VERSION = "finance_affaires_dataset_v4"
 TEMPO_LOGO_PATH = os.getenv("TEMPO_LOGO_PATH", r"\\192.168.10.100\02 - affaires\02.2 - SYNTHESE\ZZ - METRONOME\Content\T logo.png")
 METRONOME_BASE_PATH = os.getenv("METRONOME_BASE_PATH", r"\\192.168.10.100\02 - affaires\02.2 - SYNTHESE\ZZ - METRONOME")
+POINTAGE_STORE_FILE = Path(os.getenv("POINTAGE_STORE_FILE", "pointage_store.json"))
 METRONOME_FILES = {
     "projects": "Projects.csv",
     "entries": "Entries (Tasks & Memos).csv",
@@ -44,7 +45,9 @@ METRONOME_COLUMN_ALIASES = {
     "project_name_projects": ["Name", "Title"],
     "project_start": ["Start Date", "StartDate", "Start"],
     "project_end": ["End Date", "EndDate", "End"],
-    "entry_done_date": ["Done Date", "DoneDate", "Completed Date", "CompletedDate", "ClosedDate", "UpdatedAt"],
+    "project_image": ["Image", "Image URL", "Project Image"],
+    "project_description": ["Description", "Start Sentence"],
+    "entry_done_date": ["Done Date", "DoneDate", "Completed Date", "CompletedDate", "Completed/Declared End", "ClosedDate", "UpdatedAt"],
     "entry_category": ["Category/Name to display", "Category"],
     "entry_project_id": ["Project/ID", "Project"],
     "entry_meeting_id": ["Meeting/ID", "Meeting"],
@@ -119,7 +122,7 @@ def clean_number(value: Any) -> float:
         return 0.0
     if isinstance(value, (int, float)):
         return float(value)
-    text = clean_text(value).replace("€", "").replace("\u202f", "").replace(" ", "")
+    text = clean_text(value).replace("€", "").replace("%", "").replace("\u202f", "").replace(" ", "")
     text = text.replace(",", ".")
     try:
         return float(text)
@@ -546,6 +549,13 @@ class FinanceService:
         if commande > 0 and taux >= 0.9:
             insights.append("L'affaire est presque finalisée financièrement.")
 
+        pointage_amount = clean_number(affaire.get("pointage_progress_amount"))
+        if commande > 0 and pointage_amount > 0:
+            gap = facture - pointage_amount
+            if abs(gap) > max(1000.0, commande * 0.1):
+                direction = "en avance" if gap > 0 else "en retard"
+                insights.append(f"La facturation cumulée est {direction} de {abs(gap):,.0f} € vs avancement pointé CST.".replace(',', ' '))
+
         if not insights:
             insights.append("Situation financière stable selon les données disponibles.")
         return insights
@@ -682,14 +692,217 @@ class MetronomeService:
         txt = clean_text(value)
         if not txt:
             return None
+        # Nettoie les préfixes type jour abrégé: "Mar 09/12/25" -> "09/12/25"
+        txt = re.sub(r"^(?:lun|mar|mer|jeu|ven|sam|dim|mon|tue|wed|thu|fri|sat|sun)\.?\s+", "", txt, flags=re.IGNORECASE)
         for fmt in (
-            "%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d", "%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%d/%m/%y %H:%M:%S"
+            "%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d", "%m/%d/%Y", "%m/%d/%y",
+            "%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%dT%H:%M:%S", "%m/%d/%Y %H:%M", "%m/%d/%Y %H:%M:%S", "%m/%d/%y %H:%M",
+            "%m/%d/%Y %I:%M %p", "%m/%d/%y %I:%M %p", "%d/%m/%y %H:%M:%S"
         ):
-            try:
-                return datetime.strptime(txt[:19], fmt)
-            except Exception:
-                continue
+            for candidate in (txt, txt[:19]):
+                try:
+                    return datetime.strptime(candidate, fmt)
+                except Exception:
+                    continue
+        simple = slugify(txt).replace("-", " ")
+        match = re.match(r"^(\d{1,2})\s+([a-z]+)\s+(\d{4})$", simple)
+        if match:
+            day = int(match.group(1))
+            month_txt = match.group(2)
+            year = int(match.group(3))
+            months = {
+                "janvier": 1, "fevrier": 2, "mars": 3, "avril": 4, "mai": 5, "juin": 6,
+                "juillet": 7, "aout": 8, "septembre": 9, "octobre": 10, "novembre": 11, "decembre": 12,
+            }
+            month = months.get(month_txt)
+            if month:
+                try:
+                    return datetime(year, month, day)
+                except Exception:
+                    return None
         return None
+
+    @classmethod
+    def _parse_date_only(cls, value: str) -> Optional[date]:
+        dt = cls._parse_date_value(value)
+        return dt.date() if dt else None
+
+    @staticmethod
+    def _normalize_company(value: Any) -> str:
+        return clean_text(value) or "Non renseigné"
+
+    @staticmethod
+    def _normalize_zone(value: Any) -> str:
+        return clean_text(value) or "Général"
+
+    @staticmethod
+    def _normalize_lot(value: Any) -> str:
+        return clean_text(value) or "Sans lot"
+
+    @staticmethod
+    def _normalize_owner(value: Any) -> str:
+        return clean_text(value) or "Non attribué"
+
+    @staticmethod
+    def _company_logo_from_row(row: Dict[str, Any]) -> str:
+        for key in ["Logo", "Logo URL", "Avatar", "Avatar URL", "Icon", "Icon URL"]:
+            val = clean_text(row.get(key))
+            if val:
+                return val
+        return ""
+
+    @staticmethod
+    def reminder_level(deadline: Optional[date], completed: bool, ref_date: date) -> Optional[int]:
+        if completed or not deadline:
+            return None
+        days_late = (ref_date - deadline).days
+        if days_late <= 0:
+            return None
+        return ((days_late - 1) // 7) + 1
+
+    @staticmethod
+    def _business_day_delta(target: date, ref_date: date) -> int:
+        if target == ref_date:
+            return 0
+        step = 1 if target > ref_date else -1
+        cur = ref_date
+        count = 0
+        while cur != target:
+            cur = cur + timedelta(days=step)
+            if cur.weekday() < 5:
+                count += step
+        return count
+
+    def reminders_by_company(self, rem_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not rem_rows:
+            return []
+        grouped: Dict[str, int] = {}
+        logos: Dict[str, str] = {}
+        for row in rem_rows:
+            company = self._normalize_company(row.get("__company__"))
+            grouped[company] = grouped.get(company, 0) + 1
+            logos[company] = clean_text(row.get("__logo__"))
+        return [
+            {"name": name, "count": count, "logo": logos.get(name, "")}
+            for name, count in sorted(grouped.items(), key=lambda x: (-x[1], x[0]))
+        ]
+
+    def reminders_for_project(
+        self,
+        project_title: str,
+        ref_date: date,
+        max_level: int = 8,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        entries_override: Optional[List[Dict[str, Any]]] = None,
+        company_logos: Optional[Dict[str, str]] = None,
+    ) -> List[Dict[str, Any]]:
+        source = entries_override or []
+        rows: List[Dict[str, Any]] = []
+        for e in source:
+            if not e.get("is_task"):
+                continue
+            created_date = self._parse_date_only(e.get("meeting_date", ""))
+            if start_date and created_date and created_date < start_date:
+                continue
+            if end_date and created_date and created_date > end_date:
+                continue
+            completed = bool(e.get("is_closed"))
+            done = e.get("done_date")
+            if done is not None:
+                completed = True
+            deadline = self._parse_date_only(e.get("deadline", ""))
+            lvl = self.reminder_level(deadline, completed, ref_date)
+            if lvl is None:
+                continue
+            if int(lvl) > max_level:
+                continue
+            company = self._normalize_company(e.get("company"))
+            zones = e.get("area_names") or ["Général"]
+            if not zones:
+                zones = ["Général"]
+            for zone in zones:
+                rows.append({
+                    **e,
+                    "__project__": project_title,
+                    "__deadline__": deadline,
+                    "__reminder__": int(lvl),
+                    "__zone__": self._normalize_zone(zone),
+                    "__company__": company,
+                    "__logo__": clean_text((company_logos or {}).get(company, "")),
+                })
+        rows.sort(key=lambda r: (-r["__reminder__"], r.get("__deadline__") or date.max))
+        return rows
+
+    def followups_for_project(
+        self,
+        project_title: str,
+        ref_date: date,
+        exclude_entry_ids: Optional[List[str]],
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        entries_override: Optional[List[Dict[str, Any]]] = None,
+        company_logos: Optional[Dict[str, str]] = None,
+    ) -> List[Dict[str, Any]]:
+        source = entries_override or []
+        excluded = {clean_text(v) for v in (exclude_entry_ids or []) if clean_text(v)}
+        rows: List[Dict[str, Any]] = []
+        for e in source:
+            if not e.get("is_task"):
+                continue
+            eid = clean_text(e.get("entry_id"))
+            if eid and eid in excluded:
+                continue
+            created_date = self._parse_date_only(e.get("meeting_date", ""))
+            if start_date and created_date and created_date < start_date:
+                continue
+            if end_date and created_date and created_date > end_date:
+                continue
+            completed = bool(e.get("is_closed"))
+            done = e.get("done_date")
+            if done is not None:
+                completed = True
+            if completed:
+                continue
+            deadline = self._parse_date_only(e.get("deadline", ""))
+            if deadline and deadline < ref_date:
+                continue
+            company = self._normalize_company(e.get("company"))
+            zones = e.get("area_names") or ["Général"]
+            if not zones:
+                zones = ["Général"]
+            for zone in zones:
+                rows.append({
+                    **e,
+                    "__id__": eid,
+                    "__project__": project_title,
+                    "__deadline__": deadline,
+                    "__zone__": self._normalize_zone(zone),
+                    "__company__": company,
+                    "__deadline_sort__": deadline or date.max,
+                })
+        rows.sort(key=lambda r: (r.get("__deadline_sort__") or date.max, r.get("__company__") or ""))
+        return rows
+
+    def meeting_simple_kpis(self, entries_rows: List[Dict[str, Any]], ref_date: date) -> Dict[str, int]:
+        tasks = [e for e in entries_rows if e.get("is_task")]
+        memos = [e for e in entries_rows if e.get("is_memo")]
+        open_tasks = [e for e in tasks if not bool(e.get("is_closed"))]
+        closed_tasks = [e for e in tasks if bool(e.get("is_closed"))]
+        late_tasks = 0
+        for e in open_tasks:
+            dl = self._parse_date_only(e.get("deadline", ""))
+            if dl and dl < ref_date:
+                late_tasks += 1
+        return {
+            "total_entries": len(entries_rows),
+            "tasks_meeting": len(tasks),
+            "memos_meeting": len(memos),
+            "open_tasks": len(open_tasks),
+            "closed_tasks": len(closed_tasks),
+            "late_tasks": late_tasks,
+        }
 
 
     def _score_project_match(self, target_slug: str, target_tokens: set[str], candidate_name: str) -> int:
@@ -814,7 +1027,7 @@ class MetronomeService:
             })
         return resolved
 
-    def build_project_board(self, project_name: str) -> Dict[str, Any]:
+    def build_project_board(self, project_name: str, start_date: str = "", end_date: str = "") -> Dict[str, Any]:
         cache = self._ensure_loaded()
         t = cache.get("tables", {})
         projects = t.get("projects", [])
@@ -832,6 +1045,12 @@ class MetronomeService:
         packages = self._idx(packages_rows)
         companies = self._idx(companies_rows)
         users = self._idx(users_rows)
+        company_logos_by_name: Dict[str, str] = {}
+        for comp in companies_rows:
+            cname = self._normalize_company(comp.get("Name"))
+            logo = self._company_logo_from_row(comp)
+            if cname not in company_logos_by_name or logo:
+                company_logos_by_name[cname] = logo
 
         comments_by_entry: Dict[str, List[str]] = {}
         memo_comments_by_entry: Dict[str, List[Dict[str, Any]]] = {}
@@ -893,6 +1112,8 @@ class MetronomeService:
         today = datetime.now().date()
         rows_filtered_by_title = 0
         rows_filtered_by_id = 0
+        filter_mode = "id" if resolved_id else "title"
+        match_debug["filter_mode"] = filter_mode
 
         def parse_date(value: str) -> Optional[date]:
             txt = clean_text(value)
@@ -903,7 +1124,7 @@ class MetronomeService:
                     return datetime.strptime(txt[:10], fmt).date()
                 except Exception:
                     continue
-            return None
+            return self._parse_date_only(txt)
 
         selected_entries: List[Dict[str, Any]] = []
 
@@ -912,21 +1133,22 @@ class MetronomeService:
             entry_project_id = self._get_first_value(e, METRONOME_COLUMN_ALIASES["entry_project_id"])
 
             use_row = False
-            if resolved_title and entry_project_title == resolved_title:
+            if resolved_id:
+                if entry_project_id == resolved_id:
+                    rows_filtered_by_id += 1
+                    use_row = True
+            elif resolved_title and entry_project_title == resolved_title:
                 rows_filtered_by_title += 1
-                use_row = True
-            elif not resolved_title and resolved_id and entry_project_id == resolved_id:
-                rows_filtered_by_id += 1
-                use_row = True
-            elif resolved_id and entry_project_id == resolved_id and rows_filtered_by_title == 0:
-                rows_filtered_by_id += 1
                 use_row = True
 
             if not use_row:
                 continue
 
-            status = clean_text(self._get_first_value(e, ["Status", "Deadline & Status for Tasks/Status Emoji + Text"])).lower()
-            is_closed = status in {"closed", "close", "done", "termine", "terminé"}
+            completed_flag = self._parse_bool(self._get_first_value(e, ["Completed/true/false", "Completed"]))
+            done_date = self._parse_date_only(self._get_first_value(e, METRONOME_COLUMN_ALIASES["entry_done_date"]))
+            is_closed = bool(completed_flag)
+            if done_date is not None:
+                is_closed = True
 
             entry_id = self._row_id(e)
             area_ids = self._split_multi_values(self._get_first_value(e, METRONOME_COLUMN_ALIASES["entry_area_ids"]))
@@ -943,7 +1165,6 @@ class MetronomeService:
             meeting = meetings.get(meeting_id, {})
             due = self._get_first_value(e, METRONOME_COLUMN_ALIASES["entry_deadline"])
             meeting_date = self._get_first_value(meeting, METRONOME_COLUMN_ALIASES["meeting_date"])
-            done_date = parse_date(self._get_first_value(e, METRONOME_COLUMN_ALIASES["entry_done_date"]))
             request_date = parse_date(due) or parse_date(meeting_date)
 
             category_label = self._get_first_value(e, METRONOME_COLUMN_ALIASES["entry_category"]) or ""
@@ -996,11 +1217,11 @@ class MetronomeService:
                 "request_date": request_date,
                 "done_date": done_date,
                 "is_closed": is_closed,
-                "company": clean_text(company_name_for_task) or clean_text(company.get("Name")) or clean_text(companies.get(pkg_company_id, {}).get("Name")) or "Non défini",
+                "company": clean_text(company_name_for_task) or clean_text(company.get("Name")) or clean_text(companies.get(pkg_company_id, {}).get("Name")) or "Non renseigné",
                 "raw": e,
             })
 
-            if is_closed:
+            if is_closed or not is_task_entry:
                 continue
 
             overdue = False
@@ -1009,11 +1230,11 @@ class MetronomeService:
                 overdue = bool(due_date and due_date < today)
 
             rows.append({
-                "zone": clean_text(area.get("Name")),
-                "lot": clean_text(pkg.get("Name")),
+                "zone": self._normalize_zone(area.get("Name")),
+                "lot": self._normalize_lot(pkg.get("Name")),
                 "sujet": clean_text(e.get("Title")),
-                "entreprise": clean_text(company.get("Name")),
-                "responsable": clean_text(user.get("Name")),
+                "entreprise": self._normalize_company(clean_text(company_name_for_task) or clean_text(company.get("Name"))),
+                "responsable": self._normalize_owner(user.get("Name")),
                 "statut": clean_text(e.get("Status")),
                 "date_echeance": due,
                 "reunion_origine": meeting_date,
@@ -1027,22 +1248,49 @@ class MetronomeService:
         def count_by(field: str) -> List[Dict[str, Any]]:
             agg: Dict[str, int] = {}
             for r in rows:
-                k = clean_text(r.get(field)) or "Non défini"
+                k = clean_text(r.get(field)) or "Non renseigné"
                 agg[k] = agg.get(k, 0) + 1
             return [{"label": k, "count": v} for k, v in sorted(agg.items(), key=lambda x: (-x[1], x[0]))]
 
         by_meeting = count_by("reunion_origine")
         by_company = count_by("entreprise")
-        due_rows = [r for r in rows if (parse_date(r.get("date_echeance", "")) or today) <= today]
-        due_by_company: Dict[str, int] = {}
-        for r in due_rows:
-            label = clean_text(r.get("entreprise")) or "Non défini"
-            due_by_company[label] = due_by_company.get(label, 0) + 1
-        due_by_company_list = [
-            {"label": k, "count": v} for k, v in sorted(due_by_company.items(), key=lambda x: (-x[1], x[0]))
-        ]
 
-        reminder_threshold_days = 14
+        range_start = parse_date(start_date) if start_date else None
+        range_end = parse_date(end_date) if end_date else None
+        meeting_dates = [parse_date(e.get("meeting_date", "")) for e in selected_entries if parse_date(e.get("meeting_date", ""))]
+        meeting_ref_date = max(meeting_dates) if meeting_dates else None
+        reference_date = range_end or meeting_ref_date or today
+        reference_date_text = reference_date.strftime("%d/%m/%Y")
+
+        current_meeting_entry_ids: List[str] = []
+        if meeting_ref_date:
+            current_meeting_entry_ids = [
+                clean_text(e.get("entry_id"))
+                for e in selected_entries
+                if parse_date(e.get("meeting_date", "")) == meeting_ref_date and clean_text(e.get("entry_id"))
+            ]
+
+        rem_rows = self.reminders_for_project(
+            resolved_title or target,
+            reference_date,
+            max_level=8,
+            start_date=range_start,
+            end_date=range_end,
+            entries_override=selected_entries,
+            company_logos=company_logos_by_name,
+        )
+        fol_rows = self.followups_for_project(
+            resolved_title or target,
+            reference_date,
+            exclude_entry_ids=current_meeting_entry_ids,
+            start_date=range_start,
+            end_date=range_end,
+            entries_override=selected_entries,
+        )
+        due_by_company_list = self.reminders_by_company(rem_rows)
+        meeting_simple_kpis = self.meeting_simple_kpis(selected_entries, reference_date)
+
+        reminder_threshold_days = 7
         open_stats: Dict[str, Dict[str, int]] = {}
         delay_stats: Dict[str, Dict[str, int]] = {}
         for item in selected_entries:
@@ -1153,12 +1401,18 @@ class MetronomeService:
         project_end = parse_date(self._get_first_value(project_info, METRONOME_COLUMN_ALIASES["project_end"]))
         if project_start and project_end and project_end > project_start:
             total_days = (project_end - project_start).days
-            elapsed_days = min(max((today - project_start).days, 0), total_days)
+            elapsed_days_raw = max((today - project_start).days, 0)
+            elapsed_days = min(elapsed_days_raw, total_days)
             progress_percent = round((elapsed_days / total_days) * 100, 1)
+            overrun_days = max(0, elapsed_days_raw - total_days)
+            overrun_pct = round((overrun_days / total_days) * 100, 1) if total_days else 0.0
         else:
             total_days = 0
+            elapsed_days_raw = 0
             elapsed_days = 0
             progress_percent = 0.0
+            overrun_days = 0
+            overrun_pct = 0.0
 
         total_tasks = len(fact_tasks)
         closed_tasks = sum(1 for t in fact_tasks if t.get("is_closed"))
@@ -1199,7 +1453,7 @@ class MetronomeService:
 
         company_task_map: Dict[str, List[Dict[str, Any]]] = {}
         for t in fact_tasks:
-            company_task_map.setdefault(clean_text(t.get("company")) or "Non défini", []).append(t)
+            company_task_map.setdefault(clean_text(t.get("company")) or "Non renseigné", []).append(t)
 
         attendance_by_company: Dict[str, Dict[str, int]] = {}
         for m in fact_meetings:
@@ -1265,7 +1519,7 @@ class MetronomeService:
 
         package_map: Dict[str, List[Dict[str, Any]]] = {}
         for t in fact_tasks:
-            package_label = clean_text(t.get("package_label") or t.get("package_name") or "Non défini")
+            package_label = clean_text(t.get("package_label") or t.get("package_name") or "Non renseigné")
             package_map.setdefault(package_label, []).append(t)
         kpi_package_summary: List[Dict[str, Any]] = []
         for plabel, tasks in package_map.items():
@@ -1292,9 +1546,9 @@ class MetronomeService:
 
         zone_map: Dict[str, List[Dict[str, Any]]] = {}
         for t in fact_tasks:
-            names = t.get("area_names") or ["Non défini"]
+            names = t.get("area_names") or ["Non renseigné"]
             for z in names:
-                zone = clean_text(z) or "Non défini"
+                zone = clean_text(z) or "Non renseigné"
                 zone_map.setdefault(zone, []).append(t)
         kpi_zone_summary: List[Dict[str, Any]] = []
         for zname, tasks in zone_map.items():
@@ -1320,8 +1574,31 @@ class MetronomeService:
             "start_date": project_start.isoformat() if project_start else "",
             "end_date": project_end.isoformat() if project_end else "",
             "elapsed_days": elapsed_days,
+            "elapsed_days_raw": elapsed_days_raw,
             "total_days": total_days,
+            "overrun_days": overrun_days,
+            "overrun_pct": overrun_pct,
+            "is_overrun": overrun_days > 0,
         }
+
+        for task in fact_tasks:
+            dline = task.get("deadline")
+            deadline_dt = parse_date(dline) if dline else None
+            is_done = bool(task.get("is_closed"))
+            if is_done:
+                timeline_status = "clos"
+            elif deadline_dt and deadline_dt < reference_date:
+                timeline_status = "rappel"
+            else:
+                timeline_status = "a_suivre"
+            start_dt = task.get("request_date")
+            if not start_dt and deadline_dt:
+                start_dt = deadline_dt - timedelta(days=7)
+            task["timeline_status"] = timeline_status
+            task["timeline_start"] = start_dt.isoformat() if start_dt else ""
+            task["timeline_end"] = deadline_dt.isoformat() if deadline_dt else ""
+            task["company"] = self._normalize_company(task.get("company"))
+            task["owner_full_name"] = self._normalize_owner(task.get("owner_full_name"))
 
         reminder_log: List[Dict[str, Any]] = []
         rid = 0
@@ -1334,7 +1611,7 @@ class MetronomeService:
                     "meeting_id": task.get("meeting_id"),
                     "entry_id": task.get("entry_id"),
                     "company_id": task.get("package_company_id") or "",
-                    "company_name": task.get("company") or "Non défini",
+                    "company_name": task.get("company") or "Non renseigné",
                     "sent_at": "",
                     "sent_by_user_id": "",
                     "sent_by_user_name": "",
@@ -1352,7 +1629,7 @@ class MetronomeService:
                     "meeting_id": task.get("meeting_id"),
                     "entry_id": task.get("entry_id"),
                     "company_id": task.get("package_company_id") or "",
-                    "company_name": task.get("company") or "Non défini",
+                    "company_name": task.get("company") or "Non renseigné",
                     "sent_at": task.get("last_comment_date") or task.get("last_activity_at") or "",
                     "sent_by_user_id": task.get("last_comment_user_id") or "",
                     "sent_by_user_name": task.get("last_comment_user_name") or "",
@@ -1368,6 +1645,71 @@ class MetronomeService:
             cname = c.get("company")
             c["reminder_count_theoretical"] = sum(1 for r in reminder_log if r.get("reminder_type") == "theoretical" and r.get("company_name") == cname)
             c["reminder_count_real"] = sum(1 for r in reminder_log if r.get("reminder_type") == "real" and r.get("company_name") == cname)
+
+        open_tasks_today = [t for t in fact_tasks if t.get("is_open")]
+        overdue_tasks_today = [t for t in open_tasks_today if t.get("deadline") and parse_date(t.get("deadline")) and parse_date(t.get("deadline")) < today]
+        reminder_tasks_today: List[Dict[str, Any]] = []
+        reminder_tasks_cumulative: List[Dict[str, Any]] = []
+        followup_tasks_today: List[Dict[str, Any]] = []
+        open_not_due_tasks_today: List[Dict[str, Any]] = []
+        for task in fact_tasks:
+            deadline_txt = task.get("deadline")
+            deadline_dt = parse_date(deadline_txt) if deadline_txt else None
+            if not deadline_dt:
+                continue
+            pivot_dt = task.get("done_date") if task.get("is_closed") and task.get("done_date") else today
+            delta_biz_cum = self._business_day_delta(deadline_dt, pivot_dt)
+            if delta_biz_cum < 0 and abs(delta_biz_cum) >= 7:
+                reminder_tasks_cumulative.append(task)
+
+        for task in open_tasks_today:
+            deadline_txt = task.get("deadline")
+            deadline_dt = parse_date(deadline_txt) if deadline_txt else None
+            if not deadline_dt:
+                open_not_due_tasks_today.append(task)
+                continue
+            delta_biz = self._business_day_delta(deadline_dt, today)
+            if delta_biz < 0:
+                if abs(delta_biz) >= 7:
+                    reminder_tasks_today.append(task)
+                else:
+                    followup_tasks_today.append(task)
+            else:
+                open_not_due_tasks_today.append(task)
+                if delta_biz <= 7:
+                    followup_tasks_today.append(task)
+
+        def group_company(rows_in: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            counts: Dict[str, int] = {}
+            logos: Dict[str, str] = {}
+            for task in rows_in:
+                cname = self._normalize_company(task.get("company"))
+                counts[cname] = counts.get(cname, 0) + 1
+                logos[cname] = company_logos_by_name.get(cname, "")
+            return [
+                {"name": n, "count": c, "logo": logos.get(n, "")}
+                for n, c in sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+            ]
+
+        reactivity_by_company: List[Dict[str, Any]] = []
+        delays: Dict[str, List[int]] = {}
+        for task in fact_tasks:
+            if not task.get("is_closed"):
+                continue
+            deadline_txt = task.get("deadline")
+            deadline_dt = parse_date(deadline_txt) if deadline_txt else None
+            done_dt = task.get("done_date")
+            if not deadline_dt or not done_dt:
+                continue
+            cname = self._normalize_company(task.get("company"))
+            delays.setdefault(cname, []).append((done_dt - deadline_dt).days)
+        for cname, vals in sorted(delays.items(), key=lambda x: x[0]):
+            reactivity_by_company.append({
+                "name": cname,
+                "avg_gap_days": round(sum(vals) / max(1, len(vals)), 1),
+                "closed_count": len(vals),
+                "logo": company_logos_by_name.get(cname, ""),
+            })
         open_entries_count = rows_filtered_by_title + rows_filtered_by_id
         if project_info and match_debug.get("match_score", 0) >= 80:
             confidence_level = "high"
@@ -1381,36 +1723,55 @@ class MetronomeService:
 
         project_display_name = resolved_title or target
         project_id = resolved_id or self._row_id(project_info)
+        project_image = self._get_first_value(project_info, METRONOME_COLUMN_ALIASES["project_image"])
+        project_description = self._get_first_value(project_info, METRONOME_COLUMN_ALIASES["project_description"])
         return {
             "ok": True,
             "project_name": project_display_name,
             "project_id": project_id,
+            "project_image": project_image,
+            "project_description": project_description,
             "confidence_level": confidence_level,
             "warning": warning,
             "warning_message": warning_message,
             "match_debug": match_debug,
+            "kpis_meeting_simple": meeting_simple_kpis,
             "kpis": {
-                "open_topics": len(rows),
-                "overdue_topics": sum(1 for r in rows if r.get("overdue")),
+                "open_topics": len(open_tasks_today),
+                "overdue_topics": len(overdue_tasks_today),
                 "by_company": by_company,
                 "by_package": count_by("lot"),
                 "by_meeting": by_meeting,
             },
             "kpis_pilotage": {
-                "rappels_ouverts_a_date": len(due_rows),
-                "a_suivre_ouverts": len(rows),
-                "date_reference": today.isoformat(),
-                "rappels_cumules_par_entreprise": due_by_company_list,
+                "reminders_open_count": len(reminder_tasks_today),
+                "followups_open_count": len(open_not_due_tasks_today),
+                "reference_date": reference_date.isoformat(),
+                "reference_date_text": reference_date_text,
+                "reminders_by_company": group_company(reminder_tasks_today),
                 "open_tasks_by_company": open_tasks_by_company,
                 "average_processing_days_by_company": average_processing_days_by_company,
-                "reminder_threshold_weeks": round(reminder_threshold_days / 7),
-                "timeline_progress": {
-                    "start_date": project_start.isoformat() if project_start else "",
-                    "end_date": project_end.isoformat() if project_end else "",
-                    "elapsed_days": elapsed_days,
-                    "total_days": total_days,
-                    "progress_percent": progress_percent,
+                "rappels_ouverts_a_date": len(reminder_tasks_today),
+                "a_suivre_ouverts": len(open_not_due_tasks_today),
+                "date_reference": reference_date.isoformat(),
+                "rappels_cumules_par_entreprise": group_company(reminder_tasks_today),
+                "project_company_views": {
+                    "open": group_company(open_not_due_tasks_today),
+                    "followup": group_company(followup_tasks_today),
+                    "reminder": group_company(reminder_tasks_cumulative),
                 },
+                "reminders_open_items": [
+                    {
+                        "company": self._normalize_company(t.get("company")),
+                        "perimetre": self._normalize_zone((t.get("area_names") or [""])[0] if (t.get("area_names") or []) else ""),
+                        "lot": self._normalize_lot(t.get("package_name") or t.get("package_label")),
+                        "task": clean_text(t.get("entry_title")),
+                        "deadline": clean_text(t.get("deadline")),
+                        "owner": self._normalize_owner(t.get("owner_full_name")),
+                    }
+                    for t in sorted(reminder_tasks_today, key=lambda x: (self._normalize_zone((x.get("area_names") or [""])[0] if (x.get("area_names") or []) else ""), self._normalize_lot(x.get("package_name") or x.get("package_label"),), clean_text(x.get("entry_title"))))
+                ],
+                "reactivity_by_company": reactivity_by_company,
             },
             "analytics": {
                 "fact_tasks": fact_tasks,
@@ -1435,8 +1796,328 @@ class MetronomeService:
         }
 
 
+class PointageService:
+    def __init__(self, store_file: Path) -> None:
+        self.store_file = store_file
+        self._lock = Lock()
+
+    def _load(self) -> Dict[str, Any]:
+        if not self.store_file.exists():
+            return {"projects": {}}
+        try:
+            return json.loads(self.store_file.read_text(encoding="utf-8"))
+        except Exception:
+            return {"projects": {}}
+
+    def _save(self, data: Dict[str, Any]) -> None:
+        self.store_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    @staticmethod
+    def _project_key(affaire_id: str, affaire_name: str) -> str:
+        aid = clean_text(affaire_id)
+        if aid:
+            return f"id::{aid}"
+        return f"name::{slugify(affaire_name)}"
+
+    @staticmethod
+    def _decode_csv(raw: bytes) -> str:
+        for enc in ("utf-8-sig", "cp1252", "latin-1"):
+            try:
+                return raw.decode(enc)
+            except Exception:
+                continue
+        return raw.decode("utf-8", errors="ignore")
+
+    @staticmethod
+    def _csv_rows(text: str) -> List[Dict[str, str]]:
+        first = text.splitlines()[0] if text.splitlines() else ""
+        delimiter = ";" if first.count(";") >= first.count(",") and first.count(";") > 0 else ("	" if "	" in first else ",")
+        return list(csv.DictReader(io.StringIO(text), delimiter=delimiter))
+
+    @staticmethod
+    def _find_col(row: Dict[str, Any], names: List[str]) -> str:
+        for n in names:
+            for k in row.keys():
+                if slugify(k) == slugify(n) or slugify(n) in slugify(k):
+                    return k
+        return ""
+
+    @staticmethod
+    def _parse_outline_level(raw_value: Any) -> Optional[int]:
+        text = clean_text(raw_value)
+        if not text:
+            return None
+        m = re.search(r"\d+", text)
+        if not m:
+            return None
+        try:
+            return max(0, int(m.group(0)))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _parse_duration_to_hours(raw_value: Any, default_hours_per_day: float = 8.0) -> Tuple[float, float, str]:
+        text = clean_text(raw_value)
+        if not text:
+            return 0.0, 0.0, ""
+        compact = text.lower().replace(",", ".")
+        m = re.search(r"(-?\d+(?:\.\d+)?)", compact)
+        if not m:
+            return 0.0, 0.0, ""
+        value = clean_number(m.group(1))
+        if re.search(r"\b(j|jr|jrs|jour|jours|day|days)\b", compact):
+            return value * default_hours_per_day, value, "days"
+        if re.search(r"\b(min|mn|minute|minutes)\b", compact):
+            return value / 60.0, value, "minutes"
+        if re.search(r"\b(h|hr|hrs|heure|heures|hour|hours)\b", compact):
+            return value, value, "hours"
+        return value, value, "hours"
+
+    def parse_planning(self, raw: bytes) -> List[Dict[str, Any]]:
+        text = self._decode_csv(raw)
+        rows = self._csv_rows(text)
+        if not rows:
+            return []
+        first = rows[0]
+        c_id = self._find_col(first, ["id", "task id", "id tache", "uid"])
+        c_name = self._find_col(first, ["task name", "nom", "name", "tache"])
+        c_start = self._find_col(first, ["start", "start date", "start1", "début (f)", "debut (f)", "debut", "début", "date debut", "date début"])
+        c_end = self._find_col(first, ["finish", "finish date", "finish1", "fin (g)", "fin", "date fin", "end", "end date"])
+        c_work = self._find_col(first, ["work", "charge", "planned hours", "travail", "duree", "durée", "duration"])
+        c_duration = self._find_col(first, ["duration", "duree", "durée", "planned duration"])
+        c_owner = self._find_col(first, ["owner", "resource", "nom de ressources", "nom de ressource", "responsable", "ressource"])
+        c_pct = self._find_col(first, ["%", "% acheve", "% achevé", "% complete", "percent", "percentage complete", "percent complete", "acheve", "achevé", "avancement", "pourcentage_acheve", "pourcentage acheve"])
+        c_outline = self._find_col(first, ["outline level", "outline", "niveau", "level", "wbs", "indent"])
+        c_summary = self._find_col(first, ["summary", "is summary", "recap", "récap"])
+        c_pred = self._find_col(first, ["predecessors", "pred", "predecesseurs", "prédécesseurs"])
+        c_unit_cost = self._find_col(first, ["variation_de_cout", "variation de cout", "variation_de_coût", "variation de coût", "variation_de_coût (p)", "variation de coût (p)", "unit cost", "cout unitaire", "coût unitaire", "rate"])
+
+        tasks: List[Dict[str, Any]] = []
+        outlines: List[int] = []
+        current_level = "Général"
+        current_process = ""
+        parent_stack: List[str] = []
+        for idx, r in enumerate(rows):
+            name = clean_text(r.get(c_name)) if c_name else ""
+            if not name:
+                continue
+            name_slug = slugify(name)
+            if "synthese-technique-niveau" in name_slug or re.search(r"niveau\s+[a-z0-9-]+", name_slug):
+                current_level = name
+                current_process = ""
+            if name_slug.startswith("process"):
+                current_process = name
+            task_id = clean_text(r.get(c_id)) if c_id else ""
+            if not task_id:
+                task_id = f"task-{idx+1}-{slugify(name)[:24]}"
+            start = MetronomeService._parse_date_only(clean_text(r.get(c_start))) if c_start else None
+            end = MetronomeService._parse_date_only(clean_text(r.get(c_end))) if c_end else None
+            duration_raw = clean_text(r.get(c_duration)) if c_duration else ""
+            work_raw = clean_text(r.get(c_work)) if c_work else ""
+            duration_source = duration_raw or work_raw
+            planned_hours, planned_duration_value, planned_duration_unit = self._parse_duration_to_hours(duration_source)
+            owner = clean_text(r.get(c_owner)) if c_owner else ""
+            pct = clean_number(r.get(c_pct)) if c_pct else 0.0
+            outline_level = self._parse_outline_level(r.get(c_outline)) if c_outline else None
+            if outline_level is None:
+                outline_level = 0 if name_slug.startswith("valhubert-") else (1 if name_slug.startswith("process") else 2)
+            outlines.append(outline_level)
+
+            explicit_summary = clean_text(r.get(c_summary)).lower() if c_summary else ""
+            is_summary_explicit = explicit_summary in {"1", "true", "yes", "oui", "summary", "recap", "récap"}
+            is_structure = is_summary_explicit or name_slug.startswith("process") or "synthese-technique" in name_slug
+            is_cst = "cst" in slugify(owner) or "cst" in name_slug
+            is_cet = slugify(owner) in {"cet"} or slugify(owner).startswith("cet-")
+            stable_key = f"{task_id}|{slugify(name)}|{slugify(current_level)}|{idx}"
+
+            while len(parent_stack) > outline_level:
+                parent_stack.pop()
+            parent_task_id = parent_stack[-1] if parent_stack else ""
+            parent_stack.append(task_id)
+
+            tasks.append({
+                "task_id": task_id,
+                "stable_key": stable_key,
+                "name": name,
+                "level": current_level,
+                "process_label": current_process,
+                "level_label": current_level,
+                "parent_task_id": parent_task_id,
+                "outline_level": outline_level,
+                "depth": outline_level,
+                "owner": owner or "Non attribué",
+                "start": start.isoformat() if start else "",
+                "end": end.isoformat() if end else "",
+                "planned_hours": planned_hours,
+                "planned_duration_value": planned_duration_value,
+                "planned_duration_unit": planned_duration_unit,
+                "unit_cost": clean_number(r.get(c_unit_cost)) if c_unit_cost else 0.0,
+                "cost_variation": clean_number(r.get(c_unit_cost)) if c_unit_cost else 0.0,
+                "predecessors": clean_text(r.get(c_pred)) if c_pred else "",
+                "csv_progress": max(0.0, min(100.0, pct)),
+                "is_summary": is_structure,
+                "is_actionable": not is_structure,
+                "is_cst": is_cst,
+                "is_cet": is_cet,
+            })
+
+        for i, task in enumerate(tasks):
+            next_outline = outlines[i + 1] if i + 1 < len(outlines) else -1
+            if next_outline > int(task.get("outline_level", 0)):
+                task["is_summary"] = True
+                task["is_actionable"] = False
+
+        return tasks
+
+    def _ensure_project(self, key: str) -> Dict[str, Any]:
+        data = self._load()
+        proj = data.setdefault("projects", {}).setdefault(key, {
+            "planning_tasks": [],
+            "pointage": {"__cetMembers": "", "__cstRate": 80},
+            "workState": {"expanded_levels": []},
+            "updated_at": now_iso(),
+        })
+        return data
+
+    def import_planning(self, project_key: str, raw: bytes) -> Dict[str, Any]:
+        tasks = self.parse_planning(raw)
+        with self._lock:
+            data = self._ensure_project(project_key)
+            proj = data["projects"][project_key]
+            existing_pointage = proj.get("pointage", {})
+            remapped: Dict[str, Any] = {k: v for k, v in existing_pointage.items() if k.startswith("__")}
+            by_task = {t.get("task_id"): t for t in proj.get("planning_tasks", [])}
+            by_stable = {t.get("stable_key"): t for t in proj.get("planning_tasks", [])}
+            for nt in tasks:
+                old = by_task.get(nt.get("task_id")) or by_stable.get(nt.get("stable_key"))
+                if old and old.get("task_id") in existing_pointage:
+                    remapped[nt["task_id"]] = existing_pointage[old["task_id"]]
+            proj["planning_tasks"] = tasks
+            proj["pointage"] = remapped
+            proj["updated_at"] = now_iso()
+            self._save(data)
+        return self.get_project_data(project_key)
+
+    def save_pointage(self, project_key: str, pointage_patch: Dict[str, Any], work_state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        with self._lock:
+            data = self._ensure_project(project_key)
+            proj = data["projects"][project_key]
+            p = proj.setdefault("pointage", {"__cetMembers": "", "__cstRate": 80})
+            for k, v in pointage_patch.items():
+                p[k] = v
+            if work_state is not None:
+                proj["workState"] = work_state
+            proj["updated_at"] = now_iso()
+            self._save(data)
+        return self.get_project_data(project_key)
+
+    def import_suivi(self, project_key: str, raw_json: bytes) -> Dict[str, Any]:
+        payload = json.loads(raw_json.decode("utf-8"))
+        pointage = payload.get("pointage", {})
+        work_state = payload.get("workState", {})
+        return self.save_pointage(project_key, pointage, work_state=work_state)
+
+    def export_suivi(self, project_key: str) -> Dict[str, Any]:
+        data = self.get_project_data(project_key)
+        return {"exportedAt": now_iso(), "pointage": data.get("pointage", {}), "workState": data.get("workState", {})}
+
+    def compute_tasks(self, planning_tasks: List[Dict[str, Any]], pointage: Dict[str, Any]) -> List[Dict[str, Any]]:
+        cet_members = [clean_text(x) for x in clean_text(pointage.get("__cetMembers", "")).split(",") if clean_text(x)]
+        cst_rate = clean_number(pointage.get("__cstRate", 80))
+        today = datetime.now().date()
+        out: List[Dict[str, Any]] = []
+        for t in planning_tasks:
+            rec = pointage.get(t["task_id"], {}) if isinstance(pointage.get(t["task_id"]), dict) else {}
+            progress = clean_number(rec.get("progress", t.get("csv_progress", 0)))
+            actual_end = MetronomeService._parse_date_only(clean_text(rec.get("actualEnd")))
+            cet_map = rec.get("cet", {}) if isinstance(rec.get("cet"), dict) else {}
+            cet_progress_vals = []
+            cet_dates: List[date] = []
+            if t.get("is_cet") and cet_members:
+                for m in cet_members:
+                    cm = cet_map.get(m, {}) if isinstance(cet_map.get(m), dict) else {}
+                    cp = clean_number(cm.get("progress", 0))
+                    ca = MetronomeService._parse_date_only(clean_text(cm.get("actualEnd")))
+                    if ca:
+                        cp = 100.0
+                        cet_dates.append(ca)
+                    cet_progress_vals.append(max(0.0, min(100.0, cp)))
+                if not rec.get("progress") and cet_progress_vals:
+                    progress = sum(cet_progress_vals) / len(cet_progress_vals)
+                if not actual_end and cet_dates:
+                    actual_end = max(cet_dates)
+            if actual_end:
+                progress = 100.0
+            progress = max(0.0, min(100.0, progress))
+            start = MetronomeService._parse_date_only(t.get("start", ""))
+            end = MetronomeService._parse_date_only(t.get("end", ""))
+            if actual_end and end:
+                delay_days = max(0, (actual_end - end).days)
+            elif (not actual_end) and end and progress < 100 and today > end:
+                delay_days = (today - end).days
+            else:
+                delay_days = 0
+            if progress >= 100 or actual_end:
+                status = "past"
+            elif start and today < start:
+                status = "future"
+            else:
+                status = "current"
+            planned_hours = clean_number(t.get("planned_hours"))
+            cost_variation = clean_number(t.get("cost_variation"))
+            planned_cost = cost_variation if cost_variation != 0 else (planned_hours * cst_rate if t.get("is_cst") else 0.0)
+            actual_cost = planned_cost * (progress / 100.0)
+            out.append({
+                **t,
+                "progress": round(progress, 1),
+                "actualEnd": actual_end.isoformat() if actual_end else clean_text(rec.get("actualEnd")),
+                "cet": cet_map,
+                "cetMembers": cet_members,
+                "status": status,
+                "delayDays": int(delay_days),
+                "plannedCostCst": round(planned_cost, 2),
+                "actualCostCst": round(actual_cost, 2),
+                "plannedHours": round(planned_hours, 2),
+                "cstRate": cst_rate,
+                "isLate": bool(delay_days > 0),
+            })
+        return out
+
+    def get_project_data(self, project_key: str) -> Dict[str, Any]:
+        data = self._load()
+        proj = data.get("projects", {}).get(project_key, {"planning_tasks": [], "pointage": {"__cetMembers": "", "__cstRate": 80}, "workState": {"expanded_levels": []}})
+        tasks = self.compute_tasks(proj.get("planning_tasks", []), proj.get("pointage", {}))
+        return {
+            "project_key": project_key,
+            "tasks": tasks,
+            "pointage": proj.get("pointage", {}),
+            "workState": proj.get("workState", {}),
+            "updated_at": proj.get("updated_at", ""),
+        }
+
+
 service = FinanceService(WORKBOOK_PATH, SHEET_NAME, CACHE_FILE)
 metronome_service = MetronomeService(METRONOME_BASE_PATH)
+pointage_service = PointageService(POINTAGE_STORE_FILE)
+
+
+def pointage_finance_summary(affaire_id: str, commande_ht: float) -> Dict[str, float]:
+    try:
+        data = pointage_service.get_project_data(PointageService._project_key(affaire_id, ""))
+        tasks = data.get("tasks", []) if isinstance(data, dict) else []
+    except Exception:
+        tasks = []
+    actionable = [t for t in tasks if not bool(t.get("is_summary"))]
+    planned = sum(clean_number(t.get("plannedCostCst")) for t in actionable)
+    actual = sum(clean_number(t.get("actualCostCst")) for t in actionable)
+    progress_ratio = (actual / planned) if planned > 0 else 0.0
+    progress_amount = clean_number(commande_ht) * progress_ratio if clean_number(commande_ht) > 0 else 0.0
+    return {
+        "pointage_cost_planned_cst": round(planned, 2),
+        "pointage_cost_actual_cst": round(actual, 2),
+        "pointage_progress_ratio": round(progress_ratio, 4),
+        "pointage_progress_amount": round(progress_amount, 2),
+    }
 
 
 def landing_html() -> str:
@@ -1524,15 +2205,15 @@ def finance_html() -> str:
 .hero{margin-top:18px;padding:26px 28px}.hero-top{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap}.hero h2{margin:8px 0 4px;font-size:42px;line-height:1.02}.eyebrow{font-size:12px;font-weight:800;color:var(--blue);letter-spacing:.14em;text-transform:uppercase}
 .meta-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin-top:18px}.meta-pill{background:var(--panel2);border:1px solid var(--line);border-radius:18px;padding:14px 16px}.meta-pill .label{font-size:12px;color:var(--muted);text-transform:uppercase;font-weight:800;letter-spacing:.08em}.meta-pill .value{margin-top:6px;font-size:16px;font-weight:700}
 .health{padding:10px 14px;border-radius:999px;font-size:13px;font-weight:800}.health.ok{background:#eaf8f0;color:var(--green)}.health.warn{background:#fff6e6;color:var(--amber)}.health.bad{background:#fff0f0;color:var(--red)}
-.kpis{margin-top:18px;padding:16px}.kpi-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.kpi{background:linear-gradient(180deg,#fff,#f8faff);border:1px solid var(--line);border-radius:20px;padding:18px;min-height:132px}.kpi .label{font-size:13px;color:var(--muted);font-weight:800;text-transform:uppercase;letter-spacing:.06em}.kpi .value{margin-top:10px;font-size:34px;font-weight:800;line-height:1}.kpi .sub{margin-top:10px;font-size:13px;color:var(--muted)}
-.kpi.good{background:linear-gradient(180deg,#ffffff,#ebf9f1);border-color:#8fd5b0}.kpi.warn{background:linear-gradient(180deg,#ffffff,#fff4e1);border-color:#f1c171}.kpi.bad{background:linear-gradient(180deg,#ffffff,#ffe9e9);border-color:#ee9a9a}
-.layout{display:grid;grid-template-columns:2fr 1fr;gap:18px;margin-top:18px}.section{padding:18px 18px 22px}.section h3{margin:0 0 14px;font-size:24px}
-.chart-card{min-height:560px}.chart-wrap{height:320px;border-radius:18px;background:linear-gradient(180deg,#f7f9fc 0%,#f3f6fb 100%);border:1px solid var(--line);padding:14px}.cum-wrap{margin-top:14px;padding:14px;border:1px solid var(--line);border-radius:16px;background:#f9fbff}.cum-title{margin:0 0 10px;font-size:16px;font-weight:800}.cum-row{display:grid;grid-template-columns:160px 1fr 120px;gap:10px;align-items:center;margin:8px 0}.cum-track{height:12px;background:#e7edf7;border-radius:999px;overflow:hidden}.cum-fill{height:100%}.cum-pre{background:#b9c9ea}.cum-fac{background:#ef8d00}
+.kpis{margin-top:18px;padding:16px}.kpi-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:14px}.kpi{background:linear-gradient(180deg,#fff,#f8faff);border:1px solid var(--line);border-radius:20px;padding:18px;min-height:132px}.kpi .label{font-size:13px;color:var(--muted);font-weight:800;text-transform:uppercase;letter-spacing:.06em}.kpi .value{margin-top:10px;font-size:34px;font-weight:800;line-height:1}.kpi .sub{margin-top:10px;font-size:13px;color:var(--muted)}
+.kpi.good{background:linear-gradient(180deg,#ffffff,#ebf9f1);border-color:#8fd5b0}.kpi.warn{background:linear-gradient(180deg,#ffffff,#fff4e1);border-color:#f1c171}.kpi.bad{background:linear-gradient(180deg,#ffffff,#ffe9e9);border-color:#ee9a9a}.prod-pilot{margin-top:14px;border:1px solid #d7e1ef;border-radius:18px;padding:16px;background:linear-gradient(180deg,#ffffff,#f7faff)}.prod-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.prod-card{border:1px solid #dbe4f2;border-radius:14px;padding:14px;background:#fff}.prod-card .t{font-size:12px;color:#5f6f88;font-weight:800;text-transform:uppercase;letter-spacing:.06em}.prod-card .v{margin-top:8px;font-size:30px;font-weight:900}.prod-card .s{margin-top:6px;font-size:13px;color:#6e7a90}.prod-card.future{background:linear-gradient(180deg,#fff,#f3f7ff)}
+.layout{display:grid;grid-template-columns:1fr;gap:18px;margin-top:18px}.section{padding:18px 18px 22px}.section h3{margin:0 0 14px;font-size:24px}
+.chart-card{min-height:560px}.chart-wrap{height:340px;border-radius:18px;background:linear-gradient(180deg,#fbfcff 0%,#f4f7fd 100%);border:1px solid #d5deec;padding:16px}.cum-wrap{margin-top:14px;padding:16px;border:1px solid #d5deec;border-radius:16px;background:linear-gradient(180deg,#ffffff 0%,#f8fbff 100%)}.cum-title{margin:0 0 10px;font-size:16px;font-weight:900}.cum-row{display:grid;grid-template-columns:200px 1fr 130px;gap:12px;align-items:center;margin:10px 0}.cum-track{height:12px;background:#e7edf7;border-radius:999px;overflow:hidden}.cum-fill{height:100%}.cum-pre{background:#a6bbe6}.cum-fac{background:#ef8d00}
 .legend{display:flex;gap:18px;align-items:center;font-size:13px;color:var(--muted);font-weight:700;margin-top:10px}.legend span{display:inline-flex;align-items:center;gap:8px}.swatch{display:inline-block;width:14px;height:14px;border-radius:4px}
 .table-wrap{overflow:auto;border:1px solid var(--line);border-radius:18px}table{width:100%;border-collapse:collapse}th,td{padding:14px;border-bottom:1px solid var(--line);font-size:14px;text-align:left}th{background:#f7f9fc;color:#536079;font-size:12px;text-transform:uppercase;letter-spacing:.08em}tr:last-child td{border-bottom:none}td.num{text-align:right;font-variant-numeric:tabular-nums}
 .delta.pos{color:var(--green);font-weight:800}.delta.neg{color:var(--red);font-weight:800}.insights{display:flex;flex-wrap:wrap;gap:10px}.insight{padding:12px 14px;border-radius:16px;font-size:14px;font-weight:700;border:1px solid var(--line);background:var(--panel2)}
 .notice{padding:14px 16px;border-radius:16px;background:#fff7e7;color:#8c6211;border:1px solid #f0dcab}.error{padding:14px 16px;border-radius:16px;background:#fff0f0;color:#992f2f;border:1px solid #f1c6c6}.empty{padding:28px;border:1px dashed var(--line);border-radius:18px;color:var(--muted);text-align:center;background:#fafbfd}.small{font-size:13px;color:var(--muted)}.footer-row{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-top:12px}
-@media (max-width:1200px){.kpi-grid{grid-template-columns:repeat(2,1fr)}.layout{grid-template-columns:1fr}.meta-grid{grid-template-columns:repeat(2,1fr)}}@media (max-width:720px){.topbar{position:static}.kpi-grid{grid-template-columns:1fr}.meta-grid{grid-template-columns:1fr}.hero h2{font-size:30px}.select,.search{min-width:100%}}
+@media (max-width:1200px){.kpi-grid{grid-template-columns:repeat(2,1fr)}.prod-grid{grid-template-columns:repeat(2,1fr)}.layout{grid-template-columns:1fr}.meta-grid{grid-template-columns:repeat(2,1fr)}}@media (max-width:720px){.topbar{position:static}.kpi-grid{grid-template-columns:1fr}.prod-grid{grid-template-columns:1fr}.meta-grid{grid-template-columns:1fr}.hero h2{font-size:30px}.select,.search{min-width:100%}}
 </style>
 </head>
 <body>
@@ -1540,13 +2221,13 @@ def finance_html() -> str:
   <div class='topbar'>
     <div class='brand'><div class='eyebrow'>Gestion affaire</div><h1>Finance</h1><p>Cockpit financier par affaire</p></div>
     <div class='controls'>
-      <input id='searchInput' class='search' type='search' placeholder='Rechercher une affaire, un client, un mot-clé…'>
-      <select id='affaireSelect' class='select'><option value=''>Sélectionnez une affaire</option></select>
+      <input id='searchInput' class='search locked' type='search' placeholder='Projet verrouillé (changer depuis Accueil)' readonly>
+      <select id='affaireSelect' class='select locked' disabled><option value=''>Projet verrouillé</option></select>
       <button id='reloadBtn' class='btn primary'>Reconstruire le cache</button>
       <button id='exportBtn' class='btn dark' disabled>Exporter CSV</button>
-      <a id='dashboardBtn' class='btn dark' href='/dashboard'>Tableau de bord</a>
       <a id='pmBtn' class='btn dark' href='/gestion-projet'>Gestion de projet</a>
       <a class='btn dark' href='/'>Accueil</a>
+      <a id='dashboardBtn' class='btn dark' href='/dashboard'>Tableau de bord</a>
       <div id='cacheBadge' class='badge'><span class='dot idle'></span><span>Cache : attente</span></div>
     </div>
   </div>
@@ -1571,8 +2252,10 @@ def finance_html() -> str:
     </div>
   </div>
 
+
+
   <div class='kpis'><div class='kpi-grid'>
-    <div class='kpi' id='kpiCommandeCard'><div class='label'>💰 Commande HT</div><div class='value' id='kpiCommande'>0 €</div><div class='sub'>Montant contractualisé</div></div>
+    <div class='kpi' id='kpiCommandeCard'><div class='label'>💰 Commandes achetées</div><div class='value' id='kpiCommande'>0 €</div><div class='sub'>Montant contractualisé</div></div>
     <div class='kpi' id='kpiAnterioriteCard'><div class='label'>📚 Antériorité</div><div class='value' id='kpiAnteriorite'>0 €</div><div class='sub'>Somme G → M</div></div>
     <div class='kpi' id='kpiFacture2026Card'><div class='label'>📈 Facturé 2026</div><div class='value' id='kpiFacture2026'>0 €</div><div class='sub'>Colonne N</div></div>
     <div class='kpi' id='kpiFacturationTotaleCard'><div class='label'>🧾 Facturation totale</div><div class='value' id='kpiFacturationTotale'>0 €</div><div class='sub'>📚 Antériorité + 2026</div></div>
@@ -1580,23 +2263,28 @@ def finance_html() -> str:
     <div class='kpi' id='kpiAvanceCard'><div class='label'>✅ Avancement financier</div><div class='value' id='kpiAvance'>0 %</div><div class='sub'>Facturé / commande</div></div>
   </div></div>
 
+  <div class='prod-pilot'><h3 style='margin:0 0 12px'>Pilotage production & rentabilité (préparation)</h3><div class='prod-grid'><div class='prod-card'><div class='t'>Avancement financier</div><div id='prodFinPct' class='v'>0 %</div><div class='s'>Facturation cumulée / commande</div></div><div class='prod-card'><div class='t'>Avancement production pointé</div><div id='prodPointagePct' class='v'>0 %</div><div class='s'>Pointage opérationnel (CST)</div></div><div class='prod-card'><div class='t'>Écart financier vs production</div><div id='prodGapPct' class='v'>0 pt</div><div id='prodGapEur' class='s'>0 €</div></div><div class='prod-card future'><div class='t'>Imputation & rentabilité</div><div class='v'>À venir</div><div class='s'>Tuile prête pour l'intégration des pointages ressources</div></div></div></div>
+
   <div class='layout'>
     <div class='section chart-card'>
-      <h3>Facturation mensuelle</h3>
+      <h3>Facturation mensuelle 2026</h3>
       <div class='chart-wrap'><svg id='monthlyChart' width='100%' height='100%' viewBox='0 0 980 320' preserveAspectRatio='none'></svg></div>
       <div class='legend'><span><i class='swatch' style='background:#dbe6ff'></i>Prévisionnel</span><span><i class='swatch' style='background:#ef8d00'></i>Facturation</span></div><div class='cum-wrap'><div class='cum-title'>Graphique cumulatif</div><div id='cumulativeChart'></div></div>
     </div>
-    <div class='section'><h3>Insights / alertes</h3><div id='insightsBox' class='insights'><div class='empty' style='width:100%'>Sélectionnez une affaire.</div></div><div class='footer-row'><div class='small' id='statusMeta'>Cache en attente.</div></div></div>
   </div>
 
+  <div class='section' style='margin-top:12px'><h3>Détail des missions <span id='missionsMeta' class='small' style='margin-left:8px'>0 mission</span></h3><div id='missionsTableWrap' class='table-wrap'><div class='empty'>Sélectionnez une affaire pour afficher les missions.</div></div></div>
+
+  <div class='section' style='margin-top:12px'><h3>Insights / alertes</h3><div id='insightsBox' class='insights'><div class='empty' style='width:100%'>Sélectionnez une affaire.</div></div><div class='footer-row'><div class='small' id='statusMeta'>Cache en attente.</div></div></div>
+
   <div class='section' style='margin-top:18px'><h3>Mensuel détaillé</h3><div id='monthlyTableWrap' class='table-wrap'><div class='empty'>Sélectionnez une affaire pour afficher le détail mensuel.</div></div></div>
-  <div class='section' style='margin-top:18px'><div class='footer-row'><h3 style='margin:0'>Détail des missions</h3><div class='small' id='missionsMeta'>0 mission</div></div><div id='missionsTableWrap' class='table-wrap'><div class='empty'>Sélectionnez une affaire pour afficher les missions.</div></div></div>
+
 </div>
 
 <script>
 const MONTHS=["janvier","fevrier","mars","avril","mai","juin","juillet","aout","septembre","octobre","novembre","decembre"];
 const MONTH_LABELS={"janvier":"Janv.","fevrier":"Févr.","mars":"Mars","avril":"Avr.","mai":"Mai","juin":"Juin","juillet":"Juil.","aout":"Août","septembre":"Sept.","octobre":"Oct.","novembre":"Nov.","decembre":"Déc."};
-const state={cacheStatus:null,affaires:[],selectedAffaireId:"",selectedAffaire:null};
+const state={cacheStatus:null,affaires:[],selectedAffaireId:"",selectedAffaire:null,monthlyExpanded:false};
 function euro(v){return new Intl.NumberFormat('fr-FR',{style:'currency',currency:'EUR',maximumFractionDigits:0}).format(Number(v||0));}
 function pct(v){return new Intl.NumberFormat('fr-FR',{style:'percent',maximumFractionDigits:1}).format(Number(v||0));}
 function fmt(v){return new Intl.NumberFormat('fr-FR',{maximumFractionDigits:0}).format(Number(v||0));}
@@ -1617,25 +2305,24 @@ function renderKpis(){const a=state.selectedAffaire||{commande_ht:0,anteriorite:
 document.getElementById('kpiCommande').textContent=euro(a.commande_ht);
 document.getElementById('kpiAnteriorite').textContent=euro(a.anteriorite||0);
 document.getElementById('kpiFacture2026').textContent=euro(a.facture_2026||a.facturation_cumulee_2026||0);
-document.getElementById('kpiFacturationTotale').textContent=euro(a.facturation_totale||0);
+document.getElementById('kpiFacturationTotale').textContent=euro(a.facturation_totale||0);const facSub=document.querySelector('#kpiFacturationTotaleCard .sub');if(facSub){facSub.textContent=`Comparé au pointage: ${euro(a.pointage_progress_amount||0)}`;}
 document.getElementById('kpiReste').textContent=euro(a.reste_a_facturer);
-document.getElementById('kpiAvance').textContent=pct(a.taux_avancement_financier);
+document.getElementById('kpiAvance').textContent=pct(a.taux_avancement_financier);const avSub=document.querySelector('#kpiAvanceCard .sub');if(avSub){avSub.textContent=`Écart facturation vs pointage: ${euro(a.pointage_vs_facturation_gap||0)}`;}
 cardTone('kpiCommandeCard','good');
 cardTone('kpiAnterioriteCard',(a.anteriorite||0)>0?'good':'warn');
 cardTone('kpiFacture2026Card',(a.facture_2026||0)>0?'good':'warn');
 cardTone('kpiFacturationTotaleCard',(a.facturation_totale||0)>0?'good':'warn');
 cardTone('kpiResteCard',a.reste_a_facturer<0?'bad':(a.reste_a_facturer>(a.commande_ht||0)*0.5?'warn':'good'));
 cardTone('kpiAvanceCard',a.taux_avancement_financier>0.85?'good':(a.taux_avancement_financier<0.35?'warn':''));}
-function renderFinanceChart(){const root=document.getElementById('monthlyChart');const a=state.selectedAffaire;if(!a){root.innerHTML=`<text x="490" y="160" text-anchor="middle" fill="#6e7a90" font-size="18">Sélectionnez une affaire</text>`;return;}const s=MONTHS.map(m=>({label:MONTH_LABELS[m],pre:Number((((a.mensuel||{})[m]||{}).previsionnel)||0),fac:Number((((a.mensuel||{})[m]||{}).facture)||0)}));const maxVal=Math.max(1,...s.flatMap(x=>[x.pre,x.fac]));const left=56,top=16,width=880,height=250,step=width/s.length,barW=step*0.48;let grid='',bars='',labels='';const points=[];for(let i=0;i<=4;i++){const y=top+(height/4)*i,val=Math.round(maxVal*(1-i/4));grid+=`<line x1="${left}" y1="${y}" x2="${left+width}" y2="${y}" stroke="#dfe5ef" stroke-width="1"/><text x="${left-10}" y="${y+4}" text-anchor="end" fill="#8090a8" font-size="12">${fmt(val)}</text>`;}s.forEach((it,i)=>{const x=left+i*step+(step-barW)/2;const h=(it.pre/maxVal)*height;const y=top+height-h;const py=top+height-(it.fac/maxVal)*height;bars+=`<rect x="${x}" y="${y}" width="${barW}" height="${Math.max(h,0.5)}" rx="8" fill="#dbe6ff"><title>${it.label} prévisionnel: ${euro(it.pre)}</title></rect>`;points.push(`${x+barW/2},${py}`);labels+=`<text x="${x+barW/2}" y="${top+height+22}" text-anchor="middle" fill="#66748b" font-size="12">${it.label}</text>`;});root.innerHTML=`${grid}<line x1="${left}" y1="${top+height}" x2="${left+width}" y2="${top+height}" stroke="#b8c3d4" stroke-width="1.2"/>${bars}<polyline points="${points.join(' ')}" fill="none" stroke="#ef8d00" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>${points.map((p,i)=>{const q=p.split(',');return `<circle cx="${q[0]}" cy="${q[1]}" r="4.5" fill="#fff" stroke="#ef8d00" stroke-width="3"><title>${s[i].label} facturé: ${euro(s[i].fac)}</title></circle>`;}).join('')}${labels}`;}
-function renderCumulativeChart(){const root=document.getElementById('cumulativeChart');const a=state.selectedAffaire;if(!a){root.innerHTML="<div class='small'>Sélectionnez une affaire.</div>";return;}const pre=Number(a.total_previsionnel||0);const fac=Number(a.total_facture||0);const max=Math.max(1,pre,fac);const prePct=(pre/max)*100;const facPct=(fac/max)*100;root.innerHTML=`<div class='cum-row'><div>Prévisionnel cumulé</div><div class='cum-track'><div class='cum-fill cum-pre' style='width:${prePct}%'></div></div><div>${euro(pre)}</div></div><div class='cum-row'><div>Facturation cumulée</div><div class='cum-track'><div class='cum-fill cum-fac' style='width:${facPct}%'></div></div><div>${euro(fac)}</div></div>`;}
-function renderMonthlyTable(){const root=document.getElementById('monthlyTableWrap');const a=state.selectedAffaire;if(!a){root.innerHTML=`<div class='empty'>Sélectionnez une affaire pour afficher le détail mensuel.</div>`;return;}let rows='';MONTHS.forEach(m=>{const pre=Number((((a.mensuel||{})[m]||{}).previsionnel)||0),fac=Number((((a.mensuel||{})[m]||{}).facture)||0),ec=fac-pre;rows+=`<tr><td>${MONTH_LABELS[m]}</td><td class='num'>${euro(pre)}</td><td class='num'>${euro(fac)}</td><td class='num delta ${ec>=0?'pos':'neg'}'>${euro(ec)}</td></tr>`;});rows+=`<tr><td><strong>Total</strong></td><td class='num'><strong>${euro(a.total_previsionnel||0)}</strong></td><td class='num'><strong>${euro(a.total_facture||0)}</strong></td><td class='num delta ${Number(a.ecart_previsionnel_vs_facture||0)>=0?'pos':'neg'}'><strong>${euro(a.ecart_previsionnel_vs_facture||0)}</strong></td></tr>`;root.innerHTML=`<table><thead><tr><th>Mois</th><th class='num'>Prévisionnel</th><th class='num'>Facturé</th><th class='num'>Écart</th></tr></thead><tbody>${rows}</tbody></table>`;}
-function renderMissions(){const root=document.getElementById('missionsTableWrap');const meta=document.getElementById('missionsMeta');const a=state.selectedAffaire;if(!a){meta.textContent='0 mission';root.innerHTML=`<div class='empty'>Sélectionnez une affaire pour afficher les missions.</div>`;return;}const missions=a.missions||[];meta.textContent=`${missions.length} mission(s)`;if(!missions.length){root.innerHTML=`<div class='empty'>Aucune mission détaillée sur cette affaire.</div>`;return;}root.innerHTML=`<table><thead><tr><th>Tag</th><th>Mission</th><th>N°</th><th class='num'>Commande</th><th class='num'>🧾 Facturation totale</th><th class='num'>Reste</th><th class='num'>Prévisionnel</th><th class='num'>Facturé</th></tr></thead><tbody>${missions.map(m=>`<tr><td>${esc(m.tag||'')}</td><td>${esc(m.label||'')}</td><td>${esc(m.numero||'')}</td><td class='num'>${euro(m.commande_ht)}</td><td class='num'>${euro(m.facturation_totale||((m.anteriorite||0)+(m.facture_2026||m.facturation_cumulee_2026||0)))}</td><td class='num'>${euro(m.reste_a_facturer)}</td><td class='num'>${euro(m.total_previsionnel)}</td><td class='num'>${euro(m.total_facture)}</td></tr>`).join('')}</tbody></table>`;}
+function renderProductionPilot(){const a=state.selectedAffaire||{};const fin=Number(a.taux_avancement_financier||0);const prod=Number(a.pointage_progress_ratio||0);const gapPct=(fin-prod)*100;const gapEur=Number(a.pointage_vs_facturation_gap||0);const e1=document.getElementById('prodFinPct');const e2=document.getElementById('prodPointagePct');const e3=document.getElementById('prodGapPct');const e4=document.getElementById('prodGapEur');if(e1)e1.textContent=pct(fin);if(e2)e2.textContent=pct(prod);if(e3)e3.textContent=`${gapPct>=0?'+':''}${gapPct.toFixed(1)} pt`;if(e4)e4.textContent=`${euro(gapEur)} · ${gapEur>=0?'facturation en avance':'production en avance'}`;}
+function renderFinanceChart(){const root=document.getElementById('monthlyChart');const a=state.selectedAffaire;if(!a){root.innerHTML=`<text x="490" y="160" text-anchor="middle" fill="#6e7a90" font-size="18">Sélectionnez une affaire</text>`;return;}const rows=MONTHS.map(m=>({label:MONTH_LABELS[m],pre:Number((((a.mensuel||{})[m]||{}).previsionnel)||0),fac:Number((((a.mensuel||{})[m]||{}).facture)||0)}));const maxVal=Math.max(1,...rows.flatMap(x=>[x.pre,x.fac]));const left=56,top=16,width=880,height=250,step=width/rows.length,groupW=Math.min(66,step*0.72),barW=Math.max(10,(groupW-8)/2);let grid='',bars='',labels='';for(let i=0;i<=4;i++){const y=top+(height/4)*i,val=Math.round(maxVal*(1-i/4));grid+=`<line x1="${left}" y1="${y}" x2="${left+width}" y2="${y}" stroke="#d8e1ef" stroke-width="1"/><text x="${left-10}" y="${y+4}" text-anchor="end" fill="#6f7f97" font-size="12">${fmt(val)}</text>`;}rows.forEach((it,i)=>{const gx=left+i*step+(step-groupW)/2;const preH=(it.pre/maxVal)*height;const facH=(it.fac/maxVal)*height;const preY=top+height-preH;const facY=top+height-facH;bars+=`<rect x="${gx}" y="${preY}" width="${barW}" height="${Math.max(preH,1)}" rx="6" fill="#cfdcf6" stroke="#b5c7eb" stroke-width="1"><title>${it.label} prévisionnel: ${euro(it.pre)}</title></rect>`;bars+=`<rect x="${gx+barW+8}" y="${facY}" width="${barW}" height="${Math.max(facH,1)}" rx="6" fill="#ef8d00" stroke="#d87800" stroke-width="1"><title>${it.label} facturation: ${euro(it.fac)}</title></rect>`;labels+=`<text x="${gx+groupW/2}" y="${top+height+22}" text-anchor="middle" fill="#5f6f88" font-size="12">${it.label}</text>`;});root.innerHTML=`${grid}<line x1="${left}" y1="${top+height}" x2="${left+width}" y2="${top+height}" stroke="#b8c3d4" stroke-width="1.2"/>${bars}${labels}`;}
+function renderCumulativeChart(){const root=document.getElementById('cumulativeChart');const a=state.selectedAffaire;if(!a){root.innerHTML="<div class='small'>Sélectionnez une affaire.</div>";return;}const pre=Number(a.total_previsionnel||0);const fac=Number(a.total_facture||0);const max=Math.max(1,pre,fac);const prePct=(pre/max)*100;const facPct=(fac/max)*100;const delta=fac-pre;root.innerHTML=`<div class='cum-row'><div><strong>Prévisionnel cumulé</strong><div class='small'>Base de comparaison</div></div><div class='cum-track'><div class='cum-fill cum-pre' style='width:${prePct}%'></div></div><div><strong>${euro(pre)}</strong></div></div><div class='cum-row'><div><strong>Facturation cumulée</strong><div class='small'>Écart: ${euro(delta)}</div></div><div class='cum-track'><div class='cum-fill cum-fac' style='width:${facPct}%'></div></div><div><strong>${euro(fac)}</strong></div></div>`;}
+function renderMonthlyTable(){const root=document.getElementById('monthlyTableWrap');const a=state.selectedAffaire;if(!a){root.innerHTML=`<div class='empty'>Sélectionnez une affaire pour afficher le détail mensuel.</div>`;return;}const ordered=[...MONTHS];const showAll=(state.monthlyExpanded===true);const visible=showAll?ordered:ordered.slice(0,6);let rows='';visible.forEach(m=>{const pre=Number((((a.mensuel||{})[m]||{}).previsionnel)||0),fac=Number((((a.mensuel||{})[m]||{}).facture)||0),ec=fac-pre;rows+=`<tr><td>${MONTH_LABELS[m]} 2026</td><td class='num'>${euro(pre)}</td><td class='num'>${euro(fac)}</td><td class='num delta ${ec>=0?'pos':'neg'}'>${euro(ec)}</td></tr>`;});rows+=`<tr><td><strong>Total 2026</strong></td><td class='num'><strong>${euro(a.total_previsionnel||0)}</strong></td><td class='num'><strong>${euro(a.total_facture||0)}</strong></td><td class='num delta ${Number(a.ecart_previsionnel_vs_facture||0)>=0?'pos':'neg'}'><strong>${euro(a.ecart_previsionnel_vs_facture||0)}</strong></td></tr>`;const btn=ordered.length>6?`<div style='padding:8px'><button id='btnToggleMonths' class='btn' type='button'>${showAll?'Voir moins':"Voir toute l'année 2026"}</button></div>`:'';root.innerHTML=`<table><thead><tr><th>Mois</th><th class='num'>Prévisionnel</th><th class='num'>Facturé</th><th class='num'>Écart</th></tr></thead><tbody>${rows}</tbody></table>${btn}`;const t=document.getElementById('btnToggleMonths');if(t)t.addEventListener('click',()=>{state.monthlyExpanded=!state.monthlyExpanded;renderMonthlyTable();});}
+function renderMissions(){const root=document.getElementById('missionsTableWrap');const meta=document.getElementById('missionsMeta');if(!root||!meta)return;const a=state.selectedAffaire;if(!a){meta.textContent='0 mission';root.innerHTML=`<div class='empty'>Sélectionnez une affaire pour afficher les missions.</div>`;return;}const missions=a.missions||[];meta.textContent=`${missions.length} mission(s)`;if(!missions.length){root.innerHTML=`<div class='empty'>Aucune mission détaillée sur cette affaire.</div>`;return;}root.innerHTML=`<table><thead><tr><th>Tag</th><th>Mission</th><th>N°</th><th class='num'>Commande</th><th class='num'>🧾 Facturation totale</th><th class='num'>Reste</th><th class='num'>Prévisionnel</th><th class='num'>Facturé</th></tr></thead><tbody>${missions.map(m=>`<tr><td>${esc(m.tag||'')}</td><td>${esc(m.label||'')}</td><td>${esc(m.numero||'')}</td><td class='num'>${euro(m.commande_ht)}</td><td class='num'>${euro(m.facturation_totale||((m.anteriorite||0)+(m.facture_2026||m.facturation_cumulee_2026||0)))}</td><td class='num'>${euro(m.reste_a_facturer)}</td><td class='num'>${euro(m.total_previsionnel)}</td><td class='num'>${euro(m.total_facture)}</td></tr>`).join('')}</tbody></table>`;}
 function renderInsights(){const root=document.getElementById('insightsBox');const a=state.selectedAffaire;if(!a){root.innerHTML=`<div class='empty' style='width:100%'>Sélectionnez une affaire.</div>`;return;}const items=a.insights||[];root.innerHTML=items.map(x=>`<div class='insight'>${esc(x)}</div>`).join('');}
-function renderAll(){renderHero();renderKpis();renderFinanceChart();renderCumulativeChart();renderMonthlyTable();renderMissions();renderInsights();document.getElementById('exportBtn').disabled=!state.selectedAffaireId;const dash=document.getElementById('dashboardBtn');dash.href=state.selectedAffaireId?`/dashboard?affaire_id=${encodeURIComponent(state.selectedAffaireId)}`:'/dashboard';const pm=document.getElementById('pmBtn');pm.href=state.selectedAffaireId?`/gestion-projet?affaire_id=${encodeURIComponent(state.selectedAffaireId)}`:'/gestion-projet';}
+function renderAll(){renderHero();renderKpis();renderProductionPilot();renderFinanceChart();renderCumulativeChart();renderMonthlyTable();renderMissions();renderInsights();document.getElementById('exportBtn').disabled=!state.selectedAffaireId;const dash=document.getElementById('dashboardBtn');dash.href=state.selectedAffaireId?`/dashboard?affaire_id=${encodeURIComponent(state.selectedAffaireId)}`:'/dashboard';const pm=document.getElementById('pmBtn');pm.href=state.selectedAffaireId?`/gestion-projet?affaire_id=${encodeURIComponent(state.selectedAffaireId)}`:'/gestion-projet';}
 async function rebuildCache(){clearError();showNotice('Reconstruction du cache en cours…');await api('/api/finance/rebuild-cache',{method:'POST'});await loadCacheStatus();await loadAffairesList(document.getElementById('searchInput').value||'');if(state.selectedAffaireId&&state.affaires.some(x=>x.affaire_id===state.selectedAffaireId)){await loadSelectedAffaire(state.selectedAffaireId);}else{state.selectedAffaireId='';state.selectedAffaire=null;renderAll();}showNotice('Cache reconstruit avec succès.');}
 async function initFinancePage(){clearError();try{await loadCacheStatus();await loadAffairesList('');const params=new URLSearchParams(window.location.search);const affairFromUrl=params.get('affaire_id');const affairFromStorage=localStorage.getItem('selectedAffaireId')||'';const preselected=affairFromUrl||affairFromStorage;if(preselected&&state.affaires.some(x=>x.affaire_id===preselected)){document.getElementById('affaireSelect').value=preselected;await loadSelectedAffaire(preselected);}else{renderAll();}}catch(err){showError(err.message||'Erreur de chargement');}
-document.getElementById('searchInput').addEventListener('input',async ev=>{clearError();try{await loadAffairesList(ev.target.value||'');if(state.selectedAffaireId&&!state.affaires.some(x=>x.affaire_id===state.selectedAffaireId)){state.selectedAffaireId='';state.selectedAffaire=null;document.getElementById('affaireSelect').value='';renderAll();}}catch(err){showError(err.message||'Erreur de recherche');}});
-document.getElementById('affaireSelect').addEventListener('change',async ev=>{clearError();try{await loadSelectedAffaire(ev.target.value||'');}catch(err){showError(err.message||'Erreur de chargement affaire');}});
 document.getElementById('reloadBtn').addEventListener('click',async()=>{try{await rebuildCache();}catch(err){showError(err.message||'Erreur de reconstruction du cache');}});
 document.getElementById('exportBtn').addEventListener('click',()=>{if(!state.selectedAffaireId)return;window.location.href=`/api/finance/affaire/${encodeURIComponent(state.selectedAffaireId)}/export-csv`;});}
 initFinancePage();
@@ -1654,31 +2341,35 @@ def gestion_projet_html() -> str:
 :root{--line:#dfe5ef;--ink:#122033;--muted:#6e7a90;--accent:#ef8d00;--panel:#fff;--shadow:0 12px 34px rgba(18,32,51,.07)}
 *{box-sizing:border-box}body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:#f3f6fb;color:var(--ink)}
 .wrap{max-width:1480px;margin:20px auto;padding:0 16px}.top,.kpis,.section{background:var(--panel);border:1px solid var(--line);border-radius:22px;box-shadow:var(--shadow)}
-.top{padding:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}.search,.select{height:44px;border:1px solid var(--line);border-radius:12px;padding:0 12px;min-width:280px}
+.top{padding:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}.search,.select{height:44px;border:1px solid var(--line);border-radius:12px;padding:0 12px;min-width:280px}.search.locked,.select.locked{background:#eef2f8;color:#6e7a90;pointer-events:none}
 .btn{height:44px;border-radius:12px;border:none;padding:0 14px;background:var(--accent);color:#fff;text-decoration:none;display:inline-flex;align-items:center;font-weight:800;cursor:pointer}
 .kpis{margin-top:12px;padding:14px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.k{border:1px solid var(--line);border-radius:14px;padding:14px;background:#fbfdff}.k .v{font-size:34px;font-weight:900;margin-top:6px}
 .section{margin-top:12px;padding:14px}.subgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:14px}table{width:100%;border-collapse:collapse}th,td{padding:10px 12px;border-bottom:1px solid var(--line);font-size:13px;text-align:left}th{background:#f7f9fc;font-size:12px;color:#5b6880;text-transform:uppercase}.small{color:var(--muted);font-size:13px}
 .bar{height:10px;background:#edf1f8;border-radius:999px;overflow:hidden}.fill{height:100%;background:#ef8d00}
-.loading-wrap{margin-top:8px;padding:8px 10px;border:1px solid #d8e0ee;border-radius:12px;background:#fff}.loading-label{font-size:12px;color:#5b6880;margin-bottom:6px;font-weight:700}.loading-track{height:8px;border-radius:999px;background:#eef2f8;overflow:hidden}.loading-bar{height:100%;width:35%;background:linear-gradient(90deg,#ef8d00,#ffd08a);animation:loadmove 1.2s infinite ease-in-out}@keyframes loadmove{0%{margin-left:-35%}100%{margin-left:100%}}.match-box{margin-top:10px;border:1px solid var(--line);border-radius:10px;padding:8px;background:#fffaf2}.match-box.ok{border-color:#49a66a;background:#f4fcf6}.match-box.warn{border-color:#ef8d00;background:#fff7ec}.match-title{font-weight:700;margin-bottom:4px;font-size:13px}.conf-badge{display:inline-block;margin-left:8px;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:800;background:#eef2f8;color:#3b4f6f}.match-grid{display:none}.match-item{font-size:12px;color:#30425f}.match-item b{display:block;color:#6e7a90;font-size:11px;margin-bottom:2px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-word}.pilot-box{margin-top:12px;border:1px solid #cfd8e8;border-radius:18px;padding:16px;background:#f8fbff}.pilot-title{font-size:34px;font-weight:900;margin:4px 0 10px}.pilot-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.pilot-card{background:#fff;border:1px solid #d8e0ee;border-radius:18px;padding:14px}.pilot-card .t{font-size:15px;color:#4b5d7a;font-weight:800}.pilot-card .v{font-size:44px;font-weight:900;margin-top:8px}.pilot-list{margin-top:12px;border:1px solid #d8e0ee;border-radius:18px;background:#fff;padding:8px 14px}.pilot-row{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px dashed #d8e0ee}.pilot-row:last-child{border-bottom:none}.pilot-row .name{font-weight:700}
+.loading-wrap{margin-top:8px;padding:8px 10px;border:1px solid #d8e0ee;border-radius:12px;background:#fff}.loading-label{font-size:12px;color:#5b6880;margin-bottom:6px;font-weight:700}.loading-track{height:8px;border-radius:999px;background:#eef2f8;overflow:hidden}.loading-bar{height:100%;width:35%;background:linear-gradient(90deg,#ef8d00,#ffd08a);animation:loadmove 1.2s infinite ease-in-out}@keyframes loadmove{0%{margin-left:-35%}100%{margin-left:100%}}.match-box{margin-top:10px;border:1px solid var(--line);border-radius:10px;padding:8px;background:#fffaf2}.match-box.ok{border-color:#49a66a;background:#f4fcf6}.match-box.warn{border-color:#ef8d00;background:#fff7ec}.match-title{font-weight:700;margin-bottom:4px;font-size:13px}.conf-badge{display:inline-block;margin-left:8px;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:800;background:#eef2f8;color:#3b4f6f}.match-grid{display:none;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.match-box:hover .match-grid,.match-box:focus-within .match-grid{display:grid}.match-item{font-size:12px;color:#30425f}.match-item b{display:block;color:#6e7a90;font-size:11px;margin-bottom:2px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-word}.pilot-box{margin-top:12px;border:1px solid #cfd8e8;border-radius:18px;padding:16px;background:#f8fbff}.pilot-title{font-size:34px;font-weight:900;margin:4px 0 10px}.pilot-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.pilot-card{background:#fff;border:1px solid #d8e0ee;border-radius:18px;padding:14px}.pilot-card .t{font-size:15px;color:#4b5d7a;font-weight:800}.pilot-card .v{font-size:44px;font-weight:900;margin-top:8px}.pilot-list{margin-top:12px;border:1px solid #d8e0ee;border-radius:18px;background:#fff;padding:10px}.pilot-row{display:flex;justify-content:space-between;gap:12px;padding:12px;border:1px solid #e6ecf6;border-radius:12px;margin:8px 0;background:linear-gradient(180deg,#ffffff 0%,#f8fbff 100%)}.pilot-row:last-child{border-bottom:1px solid #e6ecf6}.pilot-row .name{font-weight:800}.pilot-row-btn{appearance:none;-webkit-appearance:none;width:100%;text-align:left;background:none;cursor:pointer;color:inherit;font:inherit}.company-cell{display:flex;align-items:center;gap:10px}.company-logo{width:28px;height:28px;border-radius:50%;border:1px solid #d8e0ee;background:#fff;object-fit:cover;display:inline-flex;align-items:center;justify-content:center;font-size:11px;color:#6e7a90;font-weight:800}.proj-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.progress-card{border:1px solid #d8e0ee;border-radius:14px;padding:12px;background:#fff}.progress-title{font-weight:800;margin-bottom:8px}.progress-row{display:grid;grid-template-columns:180px 1fr 70px;gap:10px;align-items:center;padding:6px 0}.progress-track{height:10px;border-radius:999px;background:#edf1f8;overflow:hidden}.progress-fill{height:100%;background:#1b6ef3}.curve-wrap{border:1px solid #d8e0ee;border-radius:14px;padding:12px;background:#fff}.project-head{display:flex;align-items:center;gap:14px}.project-cover{width:88px;height:64px;border-radius:10px;border:1px solid #d8e0ee;object-fit:cover;background:#fff}.project-title{font-size:30px;font-weight:900;margin:4px 0 2px}.project-desc{color:#6e7a90;margin:2px 0 0}.timeline-box{margin:10px 0;border:1px solid #d8e0ee;border-radius:14px;background:#fff;padding:10px}.timeline-row{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px}.timeline-track{height:12px;border-radius:999px;background:#edf1f8;overflow:hidden}.timeline-fill{height:100%;background:#1b6ef3}.timeline-fill.over{background:#d64545}.chart-controls{display:flex;gap:8px;align-items:center;margin-bottom:8px}.chart-select{height:36px;border:1px solid var(--line);border-radius:10px;padding:0 10px}.react-row{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px dashed #d8e0ee}.react-row:last-child{border-bottom:none}.pm-modal{position:fixed;inset:0;background:rgba(11,20,33,.45);display:flex;align-items:center;justify-content:center;padding:20px;z-index:50}.pm-modal-box{background:#fff;border-radius:14px;max-width:1100px;width:100%;max-height:82vh;overflow:auto;padding:14px;border:1px solid #d8e0ee}.lvl-row{background:#f7f9fd;font-weight:800}.task-late{background:#fff1f1}.task-soon{background:#fffaf0}
 @media (max-width:980px){.grid{grid-template-columns:repeat(2,1fr)}.subgrid{grid-template-columns:1fr}}@media (max-width:640px){.grid{grid-template-columns:1fr}}
 </style></head>
 <body><div class='wrap'>
   <div class='top'>
     <a class='btn' href='/'>Accueil</a>
-    <input id='searchInput' class='search' type='search' placeholder='Rechercher une affaire'>
-    <select id='affaireSelect' class='select'><option value=''>Sélectionnez une affaire</option></select>
+    <input id='searchInput' class='search locked' type='search' placeholder='Projet verrouillé (changer depuis Accueil)' readonly>
+    <select id='affaireSelect' class='select locked' disabled><option value=''>Projet verrouillé</option></select>
     <a id='financeBtn' class='btn' href='/finance'>Finances</a>
     <a id='dashboardBtn' class='btn' href='/dashboard'>Tableau de bord</a>
+    <a class='btn' href='/'>Changer de projet</a>
   </div>
   <div id='loadingWrap' class='loading-wrap' style='display:none'><div id='loadingLabel' class='loading-label'>Chargement des indicateurs projet…</div><div class='loading-track'><div class='loading-bar'></div></div></div>
 
-  <div class='kpis'><div class='grid'>
-    <div class='k'><div class='small'>Sujets ouverts</div><div id='kOpen' class='v'>0</div></div>
-    <div class='k'><div class='small'>Sujets en retard</div><div id='kLate' class='v'>0</div></div>
-    <div class='k'><div class='small'>Projet METRONOME</div><div id='kProject' class='v' style='font-size:22px'>-</div></div>
-    <div class='k'><div class='small'>Chargement</div><div id='kLoad' class='v' style='font-size:18px'>-</div></div>
-  </div>
-    <div id='matchBox' class='match-box warn'>
+  <div class='kpis'>
+    <div class='project-head'><img id='projectImage' class='project-cover' alt='Projet' src=''><div><div id='projectTitle' class='project-title'>-</div><div id='projectDesc' class='project-desc'>-</div></div></div>
+    <div id='timelineBox' class='timeline-box'><div class='small'>Période projet indisponible</div></div>
+    <div class='grid'>
+      <div class='k'><div class='small'>Sujets ouverts</div><div id='kOpen' class='v'>0</div></div>
+      <div class='k'><div class='small'>Sujets en retard</div><div id='kLate' class='v'>0</div></div>
+      <div class='k'><div class='small'>Rappels ouverts (>=7j ouvrés)</div><div id='kTopRappels' class='v'>0</div></div>
+      <div class='k'><div class='small'>À suivre ouverts</div><div id='kTopASuivre' class='v'>0</div></div>
+    </div>
+    <div id='matchBox' class='match-box warn' tabindex='0'>
       <div id='matchStatus' class='match-title'>Diagnostic de matching METRONOME</div>
       <div id='matchReason' class='small'>Aucune affaire sélectionnée.</div>
       <div class='match-grid'>
@@ -1710,58 +2401,84 @@ def gestion_projet_html() -> str:
   </div>
 
   <div class='section'>
-    <h3>Tâches ouvertes par entreprise (avec rappels)</h3>
-    <div id='companyOpenList' class='pilot-list'><div class='small'>Aucune donnée</div></div>
+    <h3>Graphique par entreprise</h3>
+    <div class='chart-controls'>
+      <label for='companyMetric' class='small'>Afficher :</label>
+      <select id='companyMetric' class='chart-select'>
+        <option value='open'>Tâches ouvertes par entreprise</option>
+        <option value='followup'>Tâches à suivre par entreprise</option>
+        <option value='reminder'>Total de taches en rappel par entreprise</option>
+      </select>
+    </div>
+    <div id='companyChartList' class='pilot-list'><div class='small'>Aucune donnée</div></div>
   </div>
 
   <div class='section'>
-    <h3>Réactivité entreprises (délai moyen de traitement)</h3>
-    <div id='companyDelayList' class='pilot-list'><div class='small'>Aucune donnée</div></div>
+    <h3>Réactivité par entreprise (écart moyen échéance → clôture)</h3>
+    <div id='reactivityList' class='pilot-list'><div class='small'>Aucune donnée</div></div>
   </div>
+
+  <div class='section'>
+    <h3>Pointage opérationnel</h3>
+    <div class='chart-controls'>
+      <input id='planningCsvInput' type='file' accept='.csv' style='display:none'>
+      <input id='suiviImportInput' type='file' accept='.json' style='display:none'>
+      <button id='btnImportPlanning' class='btn'>Importer planning CSV</button>
+      <button id='btnExportSuivi' class='btn'>Exporter suivi (.json)</button>
+      <button id='btnImportSuivi' class='btn'>Importer suivi</button>
+      <input id='cetMembersInput' class='search' style='height:36px;min-width:320px' placeholder='Équipe CET (ex: CVC, PLB, ELE)'>
+      <button id='btnExpandAll' class='btn'>Tout déployer</button>
+      <button id='btnCollapseAll' class='btn'>Tout refermer</button>
+    </div>
+    <div id='pointageWrap' class='table-wrap'><div class='small' style='padding:10px'>Aucun planning importé.</div></div>
+  </div>
+
+  <div id='reminderModal' class='pm-modal' style='display:none'>
+    <div class='pm-modal-box'>
+      <div style='display:flex;justify-content:space-between;align-items:center'>
+        <h3 id='reminderModalTitle' style='margin:0'>Rappels ouverts</h3>
+        <button id='reminderModalClose' class='btn'>Fermer</button>
+      </div>
+      <div id='reminderModalBody' class='table-wrap' style='margin-top:8px'></div>
+    </div>
+  </div>
+
 </div>
 <script>
-const state={affaires:[],selectedId:'',board:null};
+const state={affaires:[],selectedId:'',selectedLabel:'',board:null,pointage:null};
+function resolveAffaire(input){const raw=String(input||'').trim();if(!raw)return null;const low=raw.toLowerCase();const slug=raw.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g,'').replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'');return (state.affaires||[]).find(a=>String(a.affaire_id||'')===raw)|| (state.affaires||[]).find(a=>String(a.display_name||'').toLowerCase()===low)|| (state.affaires||[]).find(a=>String(a.display_name||'').toLowerCase().startsWith(low))|| (state.affaires||[]).find(a=>String((a.display_name||'').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g,'').replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,''))===slug)||null;}
 function esc(v){return String(v??'').replace(/[&<>]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[ch]||ch));}
 async function api(u){const r=await fetch(u);const d=await r.json();if(!r.ok) throw new Error(d.detail||'Erreur API');return d;}
-function renderBars(id,items){const root=document.getElementById(id);if(!items||!items.length){root.innerHTML="<div class='small'>Aucune donnée</div>";return;}const max=Math.max(1,...items.map(x=>Number(x.count||0)));root.innerHTML=items.map(x=>`<div style='margin:8px 0'><div style='display:flex;justify-content:space-between;gap:8px'><span>${esc(x.label)}</span><strong>${x.count}</strong></div><div class='bar'><div class='fill' style='width:${(Number(x.count||0)/max)*100}%'></div></div></div>`).join('');}
-function renderTable(rows){const root=document.getElementById('boardTable');if(!rows||!rows.length){root.innerHTML="<div class='small' style='padding:12px'>Aucun sujet ouvert.</div>";return;}root.innerHTML=`<table><thead><tr><th>Zone</th><th>Lot</th><th>Sujet</th><th>Entreprise</th><th>Responsable</th><th>Statut</th><th>Date échéance</th><th>Réunion origine</th><th>Commentaire</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${esc(r.zone)}</td><td>${esc(r.lot)}</td><td>${esc(r.sujet)}</td><td>${esc(r.entreprise)}</td><td>${esc(r.responsable)}</td><td>${esc(r.statut)}</td><td>${esc(r.date_echeance)}</td><td>${esc(r.reunion_origine)}</td><td>${esc(r.commentaire)}</td></tr>`).join('')}</tbody></table>`;}
+function renderBars(id,items){const root=document.getElementById(id);if(!root)return;if(!items||!items.length){root.innerHTML="<div class='small'>Aucune donnée</div>";return;}const max=Math.max(1,...items.map(x=>Number(x.count||0)));root.innerHTML=items.map(x=>`<div style='margin:8px 0'><div style='display:flex;justify-content:space-between;gap:8px'><span>${esc(x.label)}</span><strong>${x.count}</strong></div><div class='bar'><div class='fill' style='width:${(Number(x.count||0)/max)*100}%'></div></div></div>`).join('');}
+function renderTable(rows){const root=document.getElementById('boardTable');if(!root)return;if(!rows||!rows.length){root.innerHTML="<div class='small' style='padding:12px'>Aucun sujet ouvert.</div>";return;}root.innerHTML=`<table><thead><tr><th>Zone</th><th>Lot</th><th>Sujet</th><th>Entreprise</th><th>Responsable</th><th>Statut</th><th>Date échéance</th><th>Réunion origine</th><th>Commentaire</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${esc(r.zone)}</td><td>${esc(r.lot)}</td><td>${esc(r.sujet)}</td><td>${esc(r.entreprise)}</td><td>${esc(r.responsable)}</td><td>${esc(r.statut)}</td><td>${esc(r.date_echeance)}</td><td>${esc(r.reunion_origine)}</td><td>${esc(r.commentaire)}</td></tr>`).join('')}</tbody></table>`;}
 function setText(id,value){const el=document.getElementById(id);if(el) el.textContent=value;}
 function setHtml(id,value){const el=document.getElementById(id);if(el) el.innerHTML=value;}
 function showLoading(on,label='Chargement des indicateurs projet…'){const w=document.getElementById('loadingWrap');if(!w) return;w.style.display=on?'block':'none';setText('loadingLabel',label);}
-function renderOpenTasksByCompany(b){const p=(b&&b.kpis_pilotage)||{};const analytics=(b&&b.analytics)||{};const companies=analytics.kpi_company_summary||[];const items=companies.length?companies.map(c=>({label:c.company,open_count:c.open_tasks,reminder_theoretical:c.reminder_count_theoretical||0,reminder_real:c.reminder_count_real||0})):((p.open_tasks_by_company||[]).map(x=>({label:x.label,open_count:x.open_count,reminder_theoretical:x.reminder_count||0,reminder_real:0})));const root=document.getElementById('companyOpenList');if(!items.length){root.innerHTML="<div class='small'>Aucune donnée</div>";return;}const seuil=p.reminder_threshold_weeks||2;root.innerHTML=items.map(x=>`<div class='pilot-row'><span class='name'>${esc(x.label)}</span><span><strong>${x.open_count}</strong> ouvertes · <strong>${x.reminder_theoretical}</strong> rappels théoriques (>${seuil} sem.) · <strong>${x.reminder_real}</strong> rappels réels</span></div>`).join('');}
-function renderAvgDelayByCompany(b){const p=(b&&b.kpis_pilotage)||{};const items=p.average_processing_days_by_company||[];const root=document.getElementById('companyDelayList');if(!items.length){root.innerHTML="<div class='small'>Pas assez de sujets clôturés pour calculer ce KPI.</div>";return;}root.innerHTML=items.map(x=>`<div class='pilot-row'><span class='name'>${esc(x.label)}</span><span><strong>${x.avg_days}</strong> jours (sur ${x.closed_count})</span></div>`).join('');}
-function renderPilotageKpis(b){const p=(b&&b.kpis_pilotage)||{};setText('kRappelsDate',String(p.rappels_ouverts_a_date||0));setText('kASuivre',String(p.a_suivre_ouverts||0));const t=p.timeline_progress||{};setText('kDateRef',`${t.progress_percent||0}%`);const root=document.getElementById('pilotByCompany');const items=p.rappels_cumules_par_entreprise||[];if(!items.length){root.innerHTML="<div class='small'>Aucune donnée</div>";}else{root.innerHTML=items.map(x=>`<div class='pilot-row'><span class='name'>${esc(x.label)}</span><strong>${x.count}</strong></div>`).join('');}const lbl=(t.start_date&&t.end_date)?`Période projet: ${t.start_date} → ${t.end_date} (${t.elapsed_days||0}/${t.total_days||0} jours)`:'Période projet non disponible';setHtml('pilotByCompany',`<div class='small' style='margin-bottom:8px'>${esc(lbl)}</div>`+root.innerHTML);}
-function renderMatchDiagnostics(b){const md=(b&&b.match_debug)||{};const box=document.getElementById('matchBox');
-  setHtml('matchSearchName',`<b>Projet recherché</b>${esc(md.searched_project_name||b?.project_name||'-')}`);
-  setHtml('matchSearchSlug',`<b>Slug recherché</b><span class='mono'>${esc(md.searched_project_slug||'-')}</span>`);
-  setHtml('matchFoundName',`<b>Projet matché</b>${esc(md.matched_project_name||'-')}`);
-  setHtml('matchFoundSlug',`<b>Slug matché</b><span class='mono'>${esc(md.matched_project_slug||'-')}</span>`);
-  setHtml('matchResolvedTitle',`<b>Projet résolu (title)</b>${esc(md.resolved_project_title||'-')}`);
-  setHtml('matchResolutionMode',`<b>Mode de résolution</b>${esc(md.resolution_mode||'-')}`);
-  setHtml('matchScore',`<b>Score de match</b>${md.match_score===0||md.match_score?esc(String(md.match_score)):'-'}`);
-  setHtml('rowsByTitle',`<b>Lignes filtrées par titre</b>${md.rows_filtered_by_title===0||md.rows_filtered_by_title?esc(String(md.rows_filtered_by_title)):'-'}`);
-  setHtml('rowsById',`<b>Lignes filtrées par ID</b>${md.rows_filtered_by_id===0||md.rows_filtered_by_id?esc(String(md.rows_filtered_by_id)):'-'}`);
-  const missing=(b&&Array.isArray(b.missing_files)&&b.missing_files.length)?b.missing_files.map(x=>esc(x)).join(' | '):'-';
-  setHtml('missingFiles',`<b>Fichiers CSV manquants</b>${missing}`);
-  if(!b||!b.ok){
-    const g=document.querySelector('#matchBox .match-grid');if(g)g.style.display='grid';
-    box.classList.remove('ok');box.classList.add('warn');
-    const cf=esc((b&&b.confidence_level)||'low');setHtml('matchStatus',`⚠ Projet METRONOME non trouvé <span class='conf-badge'>confiance: ${cf}</span>`);
-    const reason=b?.reason||'project_not_found';
-    const loaded=b?.loaded_at?` · Chargement: ${b.loaded_at}`:'';
-    setText('matchReason',`Raison: ${reason}${loaded}`);
-    return;
-  }
-  const g=document.querySelector('#matchBox .match-grid');if(g)g.style.display='grid';
-  box.classList.remove('warn');box.classList.add('ok');
-  const cf=esc((b&&b.confidence_level)||'high');setHtml('matchStatus',`✅ Matching METRONOME OK <span class='conf-badge'>confiance: ${cf}</span>`);
-  const loaded=b.loaded_at?` · Chargement: ${b.loaded_at}`:'';
-  const warn=b&&b.warning?` · ${b.warning_message||'matching partiel'}`:'';setText('matchReason',`Projet recherché et projet matché résolus.${loaded}${warn}`);
-}
-function renderBoard(){const b=state.board;if(!b||!b.ok){setText('kOpen','0');setText('kLate','0');setText('kProject','Projet METRONOME non trouvé');setText('kLoad',b&&b.loaded_at?b.loaded_at:'-');renderPilotageKpis({});renderOpenTasksByCompany({});renderAvgDelayByCompany({});renderMatchDiagnostics(b||{});return;}const k=b.kpis||{};setText('kOpen',String(k.open_topics||0));setText('kLate',String(k.overdue_topics||0));setText('kProject',b.warning?`${b.project_name||'-'} (partiel)`: (b.project_name||'-'));setText('kLoad',b.loaded_at||'-');renderPilotageKpis(b);renderOpenTasksByCompany(b);renderAvgDelayByCompany(b);renderMatchDiagnostics(b);} 
-async function loadBoard(id){if(!id){state.selectedId='';state.board=null;renderBoard();return;}state.selectedId=id;localStorage.setItem('selectedAffaireId',id);document.getElementById('financeBtn').href=`/finance?affaire_id=${encodeURIComponent(id)}`;document.getElementById('dashboardBtn').href=`/dashboard?affaire_id=${encodeURIComponent(id)}`;showLoading(true);try{state.board=await api(`/api/project-management/board?affaire_id=${encodeURIComponent(id)}`);}catch(err){state.board=null;showPageError(err);}finally{showLoading(false);}renderBoard();}
-async function loadAffaires(search=''){const d=await api(`/api/finance/affaires?search=${encodeURIComponent(search)}`);state.affaires=d.items||[];const sel=document.getElementById('affaireSelect');sel.innerHTML=`<option value=''>Sélectionnez une affaire</option>`+state.affaires.map(x=>`<option value="${esc(x.affaire_id)}">${esc(x.display_name)}</option>`).join('');if(state.selectedId&&state.affaires.some(x=>x.affaire_id===state.selectedId)){sel.value=state.selectedId;}}
-function showPageError(err){const box=document.getElementById('matchBox');if(box){box.classList.remove('ok');box.classList.add('warn');}setText('matchStatus','⚠ Erreur de chargement');setText('matchReason','Erreur de chargement : '+((err&&err.message)?err.message:String(err||'Erreur inconnue')));}
+function fmtDateFr(v){if(!v)return '-';const d=new Date(v+'T00:00:00');if(Number.isNaN(d.getTime()))return v;return d.toLocaleDateString('fr-FR',{day:'numeric',month:'long',year:'numeric'});} 
+function fmtDateFrShort(v){const d=parseDateOnly(v);if(!d)return '';const yy=String(d.getFullYear()).slice(-2);const mm=String(d.getMonth()+1).padStart(2,'0');const dd=String(d.getDate()).padStart(2,'0');return `${dd}/${mm}/${yy}`;}
+function parseDateOnly(v){const raw=String(v||'').trim();if(!raw)return null;const s=raw.split(' ')[0].split('T')[0];if(!s)return null;if(/^\d{4}-\d{2}-\d{2}$/.test(s)){const d=new Date(s+'T00:00:00');return Number.isNaN(d.getTime())?null:d;}const m=s.match(/^(\d{2})\/(\d{2})\/(\d{2,4})$/);if(m){const y=m[3].length===2?Number(`20${m[3]}`):Number(m[3]);const d=new Date(`${y}-${m[2]}-${m[1]}T00:00:00`);return Number.isNaN(d.getTime())?null:d;}return null;}
+function reminderWeeks(deadline){const d=parseDateOnly(deadline);if(!d)return 0;const now=new Date();const today=new Date(now.getFullYear(),now.getMonth(),now.getDate());const diff=Math.floor((today-d)/(1000*60*60*24));if(diff<=0)return 0;return Math.floor(diff/7)+1;}
+function renderProjectTimeline(b){const p=((b&&b.analytics)||{}).kpi_project_progress||{};const root=document.getElementById('timelineBox');if(!root)return;const total=Number(p.total_days||0);if(!total){root.innerHTML="<div class='small'>Période projet indisponible</div>";return;}const elapsedRaw=Number(p.elapsed_days_raw||0);const over=Number(p.overrun_days||0);const overPct=Number(p.overrun_pct||0);const basePct=Math.max(0,Math.min(100,Number(p.calendar_progress_pct||0)));const fillClass=(p.is_overrun?'timeline-fill over':'timeline-fill');const extra= p.is_overrun ? ` · Dépassement: <strong>${over} jours (${overPct}%)</strong>` : '';root.innerHTML=`<div class='timeline-row'><span><strong>Progression temporelle</strong></span><span><strong>${basePct.toFixed(0)}%</strong></span></div><div class='timeline-track'><div class='${fillClass}' style='width:${basePct}%'></div></div><div class='small' style='margin-top:6px'>Commencé le ${esc(fmtDateFr(p.start_date))}.<br>Fin prévue le ${esc(fmtDateFr(p.end_date))}.<br>${elapsedRaw}/${total} jours écoulés${extra}</div>`;}
+function renderCompanyChart(b){const p=(b&&b.kpis_pilotage)||{};const metricEl=document.getElementById('companyMetric');const metric=(metricEl&&metricEl.value)||'open';const views=p.project_company_views||{};const items=views[metric]||[];const root=document.getElementById('companyChartList');if(!root)return;if(!items.length){root.innerHTML="<div class='small'>Aucune donnée</div>";return;}const max=Math.max(1,...items.map(x=>Number(x.count||0)));root.innerHTML=items.map(x=>{const val=Number(x.count||0);return `<div class='pilot-row' style='display:block;border:1px solid #e7edf7;border-radius:12px;margin:8px 0;padding:10px;background:#fff'><div style='display:flex;justify-content:space-between;align-items:center;gap:8px'><span class='company-cell'>${companyLogoHtml(x)}<span class='name'>${esc(x.name)}</span></span><strong>${val}</strong></div><div class='bar' style='margin-top:6px'><div class='fill' style='width:${(val/max)*100}%'></div></div></div>`;}).join('');}
+function renderReactivity(b){const p=(b&&b.kpis_pilotage)||{};const items=p.reactivity_by_company||[];const root=document.getElementById('reactivityList');if(!root)return;if(!items.length){root.innerHTML="<div class='small'>Pas assez de tâches clôturées avec échéance.</div>";return;}const vals=items.map(x=>Math.abs(Number(x.avg_gap_days||0)));const max=Math.max(1,...vals);root.innerHTML=`<div style='display:flex;align-items:flex-end;gap:14px;height:240px;padding:10px 0'>${items.map(x=>{const v=Number(x.avg_gap_days||0);const h=Math.max(8,(Math.abs(v)/max)*190);const color=v>0?'#d64545':'#1b6ef3';return `<div style='flex:1;min-width:60px;text-align:center'><div title='${esc(x.name)}: ${v} j' style='margin:0 auto;width:34px;height:${h}px;background:${color};border-radius:8px 8px 0 0'></div><div style='font-size:11px;margin-top:6px;font-weight:700'>${esc(x.name)}</div><div style='font-size:11px;color:#6e7a90'>${v} j</div></div>`;}).join('')}</div>`;}
+function initials(v){const parts=String(v||'').trim().split(/\s+/).slice(0,2);return parts.map(x=>x[0]||'').join('').toUpperCase()||'?';}
+function companyLogoHtml(item){const name=item.name||item.label||'';const logo=item.logo||'';if(logo){return `<img class='company-logo' src='${esc(logo)}' alt='${esc(name)}'>`;}return `<span class='company-logo'>${esc(initials(name))}</span>`;}
+function showReminderModal(company,b){const p=(b&&b.kpis_pilotage)||{};const norm=v=>String(v||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').trim();const items=(p.reminders_open_items||[]).filter(x=>norm(x.company)===norm(company)).filter(x=>reminderWeeks(x.deadline)>0);const body=document.getElementById('reminderModalBody');const title=document.getElementById('reminderModalTitle');if(title)title.textContent=`Rappels ouverts - ${company}`;if(!body)return;if(!items.length){body.innerHTML="<div class='small' style='padding:10px'>Aucun rappel ouvert.</div>";}else{const byPer={};for(const it of items){const k=it.perimetre||'Général';(byPer[k]=byPer[k]||[]).push(it);}let html='';for(const per of Object.keys(byPer).sort()){html+=`<h4 style='margin:10px 0 6px'>${esc(per)}</h4><table><thead><tr><th>Tâche</th><th>Échéance</th><th>Rappel</th></tr></thead><tbody>${byPer[per].map(r=>{const w=reminderWeeks(r.deadline);const warn=`<span style='color:#d64545;font-weight:800'>Rappel ${w}</span>`;return `<tr><td>${esc(r.task||'')}</td><td>${esc(fmtDateFrShort(r.deadline||''))}</td><td>${warn}</td></tr>`;}).join('')}</tbody></table>`;}body.innerHTML=html;}const modal=document.getElementById('reminderModal');if(modal)modal.style.display='flex';}
+function hideReminderModal(){const modal=document.getElementById('reminderModal');if(modal)modal.style.display='none';}
+async function loadBoard(id){const requested=id||state.selectedId||'';if(!requested){state.selectedId='';state.selectedLabel='';state.board=null;renderBoard();return;}const selected=resolveAffaire(requested);const aid=(selected&&selected.affaire_id)||requested;state.selectedId=aid;const sel=document.getElementById('affaireSelect');if(sel)sel.value=aid;state.selectedLabel=(selected&&selected.display_name)||state.selectedLabel||'';localStorage.setItem('selectedAffaireId',aid);showLoading(true,'Chargement de la vue projet…');try{let b;try{b=await api(`/api/project-management/board?affaire_id=${encodeURIComponent(aid)}`);}catch(errById){const msg=String((errById&&errById.message)||'');if(state.selectedLabel&&(msg.includes('Affaire introuvable')||msg.includes('affaire_id ou affaire_name requis')||msg.includes('404'))){const alt=String(state.selectedLabel||'').split(' - ').slice(-1)[0]||state.selectedLabel;b=await api(`/api/project-management/board?affaire_name=${encodeURIComponent(alt)}`);}else{throw errById;}}state.board=b;renderBoard();}catch(err){console.error(err);state.board=null;renderBoard();showPageError(err);}finally{showLoading(false);}}
+function renderMatchDebug(b){const md=(b&&b.match_debug)||{};const box=document.getElementById('matchBox');const status=document.getElementById('matchStatus');const reason=document.getElementById('matchReason');if(box){box.className=`match-box ${(b&&b.warning)?'warn':'ok'}`;}if(status){const conf=(b&&b.confidence_level)||'low';status.innerHTML=`Diagnostic de matching METRONOME <span class='conf-badge'>${esc(conf)}</span>`;}if(reason){reason.textContent=(b&&b.warning_message)||((b&&b.project_name)?`Projet chargé : ${b.project_name}`:'Aucune affaire sélectionnée.');}setHtml('matchSearchName',`<b>Projet recherché</b>${esc(md.searched_project_name||'-')}`);setHtml('matchSearchSlug',`<b>Slug recherché</b><span class='mono'>${esc(md.searched_project_slug||'-')}</span>`);setHtml('matchFoundName',`<b>Projet matché</b>${esc(md.matched_project_name||'-')}`);setHtml('matchFoundSlug',`<b>Slug matché</b><span class='mono'>${esc(md.matched_project_slug||'-')}</span>`);setHtml('matchResolvedTitle',`<b>Projet résolu (title)</b>${esc(md.resolved_project_title||'-')}`);setHtml('matchResolutionMode',`<b>Mode de résolution</b>${esc(md.resolution_mode||'-')}`);setHtml('matchScore',`<b>Score de match</b>${esc(String(md.match_score??'-'))}`);setHtml('rowsByTitle',`<b>Lignes filtrées par titre</b>${esc(String(md.rows_filtered_by_title??'-'))}`);setHtml('rowsById',`<b>Lignes filtrées par ID</b>${esc(String(md.rows_filtered_by_id??'-'))}`);const miss=((b&&b.missing_files)||[]);setHtml('missingFiles',`<b>Fichiers CSV manquants</b>${esc(miss.length?miss.join(', '):'-')}`);} 
+function renderBoard(){const b=state.board||{};const p=(b&&b.kpis_pilotage)||{};const k=(b&&b.kpis)||{};setText('projectTitle',b.project_name||'-');setText('projectDesc',b.project_description||'-');const img=document.getElementById('projectImage');if(img){img.src=b.project_image||'';}renderMatchDebug(b);setText('kOpen',Number(k.open_topics||0));setText('kOverdue',Number(k.overdue_topics||0));setText('kTopRappels',Number(p.reminders_open_count||0));setText('kDateRef',p.date_reference||p.reference_date||'-');setText('kRappelsDate',Number(p.rappels_ouverts_a_date||p.reminders_open_count||0));setText('kASuivre',Number(p.a_suivre_ouverts||p.followups_open_count||0));renderBars('kByStatus',k.by_status||[]);renderTable(b.rows||[]);renderProjectTimeline(b);renderCompanyChart(b);renderReactivity(b);const companyRows=(p.rappels_cumules_par_entreprise||p.reminders_by_company||[]);setHtml('pilotByCompany',companyRows.length?companyRows.map(r=>{const nm=r.name||r.company||'';return `<button class='pilot-row-btn pilot-row' data-company='${esc(nm)}'><span class='company-cell'>${companyLogoHtml({name:nm,logo:r.logo||''})}<span class='name'>${esc(nm)}</span></span><span><strong>${Number(r.count||0)}</strong> rappels</span></button>`;}).join(''):"<div class='small'>Aucune donnée</div>");Array.from(document.querySelectorAll('.pilot-row-btn')).forEach(btn=>btn.addEventListener('click',()=>showReminderModal(btn.getAttribute('data-company')||'',b)));}
+function showPageError(err){const root=document.getElementById('boardTable');if(root)root.innerHTML=`<div class='small' style='padding:12px;color:#b42318'>${esc(err?.message||'Erreur de chargement')}</div>`;}
+async function loadAffaires(q){const data=await api(`/api/finance/affaires?search=${encodeURIComponent(q||'')}`);state.affaires=data.items||[];const sel=document.getElementById('affaireSelect');if(!sel)return;sel.innerHTML=`<option value=''>Sélectionner une affaire…</option>${state.affaires.map(a=>`<option value='${esc(a.affaire_id)}'>${esc(a.display_name||a.affaire_id)}</option>`).join('')}`;if(state.selectedId){const selected=state.affaires.find(a=>String(a.affaire_id||'')===String(state.selectedId||''));if(selected){state.selectedLabel=selected.display_name||state.selectedLabel||'';sel.value=selected.affaire_id;}}}
+function getProjectKey(){return state.selectedId?`id::${state.selectedId}`:'';}
+async function pointageApi(url,opts){const r=await fetch(url,opts);const d=await r.json();if(!r.ok) throw new Error(d.detail||'Erreur pointage');return d;}
+async function loadPointage(){if(!state.selectedId)return;try{const d=await pointageApi(`/api/project-management/pointage?affaire_id=${encodeURIComponent(state.selectedId)}`);state.pointage=d;renderPointage();}catch(e){console.warn(e);}}
+function levelGroups(tasks){const g={};for(const t of (tasks||[])){const lvl=t.level_label||t.level||'Général';(g[lvl]=g[lvl]||[]).push(t);}return g;}
+function renderPointage(){const root=document.getElementById('pointageWrap');const d=state.pointage||{};const tasks=d.tasks||[];if(!root)return;if(!tasks.length){root.innerHTML="<div class='small' style='padding:10px'>Aucun planning importé.</div>";return;}const expanded=new Set((d.workState&&d.workState.expanded_levels)||[]);const groups=levelGroups(tasks);let html=`<table><thead><tr><th>Tâche</th><th>Zone</th><th>Ressource</th><th>Début</th><th>Fin</th><th>% achevé</th><th>Réception réelle</th><th>Retard</th><th>Coût planifié CST</th><th>Coût pointé CST</th><th>Statut</th></tr></thead><tbody>`;for(const lvl of Object.keys(groups)){const open=expanded.has(lvl);html+=`<tr class='lvl-row'><td colspan='11'><button type='button' data-lvl='${esc(lvl)}' class='btn' style='height:28px'>${open?'−':'+'}</button> ${esc(lvl)}</td></tr>`;if(open){for(const t of groups[lvl]){const isSummary=Boolean(t.is_summary);const rowCls=isSummary?'lvl-row':(t.isLate?'task-late':(((t.status==='future')&&t.start)?'task-soon':''));const label=t.name;const start=fmtDateFrShort(t.start||'');const end=fmtDateFrShort(t.end||'');const depth=Math.max(0,Number(t.depth||0));const pad=12+(depth*14);if(isSummary){html+=`<tr class='${rowCls}'><td style='padding-left:${pad}px;font-weight:800'>${esc(t.name)}</td><td>${esc(t.level_label||t.level||'')}</td><td>${esc(t.owner||'')}</td><td>${esc(start)}</td><td>${esc(end)}</td><td>${Number(t.progress||0).toFixed(0)}%</td><td></td><td></td><td></td><td></td><td>summary</td></tr>`;continue;}html+=`<tr class='${rowCls}'><td style='padding-left:${pad}px'>${esc(label)}</td><td>${esc(t.level_label||t.level||'')}</td><td>${esc((t.owner==='Non attribué'?'':t.owner))}</td><td>${esc(start)}</td><td>${esc(end)}</td><td><input data-task='${esc(t.task_id)}' data-field='progress' type='number' min='0' max='100' value='${Number(t.progress||0)}' style='width:70px'></td><td><input data-task='${esc(t.task_id)}' data-field='actualEnd' type='date' value='${esc(t.actualEnd||'')}'></td><td>${Number(t.delayDays||0)} j</td><td style='color:#b45f06;font-weight:800'>${Number(t.plannedCostCst||0)>0?Number(t.plannedCostCst||0).toFixed(0)+' €':''}</td><td>${Number(t.actualCostCst||0)>0?Number(t.actualCostCst||0).toFixed(0)+' €':''}</td><td>${t.status==='past'?'<span style="color:#1f7a3f;font-weight:800">Terminé</span>':(t.status==='future'?'<span style="color:#8a94a8;font-weight:800">À venir</span>':'<span style="color:#1b6ef3;font-weight:800">En cours</span>')}</td></tr>`;if(t.is_cet&&t.cetMembers&&t.cetMembers.length){for(const m of t.cetMembers){const cm=((t.cet||{})[m]||{});html+=`<tr><td style='padding-left:${pad+16}px'>↳ ${esc(m)}</td><td>${esc(t.level||'')}</td><td>CET</td><td></td><td></td><td><input data-task='${esc(t.task_id)}' data-cet='${esc(m)}' data-field='progress' type='number' min='0' max='100' value='${Number(cm.progress||0)}' style='width:70px'></td><td><input data-task='${esc(t.task_id)}' data-cet='${esc(m)}' data-field='actualEnd' type='date' value='${esc(cm.actualEnd||'')}'></td><td colspan='4'></td></tr>`;}}}}}html+='</tbody></table>';root.innerHTML=html;Array.from(root.querySelectorAll('button[data-lvl]')).forEach(b=>b.addEventListener('click',async()=>{const lvl=b.getAttribute('data-lvl')||'';const ws={...(d.workState||{}),expanded_levels:[...new Set([...(d.workState?.expanded_levels||[])]) ]};const set=new Set(ws.expanded_levels);if(set.has(lvl))set.delete(lvl);else set.add(lvl);ws.expanded_levels=[...set];await savePointage({},ws);}));Array.from(root.querySelectorAll('input[data-task]')).forEach(inp=>inp.addEventListener('change',async()=>{const task=inp.getAttribute('data-task')||'';const field=inp.getAttribute('data-field')||'';const cet=inp.getAttribute('data-cet')||'';const patch={};if(cet){patch[task]={cet:{[cet]:{[field]:inp.value}}};}else{patch[task]={[field]:inp.value};}await savePointage(patch,d.workState||{});}));}
+async function savePointage(pointagePatch,workState){if(!state.selectedId)return;const cetMembers=(document.getElementById('cetMembersInput')||{}).value||'';const payload={pointage_patch:{...pointagePatch,__cetMembers:cetMembers},work_state:workState||{}};const d=await pointageApi(`/api/project-management/pointage/save?affaire_id=${encodeURIComponent(state.selectedId)}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});state.pointage=d;renderPointage();}
+async function importPlanningFile(file){if(!state.selectedId||!file)return;const fd=new FormData();fd.append('file',file);const d=await fetch(`/api/project-management/pointage/planning/import?affaire_id=${encodeURIComponent(state.selectedId)}`,{method:'POST',body:fd});const j=await d.json();if(!d.ok)throw new Error(j.detail||'Import planning impossible');state.pointage=j;renderPointage();}
+async function importSuiviFile(file){if(!state.selectedId||!file)return;const fd=new FormData();fd.append('file',file);const d=await fetch(`/api/project-management/pointage/import-suivi?affaire_id=${encodeURIComponent(state.selectedId)}`,{method:'POST',body:fd});const j=await d.json();if(!d.ok)throw new Error(j.detail||'Import suivi impossible');state.pointage=j;renderPointage();}
+async function exportSuivi(){if(!state.selectedId)return;const d=await pointageApi(`/api/project-management/pointage/export?affaire_id=${encodeURIComponent(state.selectedId)}`);const blob=new Blob([JSON.stringify(d,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`suivi-pointage-${state.selectedId}.json`;a.click();URL.revokeObjectURL(a.href);}
 async function init(){
   try{
     await loadAffaires('');
@@ -1769,18 +2486,29 @@ async function init(){
     const urlId=params.get('affaire_id');
     const initialId=urlId||localStorage.getItem('selectedAffaireId')||'';
     if(initialId){
-      state.selectedId=initialId;
       const sel=document.getElementById('affaireSelect');
-      const found=state.affaires.find(a=>a.affaire_id===initialId);
+      const found=resolveAffaire(initialId);
+      state.selectedId=(found&&found.affaire_id)||initialId;
       if(found){
         state.selectedId=found.affaire_id;
         sel.value=found.affaire_id;
+        state.selectedLabel=found.display_name||'';
         localStorage.setItem('selectedAffaireId',found.affaire_id);
       }
-      await loadBoard(initialId);
+      await loadBoard(state.selectedId||initialId);
+      await loadPointage();
     }else{renderBoard();}
-    document.getElementById('searchInput').addEventListener('input',async e=>{await loadAffaires(e.target.value||'');});
-    document.getElementById('affaireSelect').addEventListener('change',async e=>{await loadBoard(e.target.value||'');});
+    document.getElementById('btnImportPlanning').addEventListener('click',()=>document.getElementById('planningCsvInput').click());
+    document.getElementById('planningCsvInput').addEventListener('change',async e=>{if(e.target.files&&e.target.files[0]){await importPlanningFile(e.target.files[0]);e.target.value='';}});
+    document.getElementById('btnImportSuivi').addEventListener('click',()=>document.getElementById('suiviImportInput').click());
+    document.getElementById('suiviImportInput').addEventListener('change',async e=>{if(e.target.files&&e.target.files[0]){await importSuiviFile(e.target.files[0]);e.target.value='';}});
+    document.getElementById('btnExportSuivi').addEventListener('click',exportSuivi);
+    document.getElementById('btnExpandAll').addEventListener('click',async()=>{const lvls=[...new Set((state.pointage?.tasks||[]).filter(x=>x.is_summary).map(x=>x.level_label||x.level||'Général'))];await savePointage({}, {expanded_levels:lvls});});
+    document.getElementById('btnCollapseAll').addEventListener('click',async()=>{await savePointage({}, {expanded_levels:[]});});
+    document.getElementById('cetMembersInput').addEventListener('change',async()=>{await savePointage({}, state.pointage?.workState||{});});
+    const reminderClose=document.getElementById('reminderModalClose');if(reminderClose)reminderClose.addEventListener('click',hideReminderModal);
+    const affaireSelect=document.getElementById('affaireSelect');if(affaireSelect)affaireSelect.addEventListener('change',async e=>{await loadBoard(e.target.value||'');});
+    const companyMetric=document.getElementById('companyMetric');if(companyMetric)companyMetric.addEventListener('change',()=>renderCompanyChart(state.board||{}));
   }catch(err){console.error(err);renderBoard();showPageError(err);}
 }
 init();
@@ -1801,7 +2529,7 @@ def dashboard_html() -> str:
 .btn{height:44px;border-radius:12px;border:none;padding:0 14px;background:var(--accent);color:#fff;text-decoration:none;display:inline-flex;align-items:center;font-weight:800;cursor:pointer}
 .hero{padding:18px;margin-top:14px}.eyeb{font-size:12px;font-weight:800;letter-spacing:.12em;color:var(--accent);text-transform:uppercase}.title{font-size:36px;font-weight:900;margin:6px 0}.muted{color:var(--muted)}
 .kpis{padding:14px;margin-top:14px}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.k{border:1px solid var(--line);border-radius:14px;padding:14px;background:#fbfdff}.k .v{font-size:36px;font-weight:900;margin-top:6px}
-.chart{padding:14px;margin-top:14px}.chart-wrap{height:340px;border:1px solid var(--line);border-radius:14px;padding:8px;background:#f9fbff}
+.chart{padding:16px;margin-top:14px}.chart h3{margin:0 0 12px;font-size:28px}.chart-wrap{height:360px;border:1px solid #d5deec;border-radius:16px;padding:12px;background:linear-gradient(180deg,#fbfcff 0%,#f4f7fd 100%)}
 @media (max-width:900px){.grid{grid-template-columns:1fr}.title{font-size:28px}}
 </style></head>
 <body>
@@ -1809,7 +2537,7 @@ def dashboard_html() -> str:
   <div class='top'>
     <a class='btn' href='/'>Accueil</a>
     <input id='searchInput' class='search' type='search' placeholder='Rechercher une affaire'>
-    <select id='affaireSelect' class='select'><option value=''>Sélectionnez une affaire</option></select>
+    <select id='affaireSelect' class='select locked' disabled><option value=''>Projet verrouillé</option></select>
     <a id='financeBtn' class='btn' href='/finance'>Finances</a>
     <a id='pmBtn' class='btn' href='/gestion-projet'>Gestion de projet</a>
     <button id='exportBtn' class='btn' disabled>Exporter CSV</button>
@@ -1820,11 +2548,11 @@ def dashboard_html() -> str:
     <div id='subtitle' class='muted'>Synthèse principale : client, commande, antériorité, facturé 2026, facturation totale et reste à facturer.</div>
   </div>
   <div class='kpis'><div class='grid'>
-    <div class='k'><div class='muted'>💰 Commande HT</div><div id='kCommande' class='v'>0 €</div></div>
+    <div class='k'><div class='muted'>💰 Commandes achetées</div><div id='kCommande' class='v'>0 €</div></div>
     <div class='k'><div class='muted'>Facturation cumulée</div><div id='kFacture' class='v'>0 €</div></div>
     <div class='k'><div class='muted'>⚠ Reste à facturer</div><div id='kReste' class='v'>0 €</div></div>
   </div></div>
-  <div class='chart'><h3>Prévisionnel vs facturation (mois restants)</h3><div class='chart-wrap'><svg id='chart' width='100%' height='320' viewBox='0 0 980 320' preserveAspectRatio='none'></svg></div></div>
+  <div class='chart'><h3>Prévisionnel vs facturation (année complète)</h3><div class='chart-wrap'><svg id='chart' width='100%' height='320' viewBox='0 0 980 320' preserveAspectRatio='none'></svg></div></div>
 </div>
 <script>
 const MONTHS=['janvier','fevrier','mars','avril','mai','juin','juillet','aout','septembre','octobre','novembre','decembre'];
@@ -1835,7 +2563,7 @@ function esc(v){return String(v||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&l
 async function api(u){const r=await fetch(u);const d=await r.json();if(!r.ok) throw new Error(d.detail||'Erreur API');return d;}
 async function loadAffairesList(search=''){const d=await api(`/api/finance/affaires?search=${encodeURIComponent(search)}`);state.affaires=d.items||[];const sel=document.getElementById('affaireSelect');sel.innerHTML=`<option value=''>Sélectionnez une affaire</option>`+state.affaires.map(x=>`<option value="${esc(x.affaire_id)}">${esc(x.display_name)}</option>`).join('');if(state.selectedId&&state.affaires.some(x=>x.affaire_id===state.selectedId)){sel.value=state.selectedId;}}
 async function loadSelectedAffaire(id){if(!id){state.selectedId='';state.selected=null;render();return;}const d=await api(`/api/finance/affaire/${encodeURIComponent(id)}`);state.selectedId=id;state.selected=d.affaire;localStorage.setItem('selectedAffaireId',id);render();}
-function renderChart(){const root=document.getElementById('chart');const a=state.selected;if(!a){root.innerHTML='';return;}const monthIdx=(new Date().getMonth());const data=MONTHS.slice(monthIdx).map(m=>({label:MONTH_LABELS[m],pre:Number(((a.mensuel||{})[m]||{}).previsionnel||0),fac:Number(((a.mensuel||{})[m]||{}).facture||0)}));const max=Math.max(1,...data.flatMap(x=>[x.pre,x.fac]));const left=56,top=20,width=880,height=240,step=width/Math.max(1,data.length),bw=step*0.46;let out='';for(let i=0;i<=4;i++){const y=top+(height/4)*i;out+=`<line x1="${left}" y1="${y}" x2="${left+width}" y2="${y}" stroke="#dfe5ef"/><text x="${left-8}" y="${y+4}" text-anchor="end" fill="#8190a8" font-size="12">${Math.round(max*(1-i/4))}</text>`;}const pts=[];data.forEach((d,i)=>{const x=left+i*step+(step-bw)/2;const h=(d.pre/max)*height;const y=top+height-h;const py=top+height-(d.fac/max)*height;out+=`<rect x="${x}" y="${y}" width="${bw}" height="${Math.max(h,1)}" rx="7" fill="#fbd8a8"></rect><text x="${x+bw/2}" y="${top+height+18}" text-anchor="middle" fill="#6f7f98" font-size="12">${d.label}</text>`;pts.push(`${x+bw/2},${py}`);});out+=`<polyline points="${pts.join(' ')}" fill="none" stroke="#ef8d00" stroke-width="4"/>`;root.innerHTML=out;}
+function renderChart(){const root=document.getElementById('chart');const a=state.selected;if(!a){root.innerHTML='';return;}const data=MONTHS.map(m=>({label:MONTH_LABELS[m],pre:Number(((a.mensuel||{})[m]||{}).previsionnel||0),fac:Number(((a.mensuel||{})[m]||{}).facture||0)}));const max=Math.max(1,...data.flatMap(x=>[x.pre,x.fac]));const left=56,top=20,width=880,height=250,step=width/Math.max(1,data.length),bw=Math.min(60,step*0.5);let out='';for(let i=0;i<=4;i++){const y=top+(height/4)*i;out+=`<line x1="${left}" y1="${y}" x2="${left+width}" y2="${y}" stroke="#dde5f2"/><text x="${left-8}" y="${y+4}" text-anchor="end" fill="#6b7c98" font-size="12">${Math.round(max*(1-i/4))}</text>`;}const pts=[];data.forEach((d,i)=>{const x=left+i*step+(step-bw)/2;const h=(d.pre/max)*height;const y=top+height-h;const py=top+height-(d.fac/max)*height;out+=`<rect x="${x}" y="${y}" width="${bw}" height="${Math.max(h,1)}" rx="8" fill="#f5d6a8"><title>${d.label} prévisionnel: ${d.pre.toFixed(0)} €</title></rect><text x="${x+bw/2}" y="${top+height+18}" text-anchor="middle" fill="#5f6f88" font-size="12">${d.label}</text>`;pts.push(`${x+bw/2},${py}`);});out+=`<polyline points="${pts.join(' ')}" fill="none" stroke="#ef8d00" stroke-width="4"/>`;root.innerHTML=out;}
 function render(){const a=state.selected;document.getElementById('financeBtn').href=state.selectedId?`/finance?affaire_id=${encodeURIComponent(state.selectedId)}`:'/finance';document.getElementById('pmBtn').href=state.selectedId?`/gestion-projet?affaire_id=${encodeURIComponent(state.selectedId)}`:'/gestion-projet';document.getElementById('exportBtn').disabled=!state.selectedId;document.getElementById('title').textContent=a?(a.display_name||'-'):'Sélectionnez une affaire';document.getElementById('subtitle').textContent=a?`Client ${a.client||'-'} · ${a.affaire||'-'}`:'Synthèse principale : client, commande, antériorité, facturé 2026, facturation totale et reste à facturer.';document.getElementById('kCommande').textContent=euro(a?a.commande_ht:0);document.getElementById('kFacture').textContent=euro(a?(a.facturation_totale||((a.anteriorite||0)+(a.facture_2026||a.facturation_cumulee_2026||0))):0);document.getElementById('kReste').textContent=euro(a?a.reste_a_facturer:0);renderChart();}
 async function init(){await loadAffairesList('');const params=new URLSearchParams(window.location.search);const pre=params.get('affaire_id')||localStorage.getItem('selectedAffaireId')||'';if(pre&&state.affaires.some(x=>x.affaire_id===pre)){document.getElementById('affaireSelect').value=pre;await loadSelectedAffaire(pre);}else{render();}document.getElementById('searchInput').addEventListener('input',async e=>{await loadAffairesList(e.target.value||'');});document.getElementById('affaireSelect').addEventListener('change',async e=>loadSelectedAffaire(e.target.value||''));document.getElementById('exportBtn').addEventListener('click',()=>{if(state.selectedId)window.location.href=`/api/finance/affaire/${encodeURIComponent(state.selectedId)}/export-csv`;});}
 init();
@@ -1935,21 +2663,85 @@ def api_affaire_detail(affaire_id: str):
     item = cache.get("items", {}).get(affaire_id)
     if not item:
         raise HTTPException(status_code=404, detail=f"Affaire introuvable : {affaire_id}")
-    return {"ok": True, "affaire": item}
+    affaire = dict(item)
+    affaire.update(pointage_finance_summary(affaire_id, clean_number(affaire.get("commande_ht"))))
+    affaire["pointage_vs_facturation_gap"] = round(clean_number(affaire.get("facturation_totale")) - clean_number(affaire.get("pointage_progress_amount")), 2)
+    affaire["pointage_vs_financial_gap_pct"] = round((clean_number(affaire.get("taux_avancement_financier")) - clean_number(affaire.get("pointage_progress_ratio"))) * 100.0, 2)
+    affaire["insights"] = FinanceService.compute_insights(affaire)
+    return {"ok": True, "affaire": affaire}
 
 
 @app.get("/api/project-management/board", response_class=JSONResponse)
-def api_project_management_board(affaire_id: str = Query(default=""), affaire_name: str = Query(default="")):
+def api_project_management_board(affaire_id: str = Query(default=""), affaire_name: str = Query(default=""), start_date: str = Query(default=""), end_date: str = Query(default="")):
     name = clean_text(affaire_name)
     if affaire_id and not name:
         cache = service.get_finance_cache()
         item = cache.get("items", {}).get(affaire_id)
         if not item:
             raise HTTPException(status_code=404, detail=f"Affaire introuvable : {affaire_id}")
-        name = clean_text(item.get("display_name")) or clean_text(item.get("affaire"))
+        candidates = [clean_text(item.get("affaire")), clean_text(item.get("display_name"))]
+        candidates = [c for i, c in enumerate(candidates) if c and c not in candidates[:i]]
+        if not candidates:
+            raise HTTPException(status_code=400, detail="Aucun nom projet exploitable pour cette affaire")
+        boards = [metronome_service.build_project_board(c, start_date=start_date, end_date=end_date) for c in candidates]
+        boards.sort(key=lambda b: (clean_number((b.get("match_debug") or {}).get("match_score", 0)), len(b.get("rows") or [])), reverse=True)
+        best = boards[0]
+        if isinstance(best.get("match_debug"), dict):
+            best["match_debug"]["searched_variants"] = candidates
+        return best
     if not name:
         raise HTTPException(status_code=400, detail="affaire_id ou affaire_name requis")
-    return metronome_service.build_project_board(name)
+    return metronome_service.build_project_board(name, start_date=start_date, end_date=end_date)
+
+
+@app.get("/api/project-management/pointage", response_class=JSONResponse)
+def api_project_management_pointage(affaire_id: str = Query(default=""), affaire_name: str = Query(default="")):
+    key = PointageService._project_key(affaire_id, affaire_name)
+    if key.endswith("name::"):
+        raise HTTPException(status_code=400, detail="affaire_id ou affaire_name requis")
+    return pointage_service.get_project_data(key)
+
+
+@app.post("/api/project-management/pointage/planning/import", response_class=JSONResponse)
+async def api_project_management_pointage_import_planning(file: UploadFile = File(...), affaire_id: str = Query(default=""), affaire_name: str = Query(default="")):
+    key = PointageService._project_key(affaire_id, affaire_name)
+    if key.endswith("name::"):
+        raise HTTPException(status_code=400, detail="affaire_id ou affaire_name requis")
+    raw = await file.read()
+    return pointage_service.import_planning(key, raw)
+
+
+@app.post("/api/project-management/pointage/save", response_class=JSONResponse)
+def api_project_management_pointage_save(
+    payload: Dict[str, Any] = Body(default={}),
+    affaire_id: str = Query(default=""),
+    affaire_name: str = Query(default=""),
+):
+    key = PointageService._project_key(affaire_id, affaire_name)
+    if key.endswith("name::"):
+        raise HTTPException(status_code=400, detail="affaire_id ou affaire_name requis")
+    pointage_patch = payload.get("pointage_patch", {}) if isinstance(payload, dict) else {}
+    work_state = payload.get("work_state", {}) if isinstance(payload, dict) else {}
+    if not isinstance(pointage_patch, dict):
+        raise HTTPException(status_code=400, detail="pointage_patch invalide")
+    return pointage_service.save_pointage(key, pointage_patch, work_state)
+
+
+@app.post("/api/project-management/pointage/import-suivi", response_class=JSONResponse)
+async def api_project_management_pointage_import_suivi(file: UploadFile = File(...), affaire_id: str = Query(default=""), affaire_name: str = Query(default="")):
+    key = PointageService._project_key(affaire_id, affaire_name)
+    if key.endswith("name::"):
+        raise HTTPException(status_code=400, detail="affaire_id ou affaire_name requis")
+    raw = await file.read()
+    return pointage_service.import_suivi(key, raw)
+
+
+@app.get("/api/project-management/pointage/export", response_class=JSONResponse)
+def api_project_management_pointage_export(affaire_id: str = Query(default=""), affaire_name: str = Query(default="")):
+    key = PointageService._project_key(affaire_id, affaire_name)
+    if key.endswith("name::"):
+        raise HTTPException(status_code=400, detail="affaire_id ou affaire_name requis")
+    return pointage_service.export_suivi(key)
 
 
 @app.get("/api/finance/affaire/{affaire_id}/export-csv")
@@ -1970,7 +2762,7 @@ def api_affaire_export_csv(affaire_id: str):
         row = item.get("mensuel", {}).get(month, {})
         writer.writerow([MONTH_LABELS[month], row.get("previsionnel", 0), row.get("facture", 0), row.get("ecart", 0)])
     writer.writerow([])
-    writer.writerow(["Tag", "Mission", "Numero", "💰 Commande HT", "🧾 Facturation totale", "⚠ Reste à facturer", "Total prévisionnel", "Total facturé"])
+    writer.writerow(["Tag", "Mission", "Numero", "💰 Commandes achetées", "🧾 Facturation totale", "⚠ Reste à facturer", "Total prévisionnel", "Total facturé"])
     for mission in item.get("missions", []):
         writer.writerow([
             mission.get("tag", ""),
