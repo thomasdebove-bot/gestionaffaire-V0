@@ -14,6 +14,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import Body, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from openpyxl import load_workbook
+from clients.boond_client import BoondApiError, BoondClient
+from services.boond_imputation_service import BoondImputationService
 
 APP_TITLE = "Gestion Affaire - Finance"
 DEFAULT_WORKBOOK_PATH = r"\\192.168.10.100\03 - finances\10 - TABLEAU DE BORD\01 - TABLEAU ACTIVITEE\TABLEAU ACTIVITEE.xlsx"
@@ -27,6 +29,14 @@ EXPECTED_SCHEMA_VERSION = "finance_affaires_dataset_v4"
 TEMPO_LOGO_PATH = os.getenv("TEMPO_LOGO_PATH", r"\\192.168.10.100\02 - affaires\02.2 - SYNTHESE\ZZ - METRONOME\Content\T logo.png")
 METRONOME_BASE_PATH = os.getenv("METRONOME_BASE_PATH", r"\\192.168.10.100\02 - affaires\02.2 - SYNTHESE\ZZ - METRONOME")
 POINTAGE_STORE_FILE = Path(os.getenv("POINTAGE_STORE_FILE", "pointage_store.json"))
+BOOND_API_SERVER = os.getenv("BOOND_API_SERVER", "").strip()
+BOOND_API_VERSION = os.getenv("BOOND_API_VERSION", "1.0").strip()
+BOOND_LOGIN = os.getenv("BOOND_LOGIN", "").strip()
+BOOND_PASSWORD = os.getenv("BOOND_PASSWORD", "")
+BOOND_TIMEOUT = int(os.getenv("BOOND_TIMEOUT", "30") or 30)
+BOOND_HOURS_PER_DAY = float(os.getenv("BOOND_HOURS_PER_DAY", "8") or 8)
+BOOND_IMPUTATION_CACHE_FILE = Path(os.getenv("BOOND_IMPUTATION_CACHE_FILE", "boond_imputations.json"))
+
 METRONOME_FILES = {
     "projects": "Projects.csv",
     "entries": "Entries (Tasks & Memos).csv",
@@ -2099,7 +2109,32 @@ class PointageService:
 service = FinanceService(WORKBOOK_PATH, SHEET_NAME, CACHE_FILE)
 metronome_service = MetronomeService(METRONOME_BASE_PATH)
 pointage_service = PointageService(POINTAGE_STORE_FILE)
+boond_client = BoondClient(
+    api_server=BOOND_API_SERVER,
+    api_version=BOOND_API_VERSION,
+    login=BOOND_LOGIN,
+    password=BOOND_PASSWORD,
+    timeout=BOOND_TIMEOUT,
+)
+boond_imputation_service = BoondImputationService(
+    client=boond_client,
+    cache_file=BOOND_IMPUTATION_CACHE_FILE,
+    hours_per_day=BOOND_HOURS_PER_DAY,
+)
 
+
+
+
+def parse_loose_bool(value: Any, default: bool = False) -> bool:
+    """Tolère les booléens transmis avec guillemets accidentels (ex: true")."""
+    if isinstance(value, bool):
+        return value
+    txt = clean_text(value).strip().strip('"').strip("'").lower()
+    if txt in {"true", "1", "yes", "oui", "on", "vrai"}:
+        return True
+    if txt in {"false", "0", "no", "non", "off", "faux", ""}:
+        return False
+    return default
 
 def pointage_finance_summary(affaire_id: str, commande_ht: float) -> Dict[str, float]:
     try:
@@ -2627,6 +2662,8 @@ def finance_index():
             "affaire": "/api/finance/affaire/{affaire_id}",
             "affaire_export_csv": "/api/finance/affaire/{affaire_id}/export-csv",
             "health": "/health",
+            "imputation_boond": "/api/imputation/boond?project=...",
+            "imputation_boond_config": "/api/imputation/boond/config",
         },
     }
 
@@ -2742,6 +2779,31 @@ def api_project_management_pointage_export(affaire_id: str = Query(default=""), 
     if key.endswith("name::"):
         raise HTTPException(status_code=400, detail="affaire_id ou affaire_name requis")
     return pointage_service.export_suivi(key)
+
+
+
+
+@app.get("/api/imputation/boond/config", response_class=JSONResponse)
+def api_imputation_boond_config():
+    return {
+        "api_server": BOOND_API_SERVER,
+        "api_version": BOOND_API_VERSION,
+        "auth_mode": "basic",
+        "cache_file": str(BOOND_IMPUTATION_CACHE_FILE),
+        "boond_enabled": bool(BOOND_API_SERVER and BOOND_LOGIN and BOOND_PASSWORD),
+    }
+
+
+@app.get("/api/imputation/boond", response_class=JSONResponse)
+def api_imputation_boond(project: str = Query(default=""), refresh: str = Query(default="false")):
+    try:
+        refresh_flag = parse_loose_bool(refresh, default=False)
+        return boond_imputation_service.get_imputations(project=project, refresh=refresh_flag)
+    except BoondApiError as exc:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"ok": False, "reason": exc.reason, "message": exc.message},
+        )
 
 
 @app.get("/api/finance/affaire/{affaire_id}/export-csv")
