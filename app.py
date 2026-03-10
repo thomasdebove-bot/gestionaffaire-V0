@@ -729,6 +729,19 @@ class MetronomeService:
             return None
         return ((days_late - 1) // 7) + 1
 
+    @staticmethod
+    def _business_day_delta(target: date, ref_date: date) -> int:
+        if target == ref_date:
+            return 0
+        step = 1 if target > ref_date else -1
+        cur = ref_date
+        count = 0
+        while cur != target:
+            cur = cur + timedelta(days=step)
+            if cur.weekday() < 5:
+                count += step
+        return count
+
     def reminders_by_company(self, rem_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not rem_rows:
             return []
@@ -1176,7 +1189,7 @@ class MetronomeService:
                 "raw": e,
             })
 
-            if is_closed:
+            if is_closed or not is_task_entry:
                 continue
 
             overdue = False
@@ -1245,7 +1258,7 @@ class MetronomeService:
         due_by_company_list = self.reminders_by_company(rem_rows)
         meeting_simple_kpis = self.meeting_simple_kpis(selected_entries, reference_date)
 
-        reminder_threshold_days = 14
+        reminder_threshold_days = 7
         open_stats: Dict[str, Dict[str, int]] = {}
         delay_stats: Dict[str, Dict[str, int]] = {}
         for item in selected_entries:
@@ -1356,12 +1369,18 @@ class MetronomeService:
         project_end = parse_date(self._get_first_value(project_info, METRONOME_COLUMN_ALIASES["project_end"]))
         if project_start and project_end and project_end > project_start:
             total_days = (project_end - project_start).days
-            elapsed_days = min(max((today - project_start).days, 0), total_days)
+            elapsed_days_raw = max((today - project_start).days, 0)
+            elapsed_days = min(elapsed_days_raw, total_days)
             progress_percent = round((elapsed_days / total_days) * 100, 1)
+            overrun_days = max(0, elapsed_days_raw - total_days)
+            overrun_pct = round((overrun_days / total_days) * 100, 1) if total_days else 0.0
         else:
             total_days = 0
+            elapsed_days_raw = 0
             elapsed_days = 0
             progress_percent = 0.0
+            overrun_days = 0
+            overrun_pct = 0.0
 
         total_tasks = len(fact_tasks)
         closed_tasks = sum(1 for t in fact_tasks if t.get("is_closed"))
@@ -1523,7 +1542,11 @@ class MetronomeService:
             "start_date": project_start.isoformat() if project_start else "",
             "end_date": project_end.isoformat() if project_end else "",
             "elapsed_days": elapsed_days,
+            "elapsed_days_raw": elapsed_days_raw,
             "total_days": total_days,
+            "overrun_days": overrun_days,
+            "overrun_pct": overrun_pct,
+            "is_overrun": overrun_days > 0,
         }
 
         for task in fact_tasks:
@@ -1590,6 +1613,60 @@ class MetronomeService:
             cname = c.get("company")
             c["reminder_count_theoretical"] = sum(1 for r in reminder_log if r.get("reminder_type") == "theoretical" and r.get("company_name") == cname)
             c["reminder_count_real"] = sum(1 for r in reminder_log if r.get("reminder_type") == "real" and r.get("company_name") == cname)
+
+        open_tasks_today = [t for t in fact_tasks if t.get("is_open")]
+        overdue_tasks_today = [t for t in open_tasks_today if t.get("deadline") and parse_date(t.get("deadline")) and parse_date(t.get("deadline")) < today]
+        reminder_tasks_today: List[Dict[str, Any]] = []
+        followup_tasks_today: List[Dict[str, Any]] = []
+        open_not_due_tasks_today: List[Dict[str, Any]] = []
+        for task in open_tasks_today:
+            deadline_txt = task.get("deadline")
+            deadline_dt = parse_date(deadline_txt) if deadline_txt else None
+            if not deadline_dt:
+                open_not_due_tasks_today.append(task)
+                continue
+            delta_biz = self._business_day_delta(deadline_dt, today)
+            if delta_biz < 0:
+                if abs(delta_biz) >= 7:
+                    reminder_tasks_today.append(task)
+                else:
+                    followup_tasks_today.append(task)
+            else:
+                open_not_due_tasks_today.append(task)
+                if delta_biz <= 7:
+                    followup_tasks_today.append(task)
+
+        def group_company(rows_in: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            counts: Dict[str, int] = {}
+            logos: Dict[str, str] = {}
+            for task in rows_in:
+                cname = self._normalize_company(task.get("company"))
+                counts[cname] = counts.get(cname, 0) + 1
+                logos[cname] = company_logos_by_name.get(cname, "")
+            return [
+                {"name": n, "count": c, "logo": logos.get(n, "")}
+                for n, c in sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+            ]
+
+        reactivity_by_company: List[Dict[str, Any]] = []
+        delays: Dict[str, List[int]] = {}
+        for task in fact_tasks:
+            if not task.get("is_closed"):
+                continue
+            deadline_txt = task.get("deadline")
+            deadline_dt = parse_date(deadline_txt) if deadline_txt else None
+            done_dt = task.get("done_date")
+            if not deadline_dt or not done_dt:
+                continue
+            cname = self._normalize_company(task.get("company"))
+            delays.setdefault(cname, []).append((done_dt - deadline_dt).days)
+        for cname, vals in sorted(delays.items(), key=lambda x: x[0]):
+            reactivity_by_company.append({
+                "name": cname,
+                "avg_gap_days": round(sum(vals) / max(1, len(vals)), 1),
+                "closed_count": len(vals),
+                "logo": company_logos_by_name.get(cname, ""),
+            })
         open_entries_count = rows_filtered_by_title + rows_filtered_by_id
         if project_info and match_debug.get("match_score", 0) >= 80:
             confidence_level = "high"
@@ -1613,24 +1690,30 @@ class MetronomeService:
             "match_debug": match_debug,
             "kpis_meeting_simple": meeting_simple_kpis,
             "kpis": {
-                "open_topics": len(rows),
-                "overdue_topics": sum(1 for r in rows if r.get("overdue")),
+                "open_topics": len(open_tasks_today),
+                "overdue_topics": len(overdue_tasks_today),
                 "by_company": by_company,
                 "by_package": count_by("lot"),
                 "by_meeting": by_meeting,
             },
             "kpis_pilotage": {
-                "reminders_open_count": len(rem_rows),
-                "followups_open_count": len(fol_rows),
+                "reminders_open_count": len(reminder_tasks_today),
+                "followups_open_count": len(open_not_due_tasks_today),
                 "reference_date": reference_date.isoformat(),
                 "reference_date_text": reference_date_text,
-                "reminders_by_company": due_by_company_list,
+                "reminders_by_company": group_company(reminder_tasks_today),
                 "open_tasks_by_company": open_tasks_by_company,
                 "average_processing_days_by_company": average_processing_days_by_company,
-                "rappels_ouverts_a_date": len(rem_rows),
-                "a_suivre_ouverts": len(fol_rows),
+                "rappels_ouverts_a_date": len(reminder_tasks_today),
+                "a_suivre_ouverts": len(open_not_due_tasks_today),
                 "date_reference": reference_date.isoformat(),
-                "rappels_cumules_par_entreprise": due_by_company_list,
+                "rappels_cumules_par_entreprise": group_company(reminder_tasks_today),
+                "project_company_views": {
+                    "open": group_company(open_not_due_tasks_today),
+                    "followup": group_company(followup_tasks_today),
+                    "reminder": group_company(reminder_tasks_today),
+                },
+                "reactivity_by_company": reactivity_by_company,
             },
             "analytics": {
                 "fact_tasks": fact_tasks,
@@ -1879,7 +1962,7 @@ def gestion_projet_html() -> str:
 .kpis{margin-top:12px;padding:14px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.k{border:1px solid var(--line);border-radius:14px;padding:14px;background:#fbfdff}.k .v{font-size:34px;font-weight:900;margin-top:6px}
 .section{margin-top:12px;padding:14px}.subgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:14px}table{width:100%;border-collapse:collapse}th,td{padding:10px 12px;border-bottom:1px solid var(--line);font-size:13px;text-align:left}th{background:#f7f9fc;font-size:12px;color:#5b6880;text-transform:uppercase}.small{color:var(--muted);font-size:13px}
 .bar{height:10px;background:#edf1f8;border-radius:999px;overflow:hidden}.fill{height:100%;background:#ef8d00}
-.loading-wrap{margin-top:8px;padding:8px 10px;border:1px solid #d8e0ee;border-radius:12px;background:#fff}.loading-label{font-size:12px;color:#5b6880;margin-bottom:6px;font-weight:700}.loading-track{height:8px;border-radius:999px;background:#eef2f8;overflow:hidden}.loading-bar{height:100%;width:35%;background:linear-gradient(90deg,#ef8d00,#ffd08a);animation:loadmove 1.2s infinite ease-in-out}@keyframes loadmove{0%{margin-left:-35%}100%{margin-left:100%}}.match-box{margin-top:10px;border:1px solid var(--line);border-radius:10px;padding:8px;background:#fffaf2}.match-box.ok{border-color:#49a66a;background:#f4fcf6}.match-box.warn{border-color:#ef8d00;background:#fff7ec}.match-title{font-weight:700;margin-bottom:4px;font-size:13px}.conf-badge{display:inline-block;margin-left:8px;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:800;background:#eef2f8;color:#3b4f6f}.match-grid{display:none}.match-item{font-size:12px;color:#30425f}.match-item b{display:block;color:#6e7a90;font-size:11px;margin-bottom:2px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-word}.pilot-box{margin-top:12px;border:1px solid #cfd8e8;border-radius:18px;padding:16px;background:#f8fbff}.pilot-title{font-size:34px;font-weight:900;margin:4px 0 10px}.pilot-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.pilot-card{background:#fff;border:1px solid #d8e0ee;border-radius:18px;padding:14px}.pilot-card .t{font-size:15px;color:#4b5d7a;font-weight:800}.pilot-card .v{font-size:44px;font-weight:900;margin-top:8px}.pilot-list{margin-top:12px;border:1px solid #d8e0ee;border-radius:18px;background:#fff;padding:8px 14px}.pilot-row{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px dashed #d8e0ee}.pilot-row:last-child{border-bottom:none}.pilot-row .name{font-weight:700}.company-cell{display:flex;align-items:center;gap:10px}.company-logo{width:28px;height:28px;border-radius:50%;border:1px solid #d8e0ee;background:#fff;object-fit:cover;display:inline-flex;align-items:center;justify-content:center;font-size:11px;color:#6e7a90;font-weight:800}.proj-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.progress-card{border:1px solid #d8e0ee;border-radius:14px;padding:12px;background:#fff}.progress-title{font-weight:800;margin-bottom:8px}.progress-row{display:grid;grid-template-columns:180px 1fr 70px;gap:10px;align-items:center;padding:6px 0}.progress-track{height:10px;border-radius:999px;background:#edf1f8;overflow:hidden}.progress-fill{height:100%;background:#1b6ef3}.curve-wrap{border:1px solid #d8e0ee;border-radius:14px;padding:12px;background:#fff}
+.loading-wrap{margin-top:8px;padding:8px 10px;border:1px solid #d8e0ee;border-radius:12px;background:#fff}.loading-label{font-size:12px;color:#5b6880;margin-bottom:6px;font-weight:700}.loading-track{height:8px;border-radius:999px;background:#eef2f8;overflow:hidden}.loading-bar{height:100%;width:35%;background:linear-gradient(90deg,#ef8d00,#ffd08a);animation:loadmove 1.2s infinite ease-in-out}@keyframes loadmove{0%{margin-left:-35%}100%{margin-left:100%}}.match-box{margin-top:10px;border:1px solid var(--line);border-radius:10px;padding:8px;background:#fffaf2}.match-box.ok{border-color:#49a66a;background:#f4fcf6}.match-box.warn{border-color:#ef8d00;background:#fff7ec}.match-title{font-weight:700;margin-bottom:4px;font-size:13px}.conf-badge{display:inline-block;margin-left:8px;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:800;background:#eef2f8;color:#3b4f6f}.match-grid{display:none;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.match-box:hover .match-grid,.match-box:focus-within .match-grid{display:grid}.match-item{font-size:12px;color:#30425f}.match-item b{display:block;color:#6e7a90;font-size:11px;margin-bottom:2px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-word}.pilot-box{margin-top:12px;border:1px solid #cfd8e8;border-radius:18px;padding:16px;background:#f8fbff}.pilot-title{font-size:34px;font-weight:900;margin:4px 0 10px}.pilot-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.pilot-card{background:#fff;border:1px solid #d8e0ee;border-radius:18px;padding:14px}.pilot-card .t{font-size:15px;color:#4b5d7a;font-weight:800}.pilot-card .v{font-size:44px;font-weight:900;margin-top:8px}.pilot-list{margin-top:12px;border:1px solid #d8e0ee;border-radius:18px;background:#fff;padding:8px 14px}.pilot-row{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px dashed #d8e0ee}.pilot-row:last-child{border-bottom:none}.pilot-row .name{font-weight:700}.company-cell{display:flex;align-items:center;gap:10px}.company-logo{width:28px;height:28px;border-radius:50%;border:1px solid #d8e0ee;background:#fff;object-fit:cover;display:inline-flex;align-items:center;justify-content:center;font-size:11px;color:#6e7a90;font-weight:800}.proj-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.progress-card{border:1px solid #d8e0ee;border-radius:14px;padding:12px;background:#fff}.progress-title{font-weight:800;margin-bottom:8px}.progress-row{display:grid;grid-template-columns:180px 1fr 70px;gap:10px;align-items:center;padding:6px 0}.progress-track{height:10px;border-radius:999px;background:#edf1f8;overflow:hidden}.progress-fill{height:100%;background:#1b6ef3}.curve-wrap{border:1px solid #d8e0ee;border-radius:14px;padding:12px;background:#fff}.project-title{font-size:30px;font-weight:900;margin:4px 0 2px}.timeline-box{margin:10px 0;border:1px solid #d8e0ee;border-radius:14px;background:#fff;padding:10px}.timeline-row{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px}.timeline-track{height:12px;border-radius:999px;background:#edf1f8;overflow:hidden}.timeline-fill{height:100%;background:#1b6ef3}.timeline-fill.over{background:#d64545}.chart-controls{display:flex;gap:8px;align-items:center;margin-bottom:8px}.chart-select{height:36px;border:1px solid var(--line);border-radius:10px;padding:0 10px}.react-row{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px dashed #d8e0ee}.react-row:last-child{border-bottom:none}
 @media (max-width:980px){.grid{grid-template-columns:repeat(2,1fr)}.subgrid{grid-template-columns:1fr}}@media (max-width:640px){.grid{grid-template-columns:1fr}}
 </style></head>
 <body><div class='wrap'>
@@ -1892,13 +1975,16 @@ def gestion_projet_html() -> str:
   </div>
   <div id='loadingWrap' class='loading-wrap' style='display:none'><div id='loadingLabel' class='loading-label'>Chargement des indicateurs projet…</div><div class='loading-track'><div class='loading-bar'></div></div></div>
 
-  <div class='kpis'><div class='grid'>
-    <div class='k'><div class='small'>Sujets ouverts</div><div id='kOpen' class='v'>0</div></div>
-    <div class='k'><div class='small'>Sujets en retard</div><div id='kLate' class='v'>0</div></div>
-    <div class='k'><div class='small'>Projet METRONOME</div><div id='kProject' class='v' style='font-size:22px'>-</div></div>
-    <div class='k'><div class='small'>Chargement</div><div id='kLoad' class='v' style='font-size:18px'>-</div></div>
-  </div>
-    <div id='matchBox' class='match-box warn'>
+  <div class='kpis'>
+    <div id='projectTitle' class='project-title'>-</div>
+    <div id='timelineBox' class='timeline-box'><div class='small'>Période projet indisponible</div></div>
+    <div class='grid'>
+      <div class='k'><div class='small'>Sujets ouverts</div><div id='kOpen' class='v'>0</div></div>
+      <div class='k'><div class='small'>Sujets en retard</div><div id='kLate' class='v'>0</div></div>
+      <div class='k'><div class='small'>Rappels ouverts (>=7j ouvrés)</div><div id='kTopRappels' class='v'>0</div></div>
+      <div class='k'><div class='small'>À suivre ouverts</div><div id='kTopASuivre' class='v'>0</div></div>
+    </div>
+    <div id='matchBox' class='match-box warn' tabindex='0'>
       <div id='matchStatus' class='match-title'>Diagnostic de matching METRONOME</div>
       <div id='matchReason' class='small'>Aucune affaire sélectionnée.</div>
       <div class='match-grid'>
@@ -1930,21 +2016,21 @@ def gestion_projet_html() -> str:
   </div>
 
   <div class='section'>
-    <h3>Pilotage global projet</h3>
-    <div class='proj-grid'>
-      <div id='projectProgressBars' class='progress-card'><div class='small'>Aucune donnée</div></div>
-      <div id='projectProgressCurve' class='curve-wrap'><div class='small'>Aucune donnée</div></div>
+    <h3>Graphique par entreprise</h3>
+    <div class='chart-controls'>
+      <label for='companyMetric' class='small'>Afficher :</label>
+      <select id='companyMetric' class='chart-select'>
+        <option value='open'>Tâches ouvertes par entreprise</option>
+        <option value='followup'>Tâches à suivre par entreprise</option>
+        <option value='reminder'>Tâches en rappel par entreprise</option>
+      </select>
     </div>
+    <div id='companyChartList' class='pilot-list'><div class='small'>Aucune donnée</div></div>
   </div>
 
   <div class='section'>
-    <h3>Tâches ouvertes par entreprise (avec rappels)</h3>
-    <div id='companyOpenList' class='pilot-list'><div class='small'>Aucune donnée</div></div>
-  </div>
-
-  <div class='section'>
-    <h3>Réactivité entreprises (délai moyen de traitement)</h3>
-    <div id='companyDelayList' class='pilot-list'><div class='small'>Aucune donnée</div></div>
+    <h3>Réactivité par entreprise (écart moyen échéance → clôture)</h3>
+    <div id='reactivityList' class='pilot-list'><div class='small'>Aucune donnée</div></div>
   </div>
 </div>
 <script>
@@ -1956,8 +2042,9 @@ function renderTable(rows){const root=document.getElementById('boardTable');if(!
 function setText(id,value){const el=document.getElementById(id);if(el) el.textContent=value;}
 function setHtml(id,value){const el=document.getElementById(id);if(el) el.innerHTML=value;}
 function showLoading(on,label='Chargement des indicateurs projet…'){const w=document.getElementById('loadingWrap');if(!w) return;w.style.display=on?'block':'none';setText('loadingLabel',label);}
-function renderOpenTasksByCompany(b){const p=(b&&b.kpis_pilotage)||{};const analytics=(b&&b.analytics)||{};const companies=analytics.kpi_company_summary||[];const items=companies.length?companies.map(c=>({label:c.company,open_count:c.open_tasks,reminder_theoretical:c.reminder_count_theoretical||0,reminder_real:c.reminder_count_real||0})):((p.open_tasks_by_company||[]).map(x=>({label:x.label,open_count:x.open_count,reminder_theoretical:x.reminder_count||0,reminder_real:0})));const root=document.getElementById('companyOpenList');if(!items.length){root.innerHTML="<div class='small'>Aucune donnée</div>";return;}const seuil=p.reminder_threshold_weeks||2;root.innerHTML=items.map(x=>`<div class='pilot-row'><span class='name'>${esc(x.label)}</span><span><strong>${x.open_count}</strong> ouvertes · <strong>${x.reminder_theoretical}</strong> rappels théoriques (>${seuil} sem.) · <strong>${x.reminder_real}</strong> rappels réels</span></div>`).join('');}
-function renderAvgDelayByCompany(b){const p=(b&&b.kpis_pilotage)||{};const items=p.average_processing_days_by_company||[];const root=document.getElementById('companyDelayList');if(!items.length){root.innerHTML="<div class='small'>Pas assez de sujets clôturés pour calculer ce KPI.</div>";return;}root.innerHTML=items.map(x=>`<div class='pilot-row'><span class='name'>${esc(x.label)}</span><span><strong>${x.avg_days}</strong> jours (sur ${x.closed_count})</span></div>`).join('');}
+function renderProjectTimeline(b){const p=((b&&b.analytics)||{}).kpi_project_progress||{};const root=document.getElementById('timelineBox');if(!root)return;const total=Number(p.total_days||0);if(!total){root.innerHTML="<div class='small'>Période projet indisponible</div>";return;}const elapsed=Number(p.elapsed_days||0);const over=Number(p.overrun_days||0);const overPct=Number(p.overrun_pct||0);const basePct=Math.max(0,Math.min(100,Number(p.calendar_progress_pct||0)));const fillClass=(p.is_overrun?'timeline-fill over':'timeline-fill');const extra= p.is_overrun ? ` · Dépassement: <strong>${over} jours (${overPct}%)</strong>` : '';root.innerHTML=`<div class='timeline-row'><span><strong>Progression temporelle projet</strong></span><span>${esc(p.start_date||'-')} → ${esc(p.end_date||'-')}</span></div><div class='timeline-track'><div class='${fillClass}' style='width:${basePct}%'></div></div><div class='small' style='margin-top:6px'>${elapsed}/${total} jours consommés${extra}</div>`;}
+function renderCompanyChart(b){const p=(b&&b.kpis_pilotage)||{};const metricEl=document.getElementById('companyMetric');const metric=(metricEl&&metricEl.value)||'open';const views=p.project_company_views||{};const items=views[metric]||[];const root=document.getElementById('companyChartList');if(!root)return;if(!items.length){root.innerHTML="<div class='small'>Aucune donnée</div>";return;}const max=Math.max(1,...items.map(x=>Number(x.count||0)));root.innerHTML=items.map(x=>`<div style='margin:8px 0'><div class='pilot-row' style='border-bottom:none;padding:0 0 4px'><span class='company-cell'>${companyLogoHtml(x)}<span class='name'>${esc(x.name)}</span></span><strong>${x.count}</strong></div><div class='bar'><div class='fill' style='width:${(Number(x.count||0)/max)*100}%'></div></div></div>`).join('');}
+function renderReactivity(b){const p=(b&&b.kpis_pilotage)||{};const items=p.reactivity_by_company||[];const root=document.getElementById('reactivityList');if(!root)return;if(!items.length){root.innerHTML="<div class='small'>Pas assez de tâches clôturées avec échéance.</div>";return;}root.innerHTML=items.map(x=>`<div class='react-row'><span class='company-cell'>${companyLogoHtml(x)}<span class='name'>${esc(x.name)}</span></span><span><strong>${x.avg_gap_days}</strong> j (sur ${x.closed_count})</span></div>`).join('');}
 function initials(v){const parts=String(v||'').trim().split(/\s+/).slice(0,2);return parts.map(x=>x[0]||'').join('').toUpperCase()||'?';}
 function companyLogoHtml(item){const name=item.name||item.label||'';const logo=item.logo||'';if(logo){return `<img class='company-logo' src='${esc(logo)}' alt='${esc(name)}'>`;}return `<span class='company-logo'>${esc(initials(name))}</span>`;}
 function renderPilotageKpis(b){const p=(b&&b.kpis_pilotage)||{};setText('kRappelsDate',String(p.reminders_open_count||p.rappels_ouverts_a_date||0));setText('kASuivre',String(p.followups_open_count||p.a_suivre_ouverts||0));setText('kDateRef',String(p.reference_date_text||p.reference_date||p.date_reference||'-'));const root=document.getElementById('pilotByCompany');const items=p.reminders_by_company||p.rappels_cumules_par_entreprise||[];if(!items.length){root.innerHTML="<div class='small'>Aucune donnée</div>";}else{root.innerHTML=items.map(x=>`<div class='pilot-row'><span class='company-cell'>${companyLogoHtml(x)}<span class='name'>${esc(x.name||x.label)}</span></span><strong>${x.count}</strong></div>`).join('');}}
@@ -1974,7 +2061,6 @@ function renderMatchDiagnostics(b){const md=(b&&b.match_debug)||{};const box=doc
   const missing=(b&&Array.isArray(b.missing_files)&&b.missing_files.length)?b.missing_files.map(x=>esc(x)).join(' | '):'-';
   setHtml('missingFiles',`<b>Fichiers CSV manquants</b>${missing}`);
   if(!b||!b.ok){
-    const g=document.querySelector('#matchBox .match-grid');if(g)g.style.display='grid';
     box.classList.remove('ok');box.classList.add('warn');
     const cf=esc((b&&b.confidence_level)||'low');setHtml('matchStatus',`⚠ Projet METRONOME non trouvé <span class='conf-badge'>confiance: ${cf}</span>`);
     const reason=b?.reason||'project_not_found';
@@ -1982,14 +2068,12 @@ function renderMatchDiagnostics(b){const md=(b&&b.match_debug)||{};const box=doc
     setText('matchReason',`Raison: ${reason}${loaded}`);
     return;
   }
-  const g=document.querySelector('#matchBox .match-grid');if(g)g.style.display='grid';
   box.classList.remove('warn');box.classList.add('ok');
   const cf=esc((b&&b.confidence_level)||'high');setHtml('matchStatus',`✅ Matching METRONOME OK <span class='conf-badge'>confiance: ${cf}</span>`);
   const loaded=b.loaded_at?` · Chargement: ${b.loaded_at}`:'';
   const warn=b&&b.warning?` · ${b.warning_message||'matching partiel'}`:'';setText('matchReason',`Projet recherché et projet matché résolus.${loaded}${warn}`);
 }
-function renderProjectProgress(b){const a=(b&&b.analytics)||{};const p=(a.kpi_project_progress)||{};const sum=(a.kpi_project_summary)||{};const bars=document.getElementById('projectProgressBars');const curve=document.getElementById('projectProgressCurve');if(!bars||!curve)return;const cal=Number(p.calendar_progress_pct||0);const op=Number(p.operational_progress_pct||0);const gap=Number(p.progress_gap_pct||0);const health=Number(sum.project_health_score||0);const rows=[['Avancement calendrier',cal],['Avancement opérationnel',op],['Écart (op - cal)',Math.max(0,Math.min(100,gap+50))],['Santé projet',health]];bars.innerHTML=`<div class='progress-title'>Barres de progression</div>${rows.map(r=>`<div class='progress-row'><div>${esc(r[0])}</div><div class='progress-track'><div class='progress-fill' style='width:${Math.max(0,Math.min(100,Number(r[1]||0)))}%'></div></div><div><strong>${Number(r[1]||0).toFixed(1)}%</strong></div></div>`).join('')}`;const points=[{x:10,y:90},{x:40,y:90-cal*0.8},{x:70,y:90-op*0.8},{x:95,y:90-health*0.8}];curve.innerHTML=`<div class='progress-title'>Courbe synthétique projet</div><svg viewBox='0 0 100 100' style='width:100%;height:180px'><polyline points='${points.map(p=>`${p.x},${p.y}`).join(' ')}' fill='none' stroke='#ef8d00' stroke-width='2'/><line x1='10' y1='90' x2='95' y2='90' stroke='#ccd6e8' stroke-width='1'/>${points.map(p=>`<circle cx='${p.x}' cy='${p.y}' r='2.2' fill='#1b6ef3'/>`).join('')}<text x='10' y='98' font-size='4'>Démarrage</text><text x='38' y='98' font-size='4'>Calendrier</text><text x='66' y='98' font-size='4'>Opérationnel</text><text x='90' y='98' font-size='4'>Santé</text></svg><div class='small'>Période projet: ${esc(p.start_date||'-')} → ${esc(p.end_date||'-')} (${esc(String(p.elapsed_days||0))}/${esc(String(p.total_days||0))} jours)</div>`;}
-function renderBoard(){const b=state.board;if(!b||!b.ok){setText('kOpen','0');setText('kLate','0');setText('kProject','Projet METRONOME non trouvé');setText('kLoad',b&&b.loaded_at?b.loaded_at:'-');renderPilotageKpis({});renderProjectProgress({});renderOpenTasksByCompany({});renderAvgDelayByCompany({});renderMatchDiagnostics(b||{});return;}const k=b.kpis||{};setText('kOpen',String(k.open_topics||0));setText('kLate',String(k.overdue_topics||0));setText('kProject',b.warning?`${b.project_name||'-'} (partiel)`: (b.project_name||'-'));setText('kLoad',b.loaded_at||'-');renderPilotageKpis(b);renderProjectProgress(b);renderOpenTasksByCompany(b);renderAvgDelayByCompany(b);renderMatchDiagnostics(b);} 
+function renderBoard(){const b=state.board;if(!b||!b.ok){setText('kOpen','0');setText('kLate','0');setText('kTopRappels','0');setText('kTopASuivre','0');setText('projectTitle','Projet METRONOME non trouvé');renderPilotageKpis({});renderProjectTimeline({});renderCompanyChart({});renderReactivity({});renderMatchDiagnostics(b||{});return;}const k=b.kpis||{};const p=b.kpis_pilotage||{};setText('kOpen',String(k.open_topics||0));setText('kLate',String(k.overdue_topics||0));setText('kTopRappels',String(p.reminders_open_count||0));setText('kTopASuivre',String(p.followups_open_count||0));setText('projectTitle',b.warning?`${b.project_name||'-'} (partiel)`: (b.project_name||'-'));renderPilotageKpis(b);renderProjectTimeline(b);renderCompanyChart(b);renderReactivity(b);renderMatchDiagnostics(b);} 
 async function loadBoard(id){if(!id){state.selectedId='';state.board=null;renderBoard();return;}state.selectedId=id;localStorage.setItem('selectedAffaireId',id);document.getElementById('financeBtn').href=`/finance?affaire_id=${encodeURIComponent(id)}`;document.getElementById('dashboardBtn').href=`/dashboard?affaire_id=${encodeURIComponent(id)}`;showLoading(true);try{state.board=await api(`/api/project-management/board?affaire_id=${encodeURIComponent(id)}`);}catch(err){state.board=null;showPageError(err);}finally{showLoading(false);}renderBoard();}
 async function loadAffaires(search=''){const d=await api(`/api/finance/affaires?search=${encodeURIComponent(search)}`);state.affaires=d.items||[];const sel=document.getElementById('affaireSelect');sel.innerHTML=`<option value=''>Sélectionnez une affaire</option>`+state.affaires.map(x=>`<option value="${esc(x.affaire_id)}">${esc(x.display_name)}</option>`).join('');if(state.selectedId&&state.affaires.some(x=>x.affaire_id===state.selectedId)){sel.value=state.selectedId;}}
 function showPageError(err){const box=document.getElementById('matchBox');if(box){box.classList.remove('ok');box.classList.add('warn');}setText('matchStatus','⚠ Erreur de chargement');setText('matchReason','Erreur de chargement : '+((err&&err.message)?err.message:String(err||'Erreur inconnue')));}
@@ -2012,6 +2096,7 @@ async function init(){
     }else{renderBoard();}
     document.getElementById('searchInput').addEventListener('input',async e=>{await loadAffaires(e.target.value||'');});
     document.getElementById('affaireSelect').addEventListener('change',async e=>{await loadBoard(e.target.value||'');});
+    document.getElementById('companyMetric').addEventListener('change',()=>renderCompanyChart(state.board||{}));
   }catch(err){console.error(err);renderBoard();showPageError(err);}
 }
 init();
