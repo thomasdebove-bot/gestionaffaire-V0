@@ -27,6 +27,7 @@ EXPECTED_SCHEMA_VERSION = "finance_affaires_dataset_v4"
 TEMPO_LOGO_PATH = os.getenv("TEMPO_LOGO_PATH", r"\\192.168.10.100\02 - affaires\02.2 - SYNTHESE\ZZ - METRONOME\Content\T logo.png")
 METRONOME_BASE_PATH = os.getenv("METRONOME_BASE_PATH", r"\\192.168.10.100\02 - affaires\02.2 - SYNTHESE\ZZ - METRONOME")
 POINTAGE_STORE_FILE = Path(os.getenv("POINTAGE_STORE_FILE", "pointage_store.json"))
+BOOND_IMPUTATION_FILE = Path(os.getenv("BOOND_IMPUTATION_FILE", "boond_imputations.json"))
 METRONOME_FILES = {
     "projects": "Projects.csv",
     "entries": "Entries (Tasks & Memos).csv",
@@ -2096,9 +2097,134 @@ class PointageService:
         }
 
 
+class BoondImputationService:
+    _PROJECT_MATCH_IGNORED_TOKENS = {
+        "de", "du", "des", "la", "le", "les", "a", "au", "aux", "et", "rep", "projet", "affaire",
+    }
+
+    def __init__(self, source_file: Path) -> None:
+        self.source_file = Path(source_file)
+
+    @staticmethod
+    def _tokenize(value: str) -> set[str]:
+        tokens = {t for t in slugify(value).split("-") if t}
+        return {t for t in tokens if t not in BoondImputationService._PROJECT_MATCH_IGNORED_TOKENS and len(t) > 1}
+
+    def _score_match(self, target: str, candidate: str) -> int:
+        target_slug = slugify(target)
+        candidate_slug = slugify(candidate)
+        if not target_slug or not candidate_slug:
+            return 0
+        if target_slug == candidate_slug:
+            return 100
+        score = 0
+        if target_slug in candidate_slug:
+            score = max(score, 82)
+        if candidate_slug in target_slug:
+            score = max(score, 80)
+        common = self._tokenize(target) & self._tokenize(candidate)
+        if common:
+            score = max(score, min(45 + len(common) * 12, 95))
+        return score
+
+    def _load(self) -> Dict[str, Any]:
+        if not self.source_file.exists():
+            return {"projects": []}
+        try:
+            payload = json.loads(self.source_file.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Source BOOND illisible : {exc}")
+
+        if isinstance(payload, list):
+            return {"projects": payload}
+        if isinstance(payload, dict):
+            projects = payload.get("projects")
+            if isinstance(projects, list):
+                return {"projects": projects}
+            imputations = payload.get("imputations")
+            if isinstance(imputations, list):
+                return {"projects": [{"project_id": "", "project_name": "", "imputations": imputations}]}
+        return {"projects": []}
+
+    @staticmethod
+    def _imputation_month(row: Dict[str, Any]) -> str:
+        month = clean_text(row.get("month"))
+        if re.match(r"^\d{4}-\d{2}$", month):
+            return month
+        for field in ("date", "work_date", "entry_date"):
+            dt = MetronomeService._parse_date_value(clean_text(row.get(field)))
+            if dt:
+                return f"{dt.year:04d}-{dt.month:02d}"
+        return ""
+
+    def boond_imputations_for_project(self, project_name: str) -> Dict[str, Any]:
+        project_name = clean_text(project_name)
+        if not project_name:
+            raise HTTPException(status_code=400, detail="Le paramètre project est requis")
+
+        raw_projects = self._load().get("projects", [])
+        best: Optional[Dict[str, Any]] = None
+        best_score = 0
+        for candidate in raw_projects:
+            candidate_name = clean_text(candidate.get("project_name") or candidate.get("name") or candidate.get("project"))
+            score = self._score_match(project_name, candidate_name)
+            if score > best_score:
+                best_score = score
+                best = candidate
+
+        if not best or best_score < 55:
+            raise HTTPException(status_code=404, detail=f"Projet BOOND introuvable pour : {project_name}")
+
+        rows = best.get("imputations", []) if isinstance(best.get("imputations"), list) else []
+        grouped: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for row in rows:
+            resource = clean_text(row.get("resource") or row.get("collaborateur") or row.get("user") or row.get("name"))
+            month = self._imputation_month(row)
+            days = clean_number(row.get("days") if row.get("days") is not None else row.get("jours"))
+            cost_day = clean_number(row.get("cost_day") if row.get("cost_day") is not None else row.get("cout_journalier"))
+            total_cost = clean_number(row.get("total_cost") if row.get("total_cost") is not None else row.get("cout_total"))
+            if not resource or not month:
+                continue
+            key = (resource, month)
+            rec = grouped.setdefault(key, {
+                "resource": resource,
+                "month": month,
+                "days": 0.0,
+                "cost_day": 0.0,
+                "total_cost": 0.0,
+            })
+            rec["days"] += days
+            rec["total_cost"] += total_cost
+            if cost_day > 0:
+                rec["cost_day"] = cost_day
+
+        imputations: List[Dict[str, Any]] = []
+        for rec in grouped.values():
+            days = round(clean_number(rec.get("days")), 2)
+            total_cost = round(clean_number(rec.get("total_cost")), 2)
+            cost_day = clean_number(rec.get("cost_day"))
+            if cost_day <= 0 and days > 0 and total_cost > 0:
+                cost_day = total_cost / days
+            imputations.append({
+                "resource": rec.get("resource", ""),
+                "month": rec.get("month", ""),
+                "days": days,
+                "cost_day": round(cost_day, 2),
+                "total_cost": total_cost,
+            })
+
+        imputations.sort(key=lambda x: (x.get("month", ""), x.get("resource", "")))
+        return {
+            "project": project_name,
+            "boond_project_id": clean_text(best.get("project_id") or best.get("id")),
+            "imputations": imputations,
+        }
+
+
 service = FinanceService(WORKBOOK_PATH, SHEET_NAME, CACHE_FILE)
 metronome_service = MetronomeService(METRONOME_BASE_PATH)
 pointage_service = PointageService(POINTAGE_STORE_FILE)
+boond_imputation_service = BoondImputationService(BOOND_IMPUTATION_FILE)
 
 
 def pointage_finance_summary(affaire_id: str, commande_ht: float) -> Dict[str, float]:
@@ -2742,6 +2868,11 @@ def api_project_management_pointage_export(affaire_id: str = Query(default=""), 
     if key.endswith("name::"):
         raise HTTPException(status_code=400, detail="affaire_id ou affaire_name requis")
     return pointage_service.export_suivi(key)
+
+
+@app.get("/api/imputation/boond", response_class=JSONResponse)
+def api_imputation_boond(project: str = Query(default="")):
+    return boond_imputation_service.boond_imputations_for_project(project)
 
 
 @app.get("/api/finance/affaire/{affaire_id}/export-csv")
