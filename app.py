@@ -685,6 +685,8 @@ class MetronomeService:
         txt = clean_text(value)
         if not txt:
             return None
+        # Nettoie les préfixes type jour abrégé: "Mar 09/12/25" -> "09/12/25"
+        txt = re.sub(r"^(?:lun|mar|mer|jeu|ven|sam|dim|mon|tue|wed|thu|fri|sat|sun)\.?\s+", "", txt, flags=re.IGNORECASE)
         for fmt in (
             "%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d", "%m/%d/%Y", "%m/%d/%y",
             "%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S",
@@ -1876,7 +1878,7 @@ class PointageService:
         c_end = self._find_col(first, ["finish", "finish date", "finish1", "fin (g)", "fin", "date fin", "end", "end date"])
         c_work = self._find_col(first, ["work", "charge", "planned hours", "travail", "duree", "durée", "duration"])
         c_duration = self._find_col(first, ["duration", "duree", "durée", "planned duration"])
-        c_owner = self._find_col(first, ["owner", "resource", "responsable", "ressource"])
+        c_owner = self._find_col(first, ["owner", "resource", "nom de ressources", "nom de ressource", "responsable", "ressource"])
         c_pct = self._find_col(first, ["%", "% acheve", "% achevé", "% complete", "percent", "percentage complete", "percent complete", "acheve", "achevé", "avancement", "pourcentage_acheve", "pourcentage acheve"])
         c_outline = self._find_col(first, ["outline level", "outline", "niveau", "level", "wbs", "indent"])
         c_summary = self._find_col(first, ["summary", "is summary", "recap", "récap"])
