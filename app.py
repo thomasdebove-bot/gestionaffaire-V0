@@ -11,7 +11,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from openpyxl import load_workbook
 
@@ -1746,6 +1746,17 @@ class MetronomeService:
                     "followup": group_company(followup_tasks_today),
                     "reminder": group_company(reminder_tasks_cumulative),
                 },
+                "reminders_open_items": [
+                    {
+                        "company": self._normalize_company(t.get("company")),
+                        "perimetre": self._normalize_zone((t.get("area_names") or [""])[0] if (t.get("area_names") or []) else ""),
+                        "lot": self._normalize_lot(t.get("package_name") or t.get("package_label")),
+                        "task": clean_text(t.get("entry_title")),
+                        "deadline": clean_text(t.get("deadline")),
+                        "owner": self._normalize_owner(t.get("owner_full_name")),
+                    }
+                    for t in sorted(reminder_tasks_today, key=lambda x: (self._normalize_zone((x.get("area_names") or [""])[0] if (x.get("area_names") or []) else ""), self._normalize_lot(x.get("package_name") or x.get("package_label"),), clean_text(x.get("entry_title"))))
+                ],
                 "reactivity_by_company": reactivity_by_company,
             },
             "analytics": {
@@ -1771,8 +1782,231 @@ class MetronomeService:
         }
 
 
+class PointageService:
+    def __init__(self, store_file: Path) -> None:
+        self.store_file = store_file
+        self._lock = Lock()
+
+    def _load(self) -> Dict[str, Any]:
+        if not self.store_file.exists():
+            return {"projects": {}}
+        try:
+            return json.loads(self.store_file.read_text(encoding="utf-8"))
+        except Exception:
+            return {"projects": {}}
+
+    def _save(self, data: Dict[str, Any]) -> None:
+        self.store_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    @staticmethod
+    def _project_key(affaire_id: str, affaire_name: str) -> str:
+        aid = clean_text(affaire_id)
+        if aid:
+            return f"id::{aid}"
+        return f"name::{slugify(affaire_name)}"
+
+    @staticmethod
+    def _decode_csv(raw: bytes) -> str:
+        for enc in ("utf-8-sig", "cp1252", "latin-1"):
+            try:
+                return raw.decode(enc)
+            except Exception:
+                continue
+        return raw.decode("utf-8", errors="ignore")
+
+    @staticmethod
+    def _csv_rows(text: str) -> List[Dict[str, str]]:
+        first = text.splitlines()[0] if text.splitlines() else ""
+        delimiter = ";" if first.count(";") >= first.count(",") and first.count(";") > 0 else ("	" if "	" in first else ",")
+        return list(csv.DictReader(io.StringIO(text), delimiter=delimiter))
+
+    @staticmethod
+    def _find_col(row: Dict[str, Any], names: List[str]) -> str:
+        for n in names:
+            for k in row.keys():
+                if slugify(k) == slugify(n) or slugify(n) in slugify(k):
+                    return k
+        return ""
+
+    def parse_planning(self, raw: bytes) -> List[Dict[str, Any]]:
+        text = self._decode_csv(raw)
+        rows = self._csv_rows(text)
+        if not rows:
+            return []
+        first = rows[0]
+        c_id = self._find_col(first, ["id", "task id", "id tache", "uid"])
+        c_name = self._find_col(first, ["task name", "nom", "name", "tache"])
+        c_start = self._find_col(first, ["start", "debut", "date debut"])
+        c_end = self._find_col(first, ["finish", "fin", "date fin", "end"])
+        c_work = self._find_col(first, ["work", "charge", "planned hours", "travail"])
+        c_owner = self._find_col(first, ["owner", "resource", "responsable", "ressource"])
+        c_pct = self._find_col(first, ["%", "percent", "acheve", "avancement"])
+
+        tasks: List[Dict[str, Any]] = []
+        current_level = "Général"
+        for idx, r in enumerate(rows):
+            name = clean_text(r.get(c_name)) if c_name else ""
+            if not name:
+                continue
+            name_slug = slugify(name)
+            if "synthese-technique-niveau" in name_slug or re.search(r"niveau\s+[a-z0-9-]+", name_slug):
+                current_level = name
+            task_id = clean_text(r.get(c_id)) if c_id else ""
+            if not task_id:
+                task_id = f"task-{idx+1}-{slugify(name)[:24]}"
+            start = MetronomeService._parse_date_only(clean_text(r.get(c_start))) if c_start else None
+            end = MetronomeService._parse_date_only(clean_text(r.get(c_end))) if c_end else None
+            planned_hours = clean_number(r.get(c_work)) if c_work else 0.0
+            owner = clean_text(r.get(c_owner)) if c_owner else ""
+            pct = clean_number(r.get(c_pct)) if c_pct else 0.0
+            is_structure = "synthese" in name_slug or "recap" in name_slug
+            is_cst = "cst" in slugify(owner) or "cst" in name_slug
+            is_cet = slugify(owner) in {"cet"} or slugify(owner).startswith("cet-")
+            stable_key = f"{task_id}|{slugify(name)}|{slugify(current_level)}|{idx}"
+            tasks.append({
+                "task_id": task_id,
+                "stable_key": stable_key,
+                "name": name,
+                "level": current_level,
+                "owner": owner or "Non attribué",
+                "start": start.isoformat() if start else "",
+                "end": end.isoformat() if end else "",
+                "planned_hours": planned_hours,
+                "csv_progress": max(0.0, min(100.0, pct)),
+                "is_structure": is_structure,
+                "is_actionable": not is_structure,
+                "is_cst": is_cst,
+                "is_cet": is_cet,
+            })
+        return tasks
+
+    def _ensure_project(self, key: str) -> Dict[str, Any]:
+        data = self._load()
+        proj = data.setdefault("projects", {}).setdefault(key, {
+            "planning_tasks": [],
+            "pointage": {"__cetMembers": "", "__cstRate": 80},
+            "workState": {"expanded_levels": []},
+            "updated_at": now_iso(),
+        })
+        return data
+
+    def import_planning(self, project_key: str, raw: bytes) -> Dict[str, Any]:
+        tasks = self.parse_planning(raw)
+        with self._lock:
+            data = self._ensure_project(project_key)
+            proj = data["projects"][project_key]
+            existing_pointage = proj.get("pointage", {})
+            remapped: Dict[str, Any] = {k: v for k, v in existing_pointage.items() if k.startswith("__")}
+            by_task = {t.get("task_id"): t for t in proj.get("planning_tasks", [])}
+            by_stable = {t.get("stable_key"): t for t in proj.get("planning_tasks", [])}
+            for nt in tasks:
+                old = by_task.get(nt.get("task_id")) or by_stable.get(nt.get("stable_key"))
+                if old and old.get("task_id") in existing_pointage:
+                    remapped[nt["task_id"]] = existing_pointage[old["task_id"]]
+            proj["planning_tasks"] = tasks
+            proj["pointage"] = remapped
+            proj["updated_at"] = now_iso()
+            self._save(data)
+        return self.get_project_data(project_key)
+
+    def save_pointage(self, project_key: str, pointage_patch: Dict[str, Any], work_state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        with self._lock:
+            data = self._ensure_project(project_key)
+            proj = data["projects"][project_key]
+            p = proj.setdefault("pointage", {"__cetMembers": "", "__cstRate": 80})
+            for k, v in pointage_patch.items():
+                p[k] = v
+            if work_state is not None:
+                proj["workState"] = work_state
+            proj["updated_at"] = now_iso()
+            self._save(data)
+        return self.get_project_data(project_key)
+
+    def import_suivi(self, project_key: str, raw_json: bytes) -> Dict[str, Any]:
+        payload = json.loads(raw_json.decode("utf-8"))
+        pointage = payload.get("pointage", {})
+        work_state = payload.get("workState", {})
+        return self.save_pointage(project_key, pointage, work_state=work_state)
+
+    def export_suivi(self, project_key: str) -> Dict[str, Any]:
+        data = self.get_project_data(project_key)
+        return {"exportedAt": now_iso(), "pointage": data.get("pointage", {}), "workState": data.get("workState", {})}
+
+    def compute_tasks(self, planning_tasks: List[Dict[str, Any]], pointage: Dict[str, Any]) -> List[Dict[str, Any]]:
+        cet_members = [clean_text(x) for x in clean_text(pointage.get("__cetMembers", "")).split(",") if clean_text(x)]
+        cst_rate = clean_number(pointage.get("__cstRate", 80))
+        today = datetime.now().date()
+        out: List[Dict[str, Any]] = []
+        for t in planning_tasks:
+            rec = pointage.get(t["task_id"], {}) if isinstance(pointage.get(t["task_id"]), dict) else {}
+            progress = clean_number(rec.get("progress", t.get("csv_progress", 0)))
+            actual_end = MetronomeService._parse_date_only(clean_text(rec.get("actualEnd")))
+            cet_map = rec.get("cet", {}) if isinstance(rec.get("cet"), dict) else {}
+            cet_progress_vals = []
+            cet_dates: List[date] = []
+            if t.get("is_cet") and cet_members:
+                for m in cet_members:
+                    cm = cet_map.get(m, {}) if isinstance(cet_map.get(m), dict) else {}
+                    cp = clean_number(cm.get("progress", 0))
+                    ca = MetronomeService._parse_date_only(clean_text(cm.get("actualEnd")))
+                    if ca:
+                        cp = 100.0
+                        cet_dates.append(ca)
+                    cet_progress_vals.append(max(0.0, min(100.0, cp)))
+                if not rec.get("progress") and cet_progress_vals:
+                    progress = sum(cet_progress_vals) / len(cet_progress_vals)
+                if not actual_end and cet_dates:
+                    actual_end = max(cet_dates)
+            if actual_end:
+                progress = 100.0
+            progress = max(0.0, min(100.0, progress))
+            start = MetronomeService._parse_date_only(t.get("start", ""))
+            end = MetronomeService._parse_date_only(t.get("end", ""))
+            if actual_end and end:
+                delay_days = max(0, (actual_end - end).days)
+            elif (not actual_end) and end and progress < 100 and today > end:
+                delay_days = (today - end).days
+            else:
+                delay_days = 0
+            if progress >= 100 or actual_end:
+                status = "past"
+            elif start and today < start:
+                status = "future"
+            else:
+                status = "current"
+            planned_cost = clean_number(t.get("planned_hours")) * cst_rate if t.get("is_cst") else 0.0
+            actual_cost = planned_cost * (progress / 100.0)
+            out.append({
+                **t,
+                "progress": round(progress, 1),
+                "actualEnd": actual_end.isoformat() if actual_end else clean_text(rec.get("actualEnd")),
+                "cet": cet_map,
+                "cetMembers": cet_members,
+                "status": status,
+                "delayDays": int(delay_days),
+                "plannedCostCst": round(planned_cost, 2),
+                "actualCostCst": round(actual_cost, 2),
+                "cstRate": cst_rate,
+                "isLate": bool(delay_days > 0),
+            })
+        return out
+
+    def get_project_data(self, project_key: str) -> Dict[str, Any]:
+        data = self._load()
+        proj = data.get("projects", {}).get(project_key, {"planning_tasks": [], "pointage": {"__cetMembers": "", "__cstRate": 80}, "workState": {"expanded_levels": []}})
+        tasks = self.compute_tasks(proj.get("planning_tasks", []), proj.get("pointage", {}))
+        return {
+            "project_key": project_key,
+            "tasks": tasks,
+            "pointage": proj.get("pointage", {}),
+            "workState": proj.get("workState", {}),
+            "updated_at": proj.get("updated_at", ""),
+        }
+
+
 service = FinanceService(WORKBOOK_PATH, SHEET_NAME, CACHE_FILE)
 metronome_service = MetronomeService(METRONOME_BASE_PATH)
+pointage_service = PointageService(POINTAGE_STORE_FILE)
 
 
 def landing_html() -> str:
@@ -1995,7 +2229,7 @@ def gestion_projet_html() -> str:
 .kpis{margin-top:12px;padding:14px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.k{border:1px solid var(--line);border-radius:14px;padding:14px;background:#fbfdff}.k .v{font-size:34px;font-weight:900;margin-top:6px}
 .section{margin-top:12px;padding:14px}.subgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:14px}table{width:100%;border-collapse:collapse}th,td{padding:10px 12px;border-bottom:1px solid var(--line);font-size:13px;text-align:left}th{background:#f7f9fc;font-size:12px;color:#5b6880;text-transform:uppercase}.small{color:var(--muted);font-size:13px}
 .bar{height:10px;background:#edf1f8;border-radius:999px;overflow:hidden}.fill{height:100%;background:#ef8d00}
-.loading-wrap{margin-top:8px;padding:8px 10px;border:1px solid #d8e0ee;border-radius:12px;background:#fff}.loading-label{font-size:12px;color:#5b6880;margin-bottom:6px;font-weight:700}.loading-track{height:8px;border-radius:999px;background:#eef2f8;overflow:hidden}.loading-bar{height:100%;width:35%;background:linear-gradient(90deg,#ef8d00,#ffd08a);animation:loadmove 1.2s infinite ease-in-out}@keyframes loadmove{0%{margin-left:-35%}100%{margin-left:100%}}.match-box{margin-top:10px;border:1px solid var(--line);border-radius:10px;padding:8px;background:#fffaf2}.match-box.ok{border-color:#49a66a;background:#f4fcf6}.match-box.warn{border-color:#ef8d00;background:#fff7ec}.match-title{font-weight:700;margin-bottom:4px;font-size:13px}.conf-badge{display:inline-block;margin-left:8px;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:800;background:#eef2f8;color:#3b4f6f}.match-grid{display:none;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.match-box:hover .match-grid,.match-box:focus-within .match-grid{display:grid}.match-item{font-size:12px;color:#30425f}.match-item b{display:block;color:#6e7a90;font-size:11px;margin-bottom:2px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-word}.pilot-box{margin-top:12px;border:1px solid #cfd8e8;border-radius:18px;padding:16px;background:#f8fbff}.pilot-title{font-size:34px;font-weight:900;margin:4px 0 10px}.pilot-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.pilot-card{background:#fff;border:1px solid #d8e0ee;border-radius:18px;padding:14px}.pilot-card .t{font-size:15px;color:#4b5d7a;font-weight:800}.pilot-card .v{font-size:44px;font-weight:900;margin-top:8px}.pilot-list{margin-top:12px;border:1px solid #d8e0ee;border-radius:18px;background:#fff;padding:8px 14px}.pilot-row{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px dashed #d8e0ee}.pilot-row:last-child{border-bottom:none}.pilot-row .name{font-weight:700}.company-cell{display:flex;align-items:center;gap:10px}.company-logo{width:28px;height:28px;border-radius:50%;border:1px solid #d8e0ee;background:#fff;object-fit:cover;display:inline-flex;align-items:center;justify-content:center;font-size:11px;color:#6e7a90;font-weight:800}.proj-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.progress-card{border:1px solid #d8e0ee;border-radius:14px;padding:12px;background:#fff}.progress-title{font-weight:800;margin-bottom:8px}.progress-row{display:grid;grid-template-columns:180px 1fr 70px;gap:10px;align-items:center;padding:6px 0}.progress-track{height:10px;border-radius:999px;background:#edf1f8;overflow:hidden}.progress-fill{height:100%;background:#1b6ef3}.curve-wrap{border:1px solid #d8e0ee;border-radius:14px;padding:12px;background:#fff}.project-head{display:flex;align-items:center;gap:14px}.project-cover{width:88px;height:64px;border-radius:10px;border:1px solid #d8e0ee;object-fit:cover;background:#fff}.project-title{font-size:30px;font-weight:900;margin:4px 0 2px}.project-desc{color:#6e7a90;margin:2px 0 0}.timeline-box{margin:10px 0;border:1px solid #d8e0ee;border-radius:14px;background:#fff;padding:10px}.timeline-row{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px}.timeline-track{height:12px;border-radius:999px;background:#edf1f8;overflow:hidden}.timeline-fill{height:100%;background:#1b6ef3}.timeline-fill.over{background:#d64545}.chart-controls{display:flex;gap:8px;align-items:center;margin-bottom:8px}.chart-select{height:36px;border:1px solid var(--line);border-radius:10px;padding:0 10px}.react-row{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px dashed #d8e0ee}.react-row:last-child{border-bottom:none}
+.loading-wrap{margin-top:8px;padding:8px 10px;border:1px solid #d8e0ee;border-radius:12px;background:#fff}.loading-label{font-size:12px;color:#5b6880;margin-bottom:6px;font-weight:700}.loading-track{height:8px;border-radius:999px;background:#eef2f8;overflow:hidden}.loading-bar{height:100%;width:35%;background:linear-gradient(90deg,#ef8d00,#ffd08a);animation:loadmove 1.2s infinite ease-in-out}@keyframes loadmove{0%{margin-left:-35%}100%{margin-left:100%}}.match-box{margin-top:10px;border:1px solid var(--line);border-radius:10px;padding:8px;background:#fffaf2}.match-box.ok{border-color:#49a66a;background:#f4fcf6}.match-box.warn{border-color:#ef8d00;background:#fff7ec}.match-title{font-weight:700;margin-bottom:4px;font-size:13px}.conf-badge{display:inline-block;margin-left:8px;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:800;background:#eef2f8;color:#3b4f6f}.match-grid{display:none;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.match-box:hover .match-grid,.match-box:focus-within .match-grid{display:grid}.match-item{font-size:12px;color:#30425f}.match-item b{display:block;color:#6e7a90;font-size:11px;margin-bottom:2px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-word}.pilot-box{margin-top:12px;border:1px solid #cfd8e8;border-radius:18px;padding:16px;background:#f8fbff}.pilot-title{font-size:34px;font-weight:900;margin:4px 0 10px}.pilot-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.pilot-card{background:#fff;border:1px solid #d8e0ee;border-radius:18px;padding:14px}.pilot-card .t{font-size:15px;color:#4b5d7a;font-weight:800}.pilot-card .v{font-size:44px;font-weight:900;margin-top:8px}.pilot-list{margin-top:12px;border:1px solid #d8e0ee;border-radius:18px;background:#fff;padding:8px 14px}.pilot-row{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px dashed #d8e0ee}.pilot-row:last-child{border-bottom:none}.pilot-row .name{font-weight:700}.company-cell{display:flex;align-items:center;gap:10px}.company-logo{width:28px;height:28px;border-radius:50%;border:1px solid #d8e0ee;background:#fff;object-fit:cover;display:inline-flex;align-items:center;justify-content:center;font-size:11px;color:#6e7a90;font-weight:800}.proj-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.progress-card{border:1px solid #d8e0ee;border-radius:14px;padding:12px;background:#fff}.progress-title{font-weight:800;margin-bottom:8px}.progress-row{display:grid;grid-template-columns:180px 1fr 70px;gap:10px;align-items:center;padding:6px 0}.progress-track{height:10px;border-radius:999px;background:#edf1f8;overflow:hidden}.progress-fill{height:100%;background:#1b6ef3}.curve-wrap{border:1px solid #d8e0ee;border-radius:14px;padding:12px;background:#fff}.project-head{display:flex;align-items:center;gap:14px}.project-cover{width:88px;height:64px;border-radius:10px;border:1px solid #d8e0ee;object-fit:cover;background:#fff}.project-title{font-size:30px;font-weight:900;margin:4px 0 2px}.project-desc{color:#6e7a90;margin:2px 0 0}.timeline-box{margin:10px 0;border:1px solid #d8e0ee;border-radius:14px;background:#fff;padding:10px}.timeline-row{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px}.timeline-track{height:12px;border-radius:999px;background:#edf1f8;overflow:hidden}.timeline-fill{height:100%;background:#1b6ef3}.timeline-fill.over{background:#d64545}.chart-controls{display:flex;gap:8px;align-items:center;margin-bottom:8px}.chart-select{height:36px;border:1px solid var(--line);border-radius:10px;padding:0 10px}.react-row{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px dashed #d8e0ee}.react-row:last-child{border-bottom:none}.pm-modal{position:fixed;inset:0;background:rgba(11,20,33,.45);display:flex;align-items:center;justify-content:center;padding:20px;z-index:50}.pm-modal-box{background:#fff;border-radius:14px;max-width:1100px;width:100%;max-height:82vh;overflow:auto;padding:14px;border:1px solid #d8e0ee}.lvl-row{background:#f7f9fd;font-weight:800}.task-late{background:#fff1f1}.task-soon{background:#fffaf0}
 @media (max-width:980px){.grid{grid-template-columns:repeat(2,1fr)}.subgrid{grid-template-columns:1fr}}@media (max-width:640px){.grid{grid-template-columns:1fr}}
 </style></head>
 <body><div class='wrap'>
@@ -2056,7 +2290,7 @@ def gestion_projet_html() -> str:
       <select id='companyMetric' class='chart-select'>
         <option value='open'>Tâches ouvertes par entreprise</option>
         <option value='followup'>Tâches à suivre par entreprise</option>
-        <option value='reminder'>Tâches en rappel par entreprise</option>
+        <option value='reminder'>Total de taches en rappel par entreprise</option>
       </select>
     </div>
     <div id='companyChartList' class='pilot-list'><div class='small'>Aucune donnée</div></div>
@@ -2066,9 +2300,35 @@ def gestion_projet_html() -> str:
     <h3>Réactivité par entreprise (écart moyen échéance → clôture)</h3>
     <div id='reactivityList' class='pilot-list'><div class='small'>Aucune donnée</div></div>
   </div>
+
+  <div class='section'>
+    <h3>Pointage opérationnel</h3>
+    <div class='chart-controls'>
+      <input id='planningCsvInput' type='file' accept='.csv' style='display:none'>
+      <input id='suiviImportInput' type='file' accept='.json' style='display:none'>
+      <button id='btnImportPlanning' class='btn'>Importer planning CSV</button>
+      <button id='btnExportSuivi' class='btn'>Exporter suivi (.json)</button>
+      <button id='btnImportSuivi' class='btn'>Importer suivi</button>
+      <input id='cetMembersInput' class='search' style='height:36px;min-width:320px' placeholder='Équipe CET (ex: CVC, PLB, ELE)'>
+      <button id='btnExpandAll' class='btn'>Tout déployer</button>
+      <button id='btnCollapseAll' class='btn'>Tout replier</button>
+    </div>
+    <div id='pointageWrap' class='table-wrap'><div class='small' style='padding:10px'>Aucun planning importé.</div></div>
+  </div>
+
+  <div id='reminderModal' class='pm-modal' style='display:none'>
+    <div class='pm-modal-box'>
+      <div style='display:flex;justify-content:space-between;align-items:center'>
+        <h3 id='reminderModalTitle' style='margin:0'>Rappels ouverts</h3>
+        <button id='reminderModalClose' class='btn'>Fermer</button>
+      </div>
+      <div id='reminderModalBody' class='table-wrap' style='margin-top:8px'></div>
+    </div>
+  </div>
+
 </div>
 <script>
-const state={affaires:[],selectedId:'',board:null};
+const state={affaires:[],selectedId:'',board:null,pointage:null};
 function esc(v){return String(v??'').replace(/[&<>]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[ch]||ch));}
 async function api(u){const r=await fetch(u);const d=await r.json();if(!r.ok) throw new Error(d.detail||'Erreur API');return d;}
 function renderBars(id,items){const root=document.getElementById(id);if(!items||!items.length){root.innerHTML="<div class='small'>Aucune donnée</div>";return;}const max=Math.max(1,...items.map(x=>Number(x.count||0)));root.innerHTML=items.map(x=>`<div style='margin:8px 0'><div style='display:flex;justify-content:space-between;gap:8px'><span>${esc(x.label)}</span><strong>${x.count}</strong></div><div class='bar'><div class='fill' style='width:${(Number(x.count||0)/max)*100}%'></div></div></div>`).join('');}
@@ -2079,7 +2339,9 @@ function showLoading(on,label='Chargement des indicateurs projet…'){const w=do
 function fmtDateFr(v){if(!v)return '-';const d=new Date(v+'T00:00:00');if(Number.isNaN(d.getTime()))return v;return d.toLocaleDateString('fr-FR',{day:'numeric',month:'long',year:'numeric'});}function renderProjectTimeline(b){const p=((b&&b.analytics)||{}).kpi_project_progress||{};const root=document.getElementById('timelineBox');if(!root)return;const total=Number(p.total_days||0);if(!total){root.innerHTML="<div class='small'>Période projet indisponible</div>";return;}const elapsedRaw=Number(p.elapsed_days_raw||0);const over=Number(p.overrun_days||0);const overPct=Number(p.overrun_pct||0);const basePct=Math.max(0,Math.min(100,Number(p.calendar_progress_pct||0)));const fillClass=(p.is_overrun?'timeline-fill over':'timeline-fill');const extra= p.is_overrun ? ` · Dépassement: <strong>${over} jours (${overPct}%)</strong>` : '';root.innerHTML=`<div class='timeline-row'><span><strong>Progression temporelle</strong></span><span><strong>${basePct.toFixed(0)}%</strong></span></div><div class='timeline-track'><div class='${fillClass}' style='width:${basePct}%'></div></div><div class='small' style='margin-top:6px'>Commencé le ${esc(fmtDateFr(p.start_date))}.<br>Fin prévue le ${esc(fmtDateFr(p.end_date))}.<br>${elapsedRaw}/${total} jours écoulés${extra}</div>`;}function renderCompanyChart(b){const p=(b&&b.kpis_pilotage)||{};const metricEl=document.getElementById('companyMetric');const metric=(metricEl&&metricEl.value)||'open';const views=p.project_company_views||{};const items=views[metric]||[];const root=document.getElementById('companyChartList');if(!root)return;if(!items.length){root.innerHTML="<div class='small'>Aucune donnée</div>";return;}const max=Math.max(1,...items.map(x=>Number(x.count||0)));root.innerHTML=items.map(x=>`<div style='margin:8px 0'><div class='pilot-row' style='border-bottom:none;padding:0 0 4px'><span class='company-cell'>${companyLogoHtml(x)}<span class='name'>${esc(x.name)}</span></span><strong>${x.count}</strong></div><div class='bar'><div class='fill' style='width:${(Number(x.count||0)/max)*100}%'></div></div></div>`).join('');}
 function renderReactivity(b){const p=(b&&b.kpis_pilotage)||{};const items=p.reactivity_by_company||[];const root=document.getElementById('reactivityList');if(!root)return;if(!items.length){root.innerHTML="<div class='small'>Pas assez de tâches clôturées avec échéance.</div>";return;}const vals=items.map(x=>Math.abs(Number(x.avg_gap_days||0)));const max=Math.max(1,...vals);root.innerHTML=`<div style='display:flex;align-items:flex-end;gap:14px;height:240px;padding:10px 0'>${items.map(x=>{const v=Number(x.avg_gap_days||0);const h=Math.max(8,(Math.abs(v)/max)*190);const color=v>0?'#d64545':'#1b6ef3';return `<div style='flex:1;min-width:60px;text-align:center'><div title='${esc(x.name)}: ${v} j' style='margin:0 auto;width:34px;height:${h}px;background:${color};border-radius:8px 8px 0 0'></div><div style='font-size:11px;margin-top:6px;font-weight:700'>${esc(x.name)}</div><div style='font-size:11px;color:#6e7a90'>${v} j</div></div>`;}).join('')}</div>`;}function initials(v){const parts=String(v||'').trim().split(/\s+/).slice(0,2);return parts.map(x=>x[0]||'').join('').toUpperCase()||'?';}
 function companyLogoHtml(item){const name=item.name||item.label||'';const logo=item.logo||'';if(logo){return `<img class='company-logo' src='${esc(logo)}' alt='${esc(name)}'>`;}return `<span class='company-logo'>${esc(initials(name))}</span>`;}
-function renderPilotageKpis(b){const p=(b&&b.kpis_pilotage)||{};setText('kRappelsDate',String(p.reminders_open_count||p.rappels_ouverts_a_date||0));setText('kASuivre',String(p.followups_open_count||p.a_suivre_ouverts||0));setText('kDateRef',String(p.reference_date_text||p.reference_date||p.date_reference||'-'));const root=document.getElementById('pilotByCompany');const items=p.reminders_by_company||p.rappels_cumules_par_entreprise||[];if(!items.length){root.innerHTML="<div class='small'>Aucune donnée</div>";}else{root.innerHTML=items.map(x=>`<div class='pilot-row'><span class='company-cell'>${companyLogoHtml(x)}<span class='name'>${esc(x.name||x.label)}</span></span><strong>${x.count}</strong></div>`).join('');}}
+function showReminderModal(company,b){const p=(b&&b.kpis_pilotage)||{};const items=(p.reminders_open_items||[]).filter(x=>String(x.company||'')===String(company||''));const body=document.getElementById('reminderModalBody');const title=document.getElementById('reminderModalTitle');if(title)title.textContent=`Rappels ouverts - ${company}`;if(!body)return;if(!items.length){body.innerHTML="<div class='small' style='padding:10px'>Aucun rappel ouvert.</div>";}else{const byPer={};for(const it of items){const k=it.perimetre||'Général';(byPer[k]=byPer[k]||[]).push(it);}let html='';for(const per of Object.keys(byPer).sort()){html+=`<h4 style='margin:10px 0 6px'>${esc(per)}</h4><table><thead><tr><th>Lot</th><th>Tâche</th><th>Echéance</th><th>Responsable</th></tr></thead><tbody>${byPer[per].map(r=>`<tr><td>${esc(r.lot||'')}</td><td>${esc(r.task||'')}</td><td>${esc(r.deadline||'')}</td><td>${esc(r.owner||'')}</td></tr>`).join('')}</tbody></table>`;}body.innerHTML=html;}const modal=document.getElementById('reminderModal');if(modal)modal.style.display='flex';}
+function hideReminderModal(){const modal=document.getElementById('reminderModal');if(modal)modal.style.display='none';}
+function renderPilotageKpis(b){const p=(b&&b.kpis_pilotage)||{};setText('kRappelsDate',String(p.reminders_open_count||p.rappels_ouverts_a_date||0));setText('kASuivre',String(p.followups_open_count||p.a_suivre_ouverts||0));setText('kDateRef',String(p.reference_date_text||p.reference_date||p.date_reference||'-'));const root=document.getElementById('pilotByCompany');const items=p.reminders_by_company||p.rappels_cumules_par_entreprise||[];if(!items.length){root.innerHTML="<div class='small'>Aucune donnée</div>";}else{root.innerHTML=items.map(x=>`<button type='button' class='pilot-row' style='width:100%;background:transparent;border:none;text-align:left;cursor:pointer' data-company='${esc(x.name||x.label)}'><span class='company-cell'>${companyLogoHtml(x)}<span class='name'>${esc(x.name||x.label)}</span></span><strong>${x.count}</strong></button>`).join('');Array.from(root.querySelectorAll('button[data-company]')).forEach(btn=>btn.addEventListener('click',()=>showReminderModal(btn.getAttribute('data-company')||'',b)));}}
 function renderMatchDiagnostics(b){const md=(b&&b.match_debug)||{};const box=document.getElementById('matchBox');
   setHtml('matchSearchName',`<b>Projet recherché</b>${esc(md.searched_project_name||b?.project_name||'-')}`);
   setHtml('matchSearchSlug',`<b>Slug recherché</b><span class='mono'>${esc(md.searched_project_slug||'-')}</span>`);
@@ -2109,6 +2371,16 @@ function renderBoard(){const b=state.board;if(!b||!b.ok){setText('kOpen','0');se
 async function loadBoard(id){if(!id){state.selectedId='';state.board=null;renderBoard();return;}state.selectedId=id;localStorage.setItem('selectedAffaireId',id);document.getElementById('financeBtn').href=`/finance?affaire_id=${encodeURIComponent(id)}`;document.getElementById('dashboardBtn').href=`/dashboard?affaire_id=${encodeURIComponent(id)}`;showLoading(true);try{state.board=await api(`/api/project-management/board?affaire_id=${encodeURIComponent(id)}`);}catch(err){state.board=null;showPageError(err);}finally{showLoading(false);}renderBoard();}
 async function loadAffaires(search=''){const d=await api(`/api/finance/affaires?search=${encodeURIComponent(search)}`);state.affaires=d.items||[];const sel=document.getElementById('affaireSelect');sel.innerHTML=`<option value=''>Sélectionnez une affaire</option>`+state.affaires.map(x=>`<option value="${esc(x.affaire_id)}">${esc(x.display_name)}</option>`).join('');if(state.selectedId&&state.affaires.some(x=>x.affaire_id===state.selectedId)){sel.value=state.selectedId;}}
 function showPageError(err){const box=document.getElementById('matchBox');if(box){box.classList.remove('ok');box.classList.add('warn');}setText('matchStatus','⚠ Erreur de chargement');setText('matchReason','Erreur de chargement : '+((err&&err.message)?err.message:String(err||'Erreur inconnue')));}
+
+function projectKey(){return state.selectedId?`id::${state.selectedId}`:'';}
+async function pointageApi(url,opts){const r=await fetch(url,opts);const d=await r.json();if(!r.ok) throw new Error(d.detail||'Erreur pointage');return d;}
+async function loadPointage(){if(!state.selectedId)return;try{const d=await pointageApi(`/api/project-management/pointage?affaire_id=${encodeURIComponent(state.selectedId)}`);state.pointage=d;renderPointage();}catch(e){console.warn(e);}}
+function levelGroups(tasks){const g={};for(const t of (tasks||[])){const lvl=t.level||'Général';(g[lvl]=g[lvl]||[]).push(t);}return g;}
+function renderPointage(){const root=document.getElementById('pointageWrap');const d=state.pointage||{};const tasks=d.tasks||[];if(!root)return;if(!tasks.length){root.innerHTML="<div class='small' style='padding:10px'>Aucun planning importé.</div>";return;}const expanded=new Set((d.workState&&d.workState.expanded_levels)||[]);const groups=levelGroups(tasks);let html=`<table><thead><tr><th>Tâche</th><th>Niveau</th><th>Ressource</th><th>Début</th><th>Fin</th><th>% achevé</th><th>Réception réelle</th><th>Retard</th><th>Coût planifié CST</th><th>Coût pointé CST</th><th>Statut</th></tr></thead><tbody>`;for(const lvl of Object.keys(groups)){const open=expanded.has(lvl);html+=`<tr class='lvl-row'><td colspan='11'><button type='button' data-lvl='${esc(lvl)}' class='btn' style='height:28px'>${open?'−':'+'}</button> ${esc(lvl)}</td></tr>`;if(open){for(const t of groups[lvl]){const rowCls=t.isLate?'task-late':(((t.status==='future')&&t.start)?'task-soon':'');html+=`<tr class='${rowCls}'><td>${esc(t.name)}</td><td>${esc(t.level)}</td><td>${esc(t.owner)}</td><td>${esc(t.start||'')}</td><td>${esc(t.end||'')}</td><td><input data-task='${esc(t.task_id)}' data-field='progress' type='number' min='0' max='100' value='${Number(t.progress||0)}' style='width:70px'></td><td><input data-task='${esc(t.task_id)}' data-field='actualEnd' type='date' value='${esc(t.actualEnd||'')}'></td><td>${Number(t.delayDays||0)} j</td><td>${Number(t.plannedCostCst||0).toFixed(0)} €</td><td>${Number(t.actualCostCst||0).toFixed(0)} €</td><td>${esc(t.status)}</td></tr>`;if(t.is_cet&&t.cetMembers&&t.cetMembers.length){for(const m of t.cetMembers){const cm=((t.cet||{})[m]||{});html+=`<tr><td style='padding-left:28px'>↳ ${esc(m)}</td><td>${esc(t.level)}</td><td>CET</td><td></td><td></td><td><input data-task='${esc(t.task_id)}' data-cet='${esc(m)}' data-field='progress' type='number' min='0' max='100' value='${Number(cm.progress||0)}' style='width:70px'></td><td><input data-task='${esc(t.task_id)}' data-cet='${esc(m)}' data-field='actualEnd' type='date' value='${esc(cm.actualEnd||'')}'></td><td colspan='4'></td></tr>`;}}}}}html+='</tbody></table>';root.innerHTML=html;Array.from(root.querySelectorAll('button[data-lvl]')).forEach(b=>b.addEventListener('click',async()=>{const lvl=b.getAttribute('data-lvl')||'';const ws={...(d.workState||{}),expanded_levels:[...new Set([...(d.workState?.expanded_levels||[])]) ]};const set=new Set(ws.expanded_levels);if(set.has(lvl))set.delete(lvl);else set.add(lvl);ws.expanded_levels=[...set];await savePointage({},ws);}));Array.from(root.querySelectorAll('input[data-task]')).forEach(inp=>inp.addEventListener('change',async()=>{const task=inp.getAttribute('data-task')||'';const field=inp.getAttribute('data-field')||'';const cet=inp.getAttribute('data-cet')||'';const patch={};if(cet){patch[task]={cet:{[cet]:{[field]:inp.value}}};}else{patch[task]={[field]:inp.value};}await savePointage(patch,d.workState||{});}));}
+async function savePointage(pointagePatch,workState){if(!state.selectedId)return;const cetMembers=(document.getElementById('cetMembersInput')||{}).value||'';const payload={pointage_patch:{...pointagePatch,__cetMembers:cetMembers},work_state:workState||{}};const d=await pointageApi(`/api/project-management/pointage/save?affaire_id=${encodeURIComponent(state.selectedId)}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});state.pointage=d;renderPointage();}
+async function importPlanningFile(file){if(!state.selectedId||!file)return;const fd=new FormData();fd.append('file',file);const d=await fetch(`/api/project-management/pointage/planning/import?affaire_id=${encodeURIComponent(state.selectedId)}`,{method:'POST',body:fd});const j=await d.json();if(!d.ok)throw new Error(j.detail||'Import planning impossible');state.pointage=j;renderPointage();}
+async function importSuiviFile(file){if(!state.selectedId||!file)return;const fd=new FormData();fd.append('file',file);const d=await fetch(`/api/project-management/pointage/import-suivi?affaire_id=${encodeURIComponent(state.selectedId)}`,{method:'POST',body:fd});const j=await d.json();if(!d.ok)throw new Error(j.detail||'Import suivi impossible');state.pointage=j;renderPointage();}
+async function exportSuivi(){if(!state.selectedId)return;const d=await pointageApi(`/api/project-management/pointage/export?affaire_id=${encodeURIComponent(state.selectedId)}`);const blob=new Blob([JSON.stringify(d,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`suivi-pointage-${state.selectedId}.json`;a.click();URL.revokeObjectURL(a.href);}
 async function init(){
   try{
     await loadAffaires('');
@@ -2125,7 +2397,17 @@ async function init(){
         localStorage.setItem('selectedAffaireId',found.affaire_id);
       }
       await loadBoard(initialId);
+      await loadPointage();
     }else{renderBoard();}
+    document.getElementById('btnImportPlanning').addEventListener('click',()=>document.getElementById('planningCsvInput').click());
+    document.getElementById('planningCsvInput').addEventListener('change',async e=>{if(e.target.files&&e.target.files[0]){await importPlanningFile(e.target.files[0]);e.target.value='';}});
+    document.getElementById('btnImportSuivi').addEventListener('click',()=>document.getElementById('suiviImportInput').click());
+    document.getElementById('suiviImportInput').addEventListener('change',async e=>{if(e.target.files&&e.target.files[0]){await importSuiviFile(e.target.files[0]);e.target.value='';}});
+    document.getElementById('btnExportSuivi').addEventListener('click',exportSuivi);
+    document.getElementById('btnExpandAll').addEventListener('click',async()=>{const lvls=[...new Set((state.pointage?.tasks||[]).map(x=>x.level||'Général'))];await savePointage({}, {expanded_levels:lvls});});
+    document.getElementById('btnCollapseAll').addEventListener('click',async()=>{await savePointage({}, {expanded_levels:[]});});
+    document.getElementById('cetMembersInput').addEventListener('change',async()=>{await savePointage({}, state.pointage?.workState||{});});
+    document.getElementById('reminderModalClose').addEventListener('click',hideReminderModal);
     document.getElementById('affaireSelect').addEventListener('change',async e=>{await loadBoard(e.target.value||'');});
     document.getElementById('companyMetric').addEventListener('change',()=>renderCompanyChart(state.board||{}));
   }catch(err){console.error(err);renderBoard();showPageError(err);}
@@ -2144,7 +2426,7 @@ def dashboard_html() -> str:
 :root{--line:#dfe5ef;--ink:#122033;--muted:#6e7a90;--accent:#ef8d00;--panel:#fff;--shadow:0 12px 34px rgba(18,32,51,.07)}
 *{box-sizing:border-box}body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:#f3f6fb;color:var(--ink)}
 .wrap{max-width:1320px;margin:22px auto;padding:0 16px}.top,.hero,.kpis,.chart{background:var(--panel);border:1px solid var(--line);border-radius:22px;box-shadow:var(--shadow)}
-.top{padding:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}.search,.select{height:44px;border:1px solid var(--line);border-radius:12px;padding:0 12px;min-width:280px}.search.locked,.select.locked{background:#eef2f8;color:#6e7a90;pointer-events:none}
+.top{padding:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}.search,.select{height:44px;border:1px solid var(--line);border-radius:12px;padding:0 12px;min-width:280px}
 .btn{height:44px;border-radius:12px;border:none;padding:0 14px;background:var(--accent);color:#fff;text-decoration:none;display:inline-flex;align-items:center;font-weight:800;cursor:pointer}
 .hero{padding:18px;margin-top:14px}.eyeb{font-size:12px;font-weight:800;letter-spacing:.12em;color:var(--accent);text-transform:uppercase}.title{font-size:36px;font-weight:900;margin:6px 0}.muted{color:var(--muted)}
 .kpis{padding:14px;margin-top:14px}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.k{border:1px solid var(--line);border-radius:14px;padding:14px;background:#fbfdff}.k .v{font-size:36px;font-weight:900;margin-top:6px}
@@ -2155,8 +2437,8 @@ def dashboard_html() -> str:
 <div class='wrap'>
   <div class='top'>
     <a class='btn' href='/'>Accueil</a>
-    <input id='searchInput' class='search locked' type='search' placeholder='Projet verrouillé (changer depuis Accueil)' readonly>
-    <select id='affaireSelect' class='select locked' disabled><option value=''>Projet verrouillé</option></select>
+    <input id='searchInput' class='search' type='search' placeholder='Rechercher une affaire'>
+    <select id='affaireSelect' class='select'><option value=''>Sélectionnez une affaire</option></select>
     <a id='financeBtn' class='btn' href='/finance'>Finances</a>
     <a id='pmBtn' class='btn' href='/gestion-projet'>Gestion de projet</a>
     <button id='exportBtn' class='btn' disabled>Exporter CSV</button>
@@ -2297,6 +2579,56 @@ def api_project_management_board(affaire_id: str = Query(default=""), affaire_na
     if not name:
         raise HTTPException(status_code=400, detail="affaire_id ou affaire_name requis")
     return metronome_service.build_project_board(name, start_date=start_date, end_date=end_date)
+
+
+@app.get("/api/project-management/pointage", response_class=JSONResponse)
+def api_project_management_pointage(affaire_id: str = Query(default=""), affaire_name: str = Query(default="")):
+    key = PointageService._project_key(affaire_id, affaire_name)
+    if key.endswith("name::"):
+        raise HTTPException(status_code=400, detail="affaire_id ou affaire_name requis")
+    return pointage_service.get_project_data(key)
+
+
+@app.post("/api/project-management/pointage/planning/import", response_class=JSONResponse)
+async def api_project_management_pointage_import_planning(file: UploadFile = File(...), affaire_id: str = Query(default=""), affaire_name: str = Query(default="")):
+    key = PointageService._project_key(affaire_id, affaire_name)
+    if key.endswith("name::"):
+        raise HTTPException(status_code=400, detail="affaire_id ou affaire_name requis")
+    raw = await file.read()
+    return pointage_service.import_planning(key, raw)
+
+
+@app.post("/api/project-management/pointage/save", response_class=JSONResponse)
+def api_project_management_pointage_save(
+    payload: Dict[str, Any] = Body(default={}),
+    affaire_id: str = Query(default=""),
+    affaire_name: str = Query(default=""),
+):
+    key = PointageService._project_key(affaire_id, affaire_name)
+    if key.endswith("name::"):
+        raise HTTPException(status_code=400, detail="affaire_id ou affaire_name requis")
+    pointage_patch = payload.get("pointage_patch", {}) if isinstance(payload, dict) else {}
+    work_state = payload.get("work_state", {}) if isinstance(payload, dict) else {}
+    if not isinstance(pointage_patch, dict):
+        raise HTTPException(status_code=400, detail="pointage_patch invalide")
+    return pointage_service.save_pointage(key, pointage_patch, work_state)
+
+
+@app.post("/api/project-management/pointage/import-suivi", response_class=JSONResponse)
+async def api_project_management_pointage_import_suivi(file: UploadFile = File(...), affaire_id: str = Query(default=""), affaire_name: str = Query(default="")):
+    key = PointageService._project_key(affaire_id, affaire_name)
+    if key.endswith("name::"):
+        raise HTTPException(status_code=400, detail="affaire_id ou affaire_name requis")
+    raw = await file.read()
+    return pointage_service.import_suivi(key, raw)
+
+
+@app.get("/api/project-management/pointage/export", response_class=JSONResponse)
+def api_project_management_pointage_export(affaire_id: str = Query(default=""), affaire_name: str = Query(default="")):
+    key = PointageService._project_key(affaire_id, affaire_name)
+    if key.endswith("name::"):
+        raise HTTPException(status_code=400, detail="affaire_id ou affaire_name requis")
+    return pointage_service.export_suivi(key)
 
 
 @app.get("/api/finance/affaire/{affaire_id}/export-csv")
