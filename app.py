@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import unicodedata
+import base64
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -34,6 +35,9 @@ BOOND_IMPUTATION_FILE = Path(os.getenv("BOOND_IMPUTATION_FILE", "boond_imputatio
 BOOND_API_BASE_URL = os.getenv("BOOND_API_BASE_URL", "").strip()
 BOOND_API_TOKEN = os.getenv("BOOND_API_TOKEN", "").strip()
 BOOND_API_CLIENT_ID = os.getenv("BOOND_API_CLIENT_ID", "").strip()
+BOOND_API_CLIENT_TOKEN = os.getenv("BOOND_API_CLIENT_TOKEN", "").strip()
+BOOND_API_CLIENT_KEY = os.getenv("BOOND_API_CLIENT_KEY", "").strip()
+BOOND_API_AUTH_MODE = os.getenv("BOOND_API_AUTH_MODE", "auto").strip().lower()
 
 METRONOME_FILES = {
     "projects": "Projects.csv",
@@ -2109,11 +2113,14 @@ class BoondImputationService:
         "de", "du", "des", "la", "le", "les", "a", "au", "aux", "et", "rep", "projet", "affaire",
     }
 
-    def __init__(self, source_file: Path, api_base_url: str = "", api_token: str = "", client_id: str = "") -> None:
+    def __init__(self, source_file: Path, api_base_url: str = "", api_token: str = "", client_id: str = "", client_token: str = "", client_key: str = "", auth_mode: str = "auto") -> None:
         self.source_file = Path(source_file)
         self.api_base_url = clean_text(api_base_url).rstrip("/")
         self.api_token = clean_text(api_token)
         self.client_id = clean_text(client_id)
+        self.client_token = clean_text(client_token)
+        self.client_key = clean_text(client_key)
+        self.auth_mode = clean_text(auth_mode).lower() or "auto"
 
     @staticmethod
     def _tokenize(value: str) -> set[str]:
@@ -2157,14 +2164,25 @@ class BoondImputationService:
         return {"projects": [], "mode": "file"}
 
     def _api_get_json(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-        if not self.api_base_url or not self.api_token:
-            raise HTTPException(status_code=400, detail="Configuration BOOND API incomplète: BOOND_API_BASE_URL et BOOND_API_TOKEN requis")
+        if not self.api_base_url:
+            raise HTTPException(status_code=400, detail="Configuration BOOND API incomplète: BOOND_API_BASE_URL requis")
+        bearer_enabled = self.auth_mode in {"auto", "bearer"} and bool(self.api_token)
+        xjwt_enabled = self.auth_mode in {"auto", "x_jwt_client"} and bool(self.client_token and self.client_key)
+        if not bearer_enabled and not xjwt_enabled:
+            raise HTTPException(status_code=400, detail="Configuration BOOND API incomplète: fournir BOOND_API_TOKEN (bearer) ou BOOND_API_CLIENT_TOKEN + BOOND_API_CLIENT_KEY (X-Jwt-Client)")
         query = urllib.parse.urlencode({k: v for k, v in (params or {}).items() if v not in (None, "")})
         url = f"{self.api_base_url}{path}"
         if query:
             url = f"{url}?{query}"
         req = urllib.request.Request(url)
-        req.add_header("Authorization", f"Bearer {self.api_token}")
+        if bearer_enabled:
+            req.add_header("Authorization", f"Bearer {self.api_token}")
+        if xjwt_enabled:
+            raw_pair = f"{self.client_token}:{self.client_key}"
+            req.add_header("X-Jwt-Client", raw_pair)
+            req.add_header("X-Jwt-Client-B64", base64.b64encode(raw_pair.encode("utf-8")).decode("ascii"))
+            req.add_header("X-Client-Token", self.client_token)
+            req.add_header("X-Client-Key", self.client_key)
         req.add_header("Accept", "application/json")
         if self.client_id:
             req.add_header("X-Client-Id", self.client_id)
@@ -2213,7 +2231,8 @@ class BoondImputationService:
         if not project_name:
             raise HTTPException(status_code=400, detail="Le paramètre project est requis")
 
-        source = self._load_from_api(project_name) if (self.api_base_url and self.api_token) else self._load_from_file()
+        has_api_auth = bool(self.api_token) or bool(self.client_token and self.client_key)
+        source = self._load_from_api(project_name) if (self.api_base_url and has_api_auth) else self._load_from_file()
         raw_projects = source.get("projects", [])
         best: Optional[Dict[str, Any]] = None
         best_score = 0
@@ -2282,6 +2301,9 @@ boond_imputation_service = BoondImputationService(
     api_base_url=BOOND_API_BASE_URL,
     api_token=BOOND_API_TOKEN,
     client_id=BOOND_API_CLIENT_ID,
+    client_token=BOOND_API_CLIENT_TOKEN,
+    client_key=BOOND_API_CLIENT_KEY,
+    auth_mode=BOOND_API_AUTH_MODE,
 )
 
 
@@ -2935,10 +2957,13 @@ def api_project_management_pointage_export(affaire_id: str = Query(default=""), 
 @app.get("/api/imputation/boond/config", response_class=JSONResponse)
 def api_imputation_boond_config():
     return {
-        "mode": "api" if (BOOND_API_BASE_URL and BOOND_API_TOKEN) else "file",
+        "mode": "api" if (BOOND_API_BASE_URL and (BOOND_API_TOKEN or (BOOND_API_CLIENT_TOKEN and BOOND_API_CLIENT_KEY))) else "file",
         "api_base_url_configured": bool(BOOND_API_BASE_URL),
         "api_token_configured": bool(BOOND_API_TOKEN),
         "api_client_id_configured": bool(BOOND_API_CLIENT_ID),
+        "api_client_token_configured": bool(BOOND_API_CLIENT_TOKEN),
+        "api_client_key_configured": bool(BOOND_API_CLIENT_KEY),
+        "api_auth_mode": BOOND_API_AUTH_MODE,
         "file_source": str(BOOND_IMPUTATION_FILE),
     }
 @app.get("/api/imputation/boond", response_class=JSONResponse)
