@@ -44,7 +44,7 @@ METRONOME_COLUMN_ALIASES = {
     "project_name_projects": ["Name", "Title"],
     "project_start": ["Start Date", "StartDate", "Start"],
     "project_end": ["End Date", "EndDate", "End"],
-    "entry_done_date": ["Done Date", "DoneDate", "Completed Date", "CompletedDate", "ClosedDate", "UpdatedAt"],
+    "entry_done_date": ["Done Date", "DoneDate", "Completed Date", "CompletedDate", "Completed/Declared End", "ClosedDate", "UpdatedAt"],
     "entry_category": ["Category/Name to display", "Category"],
     "entry_project_id": ["Project/ID", "Project"],
     "entry_meeting_id": ["Meeting/ID", "Meeting"],
@@ -691,6 +691,164 @@ class MetronomeService:
                 continue
         return None
 
+    @classmethod
+    def _parse_date_only(cls, value: str) -> Optional[date]:
+        dt = cls._parse_date_value(value)
+        return dt.date() if dt else None
+
+    @staticmethod
+    def _normalize_company(value: Any) -> str:
+        return clean_text(value) or "Non renseigné"
+
+    @staticmethod
+    def _normalize_zone(value: Any) -> str:
+        return clean_text(value) or "Général"
+
+    @staticmethod
+    def _normalize_lot(value: Any) -> str:
+        return clean_text(value) or "Sans lot"
+
+    @staticmethod
+    def _normalize_owner(value: Any) -> str:
+        return clean_text(value) or "Non attribué"
+
+    @staticmethod
+    def reminder_level(deadline: Optional[date], completed: bool, ref_date: date) -> Optional[int]:
+        if completed or not deadline:
+            return None
+        days_late = (ref_date - deadline).days
+        if days_late <= 0:
+            return None
+        return ((days_late - 1) // 7) + 1
+
+    def reminders_by_company(self, rem_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not rem_rows:
+            return []
+        grouped: Dict[str, int] = {}
+        logos: Dict[str, str] = {}
+        for row in rem_rows:
+            company = self._normalize_company(row.get("__company__"))
+            grouped[company] = grouped.get(company, 0) + 1
+            logos[company] = clean_text(row.get("__logo__"))
+        return [
+            {"name": name, "count": count, "logo": logos.get(name, "")}
+            for name, count in sorted(grouped.items(), key=lambda x: (-x[1], x[0]))
+        ]
+
+    def reminders_for_project(
+        self,
+        project_title: str,
+        ref_date: date,
+        max_level: int = 8,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        entries_override: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        source = entries_override or []
+        rows: List[Dict[str, Any]] = []
+        for e in source:
+            if not e.get("is_task"):
+                continue
+            created_date = self._parse_date_only(e.get("meeting_date", ""))
+            if start_date and created_date and created_date < start_date:
+                continue
+            if end_date and created_date and created_date > end_date:
+                continue
+            completed = bool(e.get("is_closed"))
+            done = e.get("done_date")
+            if done is not None:
+                completed = True
+            deadline = self._parse_date_only(e.get("deadline", ""))
+            lvl = self.reminder_level(deadline, completed, ref_date)
+            if lvl is None:
+                continue
+            if int(lvl) > max_level:
+                continue
+            company = self._normalize_company(e.get("company"))
+            zones = e.get("area_names") or ["Général"]
+            if not zones:
+                zones = ["Général"]
+            for zone in zones:
+                rows.append({
+                    **e,
+                    "__project__": project_title,
+                    "__deadline__": deadline,
+                    "__reminder__": int(lvl),
+                    "__zone__": self._normalize_zone(zone),
+                    "__company__": company,
+                    "__logo__": "",
+                })
+        rows.sort(key=lambda r: (-r["__reminder__"], r.get("__deadline__") or date.max))
+        return rows
+
+    def followups_for_project(
+        self,
+        project_title: str,
+        ref_date: date,
+        exclude_entry_ids: Optional[List[str]],
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        entries_override: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        source = entries_override or []
+        excluded = {clean_text(v) for v in (exclude_entry_ids or []) if clean_text(v)}
+        rows: List[Dict[str, Any]] = []
+        for e in source:
+            if not e.get("is_task"):
+                continue
+            eid = clean_text(e.get("entry_id"))
+            if eid and eid in excluded:
+                continue
+            created_date = self._parse_date_only(e.get("meeting_date", ""))
+            if start_date and created_date and created_date < start_date:
+                continue
+            if end_date and created_date and created_date > end_date:
+                continue
+            completed = bool(e.get("is_closed"))
+            done = e.get("done_date")
+            if done is not None:
+                completed = True
+            if completed:
+                continue
+            deadline = self._parse_date_only(e.get("deadline", ""))
+            if deadline and deadline < ref_date:
+                continue
+            company = self._normalize_company(e.get("company"))
+            zones = e.get("area_names") or ["Général"]
+            if not zones:
+                zones = ["Général"]
+            for zone in zones:
+                rows.append({
+                    **e,
+                    "__id__": eid,
+                    "__project__": project_title,
+                    "__deadline__": deadline,
+                    "__zone__": self._normalize_zone(zone),
+                    "__company__": company,
+                    "__deadline_sort__": deadline or date.max,
+                })
+        rows.sort(key=lambda r: (r.get("__deadline_sort__") or date.max, r.get("__company__") or ""))
+        return rows
+
+    def meeting_simple_kpis(self, entries_rows: List[Dict[str, Any]], ref_date: date) -> Dict[str, int]:
+        tasks = [e for e in entries_rows if e.get("is_task")]
+        memos = [e for e in entries_rows if e.get("is_memo")]
+        open_tasks = [e for e in tasks if not bool(e.get("is_closed"))]
+        closed_tasks = [e for e in tasks if bool(e.get("is_closed"))]
+        late_tasks = 0
+        for e in open_tasks:
+            dl = self._parse_date_only(e.get("deadline", ""))
+            if dl and dl < ref_date:
+                late_tasks += 1
+        return {
+            "total_entries": len(entries_rows),
+            "tasks_meeting": len(tasks),
+            "memos_meeting": len(memos),
+            "open_tasks": len(open_tasks),
+            "closed_tasks": len(closed_tasks),
+            "late_tasks": late_tasks,
+        }
+
 
     def _score_project_match(self, target_slug: str, target_tokens: set[str], candidate_name: str) -> int:
         candidate_slug = slugify(candidate_name)
@@ -814,7 +972,7 @@ class MetronomeService:
             })
         return resolved
 
-    def build_project_board(self, project_name: str) -> Dict[str, Any]:
+    def build_project_board(self, project_name: str, start_date: str = "", end_date: str = "") -> Dict[str, Any]:
         cache = self._ensure_loaded()
         t = cache.get("tables", {})
         projects = t.get("projects", [])
@@ -925,8 +1083,11 @@ class MetronomeService:
             if not use_row:
                 continue
 
-            status = clean_text(self._get_first_value(e, ["Status", "Deadline & Status for Tasks/Status Emoji + Text"])).lower()
-            is_closed = status in {"closed", "close", "done", "termine", "terminé"}
+            completed_flag = self._parse_bool(self._get_first_value(e, ["Completed/true/false", "Completed"]))
+            done_date = self._parse_date_only(self._get_first_value(e, METRONOME_COLUMN_ALIASES["entry_done_date"]))
+            is_closed = bool(completed_flag)
+            if done_date is not None:
+                is_closed = True
 
             entry_id = self._row_id(e)
             area_ids = self._split_multi_values(self._get_first_value(e, METRONOME_COLUMN_ALIASES["entry_area_ids"]))
@@ -943,7 +1104,6 @@ class MetronomeService:
             meeting = meetings.get(meeting_id, {})
             due = self._get_first_value(e, METRONOME_COLUMN_ALIASES["entry_deadline"])
             meeting_date = self._get_first_value(meeting, METRONOME_COLUMN_ALIASES["meeting_date"])
-            done_date = parse_date(self._get_first_value(e, METRONOME_COLUMN_ALIASES["entry_done_date"]))
             request_date = parse_date(due) or parse_date(meeting_date)
 
             category_label = self._get_first_value(e, METRONOME_COLUMN_ALIASES["entry_category"]) or ""
@@ -996,7 +1156,7 @@ class MetronomeService:
                 "request_date": request_date,
                 "done_date": done_date,
                 "is_closed": is_closed,
-                "company": clean_text(company_name_for_task) or clean_text(company.get("Name")) or clean_text(companies.get(pkg_company_id, {}).get("Name")) or "Non défini",
+                "company": clean_text(company_name_for_task) or clean_text(company.get("Name")) or clean_text(companies.get(pkg_company_id, {}).get("Name")) or "Non renseigné",
                 "raw": e,
             })
 
@@ -1009,11 +1169,11 @@ class MetronomeService:
                 overdue = bool(due_date and due_date < today)
 
             rows.append({
-                "zone": clean_text(area.get("Name")),
-                "lot": clean_text(pkg.get("Name")),
+                "zone": self._normalize_zone(area.get("Name")),
+                "lot": self._normalize_lot(pkg.get("Name")),
                 "sujet": clean_text(e.get("Title")),
-                "entreprise": clean_text(company.get("Name")),
-                "responsable": clean_text(user.get("Name")),
+                "entreprise": self._normalize_company(clean_text(company_name_for_task) or clean_text(company.get("Name"))),
+                "responsable": self._normalize_owner(user.get("Name")),
                 "statut": clean_text(e.get("Status")),
                 "date_echeance": due,
                 "reunion_origine": meeting_date,
@@ -1027,20 +1187,46 @@ class MetronomeService:
         def count_by(field: str) -> List[Dict[str, Any]]:
             agg: Dict[str, int] = {}
             for r in rows:
-                k = clean_text(r.get(field)) or "Non défini"
+                k = clean_text(r.get(field)) or "Non renseigné"
                 agg[k] = agg.get(k, 0) + 1
             return [{"label": k, "count": v} for k, v in sorted(agg.items(), key=lambda x: (-x[1], x[0]))]
 
         by_meeting = count_by("reunion_origine")
         by_company = count_by("entreprise")
-        due_rows = [r for r in rows if (parse_date(r.get("date_echeance", "")) or today) <= today]
-        due_by_company: Dict[str, int] = {}
-        for r in due_rows:
-            label = clean_text(r.get("entreprise")) or "Non défini"
-            due_by_company[label] = due_by_company.get(label, 0) + 1
-        due_by_company_list = [
-            {"label": k, "count": v} for k, v in sorted(due_by_company.items(), key=lambda x: (-x[1], x[0]))
-        ]
+
+        range_start = parse_date(start_date) if start_date else None
+        range_end = parse_date(end_date) if end_date else None
+        meeting_dates = [parse_date(e.get("meeting_date", "")) for e in selected_entries if parse_date(e.get("meeting_date", ""))]
+        meeting_ref_date = max(meeting_dates) if meeting_dates else None
+        reference_date = range_end or meeting_ref_date or today
+        reference_date_text = reference_date.strftime("%d/%m/%Y")
+
+        current_meeting_entry_ids: List[str] = []
+        if meeting_ref_date:
+            current_meeting_entry_ids = [
+                clean_text(e.get("entry_id"))
+                for e in selected_entries
+                if parse_date(e.get("meeting_date", "")) == meeting_ref_date and clean_text(e.get("entry_id"))
+            ]
+
+        rem_rows = self.reminders_for_project(
+            resolved_title or target,
+            reference_date,
+            max_level=8,
+            start_date=range_start,
+            end_date=range_end,
+            entries_override=selected_entries,
+        )
+        fol_rows = self.followups_for_project(
+            resolved_title or target,
+            reference_date,
+            exclude_entry_ids=current_meeting_entry_ids,
+            start_date=range_start,
+            end_date=range_end,
+            entries_override=selected_entries,
+        )
+        due_by_company_list = self.reminders_by_company(rem_rows)
+        meeting_simple_kpis = self.meeting_simple_kpis(selected_entries, reference_date)
 
         reminder_threshold_days = 14
         open_stats: Dict[str, Dict[str, int]] = {}
@@ -1199,7 +1385,7 @@ class MetronomeService:
 
         company_task_map: Dict[str, List[Dict[str, Any]]] = {}
         for t in fact_tasks:
-            company_task_map.setdefault(clean_text(t.get("company")) or "Non défini", []).append(t)
+            company_task_map.setdefault(clean_text(t.get("company")) or "Non renseigné", []).append(t)
 
         attendance_by_company: Dict[str, Dict[str, int]] = {}
         for m in fact_meetings:
@@ -1265,7 +1451,7 @@ class MetronomeService:
 
         package_map: Dict[str, List[Dict[str, Any]]] = {}
         for t in fact_tasks:
-            package_label = clean_text(t.get("package_label") or t.get("package_name") or "Non défini")
+            package_label = clean_text(t.get("package_label") or t.get("package_name") or "Non renseigné")
             package_map.setdefault(package_label, []).append(t)
         kpi_package_summary: List[Dict[str, Any]] = []
         for plabel, tasks in package_map.items():
@@ -1292,9 +1478,9 @@ class MetronomeService:
 
         zone_map: Dict[str, List[Dict[str, Any]]] = {}
         for t in fact_tasks:
-            names = t.get("area_names") or ["Non défini"]
+            names = t.get("area_names") or ["Non renseigné"]
             for z in names:
-                zone = clean_text(z) or "Non défini"
+                zone = clean_text(z) or "Non renseigné"
                 zone_map.setdefault(zone, []).append(t)
         kpi_zone_summary: List[Dict[str, Any]] = []
         for zname, tasks in zone_map.items():
@@ -1323,6 +1509,25 @@ class MetronomeService:
             "total_days": total_days,
         }
 
+        for task in fact_tasks:
+            dline = task.get("deadline")
+            deadline_dt = parse_date(dline) if dline else None
+            is_done = bool(task.get("is_closed"))
+            if is_done:
+                timeline_status = "clos"
+            elif deadline_dt and deadline_dt < reference_date:
+                timeline_status = "rappel"
+            else:
+                timeline_status = "a_suivre"
+            start_dt = task.get("request_date")
+            if not start_dt and deadline_dt:
+                start_dt = deadline_dt - timedelta(days=7)
+            task["timeline_status"] = timeline_status
+            task["timeline_start"] = start_dt.isoformat() if start_dt else ""
+            task["timeline_end"] = deadline_dt.isoformat() if deadline_dt else ""
+            task["company"] = self._normalize_company(task.get("company"))
+            task["owner_full_name"] = self._normalize_owner(task.get("owner_full_name"))
+
         reminder_log: List[Dict[str, Any]] = []
         rid = 0
         for task in fact_tasks:
@@ -1334,7 +1539,7 @@ class MetronomeService:
                     "meeting_id": task.get("meeting_id"),
                     "entry_id": task.get("entry_id"),
                     "company_id": task.get("package_company_id") or "",
-                    "company_name": task.get("company") or "Non défini",
+                    "company_name": task.get("company") or "Non renseigné",
                     "sent_at": "",
                     "sent_by_user_id": "",
                     "sent_by_user_name": "",
@@ -1352,7 +1557,7 @@ class MetronomeService:
                     "meeting_id": task.get("meeting_id"),
                     "entry_id": task.get("entry_id"),
                     "company_id": task.get("package_company_id") or "",
-                    "company_name": task.get("company") or "Non défini",
+                    "company_name": task.get("company") or "Non renseigné",
                     "sent_at": task.get("last_comment_date") or task.get("last_activity_at") or "",
                     "sent_by_user_id": task.get("last_comment_user_id") or "",
                     "sent_by_user_name": task.get("last_comment_user_name") or "",
@@ -1389,6 +1594,7 @@ class MetronomeService:
             "warning": warning,
             "warning_message": warning_message,
             "match_debug": match_debug,
+            "kpis_meeting_simple": meeting_simple_kpis,
             "kpis": {
                 "open_topics": len(rows),
                 "overdue_topics": sum(1 for r in rows if r.get("overdue")),
@@ -1397,20 +1603,17 @@ class MetronomeService:
                 "by_meeting": by_meeting,
             },
             "kpis_pilotage": {
-                "rappels_ouverts_a_date": len(due_rows),
-                "a_suivre_ouverts": len(rows),
-                "date_reference": today.isoformat(),
-                "rappels_cumules_par_entreprise": due_by_company_list,
+                "reminders_open_count": len(rem_rows),
+                "followups_open_count": len(fol_rows),
+                "reference_date": reference_date.isoformat(),
+                "reference_date_text": reference_date_text,
+                "reminders_by_company": due_by_company_list,
                 "open_tasks_by_company": open_tasks_by_company,
                 "average_processing_days_by_company": average_processing_days_by_company,
-                "reminder_threshold_weeks": round(reminder_threshold_days / 7),
-                "timeline_progress": {
-                    "start_date": project_start.isoformat() if project_start else "",
-                    "end_date": project_end.isoformat() if project_end else "",
-                    "elapsed_days": elapsed_days,
-                    "total_days": total_days,
-                    "progress_percent": progress_percent,
-                },
+                "rappels_ouverts_a_date": len(rem_rows),
+                "a_suivre_ouverts": len(fol_rows),
+                "date_reference": reference_date.isoformat(),
+                "rappels_cumules_par_entreprise": due_by_company_list,
             },
             "analytics": {
                 "fact_tasks": fact_tasks,
@@ -1730,7 +1933,7 @@ function setHtml(id,value){const el=document.getElementById(id);if(el) el.innerH
 function showLoading(on,label='Chargement des indicateurs projet…'){const w=document.getElementById('loadingWrap');if(!w) return;w.style.display=on?'block':'none';setText('loadingLabel',label);}
 function renderOpenTasksByCompany(b){const p=(b&&b.kpis_pilotage)||{};const analytics=(b&&b.analytics)||{};const companies=analytics.kpi_company_summary||[];const items=companies.length?companies.map(c=>({label:c.company,open_count:c.open_tasks,reminder_theoretical:c.reminder_count_theoretical||0,reminder_real:c.reminder_count_real||0})):((p.open_tasks_by_company||[]).map(x=>({label:x.label,open_count:x.open_count,reminder_theoretical:x.reminder_count||0,reminder_real:0})));const root=document.getElementById('companyOpenList');if(!items.length){root.innerHTML="<div class='small'>Aucune donnée</div>";return;}const seuil=p.reminder_threshold_weeks||2;root.innerHTML=items.map(x=>`<div class='pilot-row'><span class='name'>${esc(x.label)}</span><span><strong>${x.open_count}</strong> ouvertes · <strong>${x.reminder_theoretical}</strong> rappels théoriques (>${seuil} sem.) · <strong>${x.reminder_real}</strong> rappels réels</span></div>`).join('');}
 function renderAvgDelayByCompany(b){const p=(b&&b.kpis_pilotage)||{};const items=p.average_processing_days_by_company||[];const root=document.getElementById('companyDelayList');if(!items.length){root.innerHTML="<div class='small'>Pas assez de sujets clôturés pour calculer ce KPI.</div>";return;}root.innerHTML=items.map(x=>`<div class='pilot-row'><span class='name'>${esc(x.label)}</span><span><strong>${x.avg_days}</strong> jours (sur ${x.closed_count})</span></div>`).join('');}
-function renderPilotageKpis(b){const p=(b&&b.kpis_pilotage)||{};setText('kRappelsDate',String(p.rappels_ouverts_a_date||0));setText('kASuivre',String(p.a_suivre_ouverts||0));const t=p.timeline_progress||{};setText('kDateRef',`${t.progress_percent||0}%`);const root=document.getElementById('pilotByCompany');const items=p.rappels_cumules_par_entreprise||[];if(!items.length){root.innerHTML="<div class='small'>Aucune donnée</div>";}else{root.innerHTML=items.map(x=>`<div class='pilot-row'><span class='name'>${esc(x.label)}</span><strong>${x.count}</strong></div>`).join('');}const lbl=(t.start_date&&t.end_date)?`Période projet: ${t.start_date} → ${t.end_date} (${t.elapsed_days||0}/${t.total_days||0} jours)`:'Période projet non disponible';setHtml('pilotByCompany',`<div class='small' style='margin-bottom:8px'>${esc(lbl)}</div>`+root.innerHTML);}
+function renderPilotageKpis(b){const p=(b&&b.kpis_pilotage)||{};setText('kRappelsDate',String(p.reminders_open_count||p.rappels_ouverts_a_date||0));setText('kASuivre',String(p.followups_open_count||p.a_suivre_ouverts||0));setText('kDateRef',String(p.reference_date_text||p.reference_date||p.date_reference||'-'));const root=document.getElementById('pilotByCompany');const items=p.reminders_by_company||p.rappels_cumules_par_entreprise||[];if(!items.length){root.innerHTML="<div class='small'>Aucune donnée</div>";}else{root.innerHTML=items.map(x=>`<div class='pilot-row'><span class='name'>${esc(x.name||x.label)}</span><strong>${x.count}</strong></div>`).join('');}}
 function renderMatchDiagnostics(b){const md=(b&&b.match_debug)||{};const box=document.getElementById('matchBox');
   setHtml('matchSearchName',`<b>Projet recherché</b>${esc(md.searched_project_name||b?.project_name||'-')}`);
   setHtml('matchSearchSlug',`<b>Slug recherché</b><span class='mono'>${esc(md.searched_project_slug||'-')}</span>`);
@@ -1939,7 +2142,7 @@ def api_affaire_detail(affaire_id: str):
 
 
 @app.get("/api/project-management/board", response_class=JSONResponse)
-def api_project_management_board(affaire_id: str = Query(default=""), affaire_name: str = Query(default="")):
+def api_project_management_board(affaire_id: str = Query(default=""), affaire_name: str = Query(default=""), start_date: str = Query(default=""), end_date: str = Query(default="")):
     name = clean_text(affaire_name)
     if affaire_id and not name:
         cache = service.get_finance_cache()
@@ -1949,7 +2152,7 @@ def api_project_management_board(affaire_id: str = Query(default=""), affaire_na
         name = clean_text(item.get("display_name")) or clean_text(item.get("affaire"))
     if not name:
         raise HTTPException(status_code=400, detail="affaire_id ou affaire_name requis")
-    return metronome_service.build_project_board(name)
+    return metronome_service.build_project_board(name, start_date=start_date, end_date=end_date)
 
 
 @app.get("/api/finance/affaire/{affaire_id}/export-csv")
