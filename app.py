@@ -2123,6 +2123,19 @@ boond_imputation_service = BoondImputationService(
 )
 
 
+
+
+def parse_loose_bool(value: Any, default: bool = False) -> bool:
+    """Tolère les booléens transmis avec guillemets accidentels (ex: true")."""
+    if isinstance(value, bool):
+        return value
+    txt = clean_text(value).strip().strip('"').strip("'").lower()
+    if txt in {"true", "1", "yes", "oui", "on", "vrai"}:
+        return True
+    if txt in {"false", "0", "no", "non", "off", "faux", ""}:
+        return False
+    return default
+
 def pointage_finance_summary(affaire_id: str, commande_ht: float) -> Dict[str, float]:
     try:
         data = pointage_service.get_project_data(PointageService._project_key(affaire_id, ""))
@@ -2782,9 +2795,10 @@ def api_imputation_boond_config():
 
 
 @app.get("/api/imputation/boond", response_class=JSONResponse)
-def api_imputation_boond(project: str = Query(default=""), refresh: bool = Query(default=False)):
+def api_imputation_boond(project: str = Query(default=""), refresh: str = Query(default="false")):
     try:
-        return boond_imputation_service.get_imputations(project=project, refresh=refresh)
+        refresh_flag = parse_loose_bool(refresh, default=False)
+        return boond_imputation_service.get_imputations(project=project, refresh=refresh_flag)
     except BoondApiError as exc:
         return JSONResponse(
             status_code=exc.status_code,
