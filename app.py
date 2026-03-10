@@ -6,10 +6,6 @@ import logging
 import os
 import re
 import unicodedata
-import base64
-import urllib.error
-import urllib.parse
-import urllib.request
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from threading import Lock
@@ -18,6 +14,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import Body, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from openpyxl import load_workbook
+from clients.boond_client import BoondApiError, BoondClient
+from services.boond_imputation_service import BoondImputationService
 
 APP_TITLE = "Gestion Affaire - Finance"
 DEFAULT_WORKBOOK_PATH = r"\\192.168.10.100\03 - finances\10 - TABLEAU DE BORD\01 - TABLEAU ACTIVITEE\TABLEAU ACTIVITEE.xlsx"
@@ -31,13 +29,13 @@ EXPECTED_SCHEMA_VERSION = "finance_affaires_dataset_v4"
 TEMPO_LOGO_PATH = os.getenv("TEMPO_LOGO_PATH", r"\\192.168.10.100\02 - affaires\02.2 - SYNTHESE\ZZ - METRONOME\Content\T logo.png")
 METRONOME_BASE_PATH = os.getenv("METRONOME_BASE_PATH", r"\\192.168.10.100\02 - affaires\02.2 - SYNTHESE\ZZ - METRONOME")
 POINTAGE_STORE_FILE = Path(os.getenv("POINTAGE_STORE_FILE", "pointage_store.json"))
-BOOND_IMPUTATION_FILE = Path(os.getenv("BOOND_IMPUTATION_FILE", "boond_imputations.json"))
-BOOND_API_BASE_URL = os.getenv("BOOND_API_BASE_URL", "").strip()
-BOOND_API_TOKEN = os.getenv("BOOND_API_TOKEN", "").strip()
-BOOND_API_CLIENT_ID = os.getenv("BOOND_API_CLIENT_ID", "").strip()
-BOOND_API_CLIENT_TOKEN = os.getenv("BOOND_API_CLIENT_TOKEN", "").strip()
-BOOND_API_CLIENT_KEY = os.getenv("BOOND_API_CLIENT_KEY", "").strip()
-BOOND_API_AUTH_MODE = os.getenv("BOOND_API_AUTH_MODE", "auto").strip().lower()
+BOOND_API_SERVER = os.getenv("BOOND_API_SERVER", "").strip()
+BOOND_API_VERSION = os.getenv("BOOND_API_VERSION", "1.0").strip()
+BOOND_LOGIN = os.getenv("BOOND_LOGIN", "").strip()
+BOOND_PASSWORD = os.getenv("BOOND_PASSWORD", "")
+BOOND_TIMEOUT = int(os.getenv("BOOND_TIMEOUT", "30") or 30)
+BOOND_HOURS_PER_DAY = float(os.getenv("BOOND_HOURS_PER_DAY", "8") or 8)
+BOOND_IMPUTATION_CACHE_FILE = Path(os.getenv("BOOND_IMPUTATION_CACHE_FILE", "boond_imputations.json"))
 
 METRONOME_FILES = {
     "projects": "Projects.csv",
@@ -2108,202 +2106,20 @@ class PointageService:
         }
 
 
-class BoondImputationService:
-    _PROJECT_MATCH_IGNORED_TOKENS = {
-        "de", "du", "des", "la", "le", "les", "a", "au", "aux", "et", "rep", "projet", "affaire",
-    }
-
-    def __init__(self, source_file: Path, api_base_url: str = "", api_token: str = "", client_id: str = "", client_token: str = "", client_key: str = "", auth_mode: str = "auto") -> None:
-        self.source_file = Path(source_file)
-        self.api_base_url = clean_text(api_base_url).rstrip("/")
-        self.api_token = clean_text(api_token)
-        self.client_id = clean_text(client_id)
-        self.client_token = clean_text(client_token)
-        self.client_key = clean_text(client_key)
-        self.auth_mode = clean_text(auth_mode).lower() or "auto"
-
-    @staticmethod
-    def _tokenize(value: str) -> set[str]:
-        tokens = {t for t in slugify(value).split("-") if t}
-        return {t for t in tokens if t not in BoondImputationService._PROJECT_MATCH_IGNORED_TOKENS and len(t) > 1}
-
-    def _score_match(self, target: str, candidate: str) -> int:
-        target_slug = slugify(target)
-        candidate_slug = slugify(candidate)
-        if not target_slug or not candidate_slug:
-            return 0
-        if target_slug == candidate_slug:
-            return 100
-        score = 0
-        if target_slug in candidate_slug:
-            score = max(score, 82)
-        if candidate_slug in target_slug:
-            score = max(score, 80)
-        common = self._tokenize(target) & self._tokenize(candidate)
-        if common:
-            score = max(score, min(45 + len(common) * 12, 95))
-        return score
-
-    def _load_from_file(self) -> Dict[str, Any]:
-        if not self.source_file.exists():
-            return {"projects": []}
-        try:
-            payload = json.loads(self.source_file.read_text(encoding="utf-8"))
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"Source BOOND illisible : {exc}")
-
-        if isinstance(payload, list):
-            return {"projects": payload, "mode": "file"}
-        if isinstance(payload, dict):
-            projects = payload.get("projects")
-            if isinstance(projects, list):
-                return {"projects": projects, "mode": "file"}
-            imputations = payload.get("imputations")
-            if isinstance(imputations, list):
-                return {"projects": [{"project_id": "", "project_name": "", "imputations": imputations}], "mode": "file"}
-        return {"projects": [], "mode": "file"}
-
-    def _api_get_json(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-        if not self.api_base_url:
-            raise HTTPException(status_code=400, detail="Configuration BOOND API incomplète: BOOND_API_BASE_URL requis")
-        bearer_enabled = self.auth_mode in {"auto", "bearer"} and bool(self.api_token)
-        xjwt_enabled = self.auth_mode in {"auto", "x_jwt_client"} and bool(self.client_token and self.client_key)
-        if not bearer_enabled and not xjwt_enabled:
-            raise HTTPException(status_code=400, detail="Configuration BOOND API incomplète: fournir BOOND_API_TOKEN (bearer) ou BOOND_API_CLIENT_TOKEN + BOOND_API_CLIENT_KEY (X-Jwt-Client)")
-        query = urllib.parse.urlencode({k: v for k, v in (params or {}).items() if v not in (None, "")})
-        url = f"{self.api_base_url}{path}"
-        if query:
-            url = f"{url}?{query}"
-        req = urllib.request.Request(url)
-        if bearer_enabled:
-            req.add_header("Authorization", f"Bearer {self.api_token}")
-        if xjwt_enabled:
-            raw_pair = f"{self.client_token}:{self.client_key}"
-            req.add_header("X-Jwt-Client", raw_pair)
-            req.add_header("X-Jwt-Client-B64", base64.b64encode(raw_pair.encode("utf-8")).decode("ascii"))
-            req.add_header("X-Client-Token", self.client_token)
-            req.add_header("X-Client-Key", self.client_key)
-        req.add_header("Accept", "application/json")
-        if self.client_id:
-            req.add_header("X-Client-Id", self.client_id)
-        try:
-            with urllib.request.urlopen(req, timeout=20) as response:
-                body = response.read().decode("utf-8")
-            return json.loads(body)
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="ignore") if exc.fp else str(exc)
-            raise HTTPException(status_code=502, detail=f"Erreur BOOND API ({exc.code}): {detail[:300]}")
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"Erreur accès BOOND API: {exc}")
-
-    def _load_from_api(self, project_name: str) -> Dict[str, Any]:
-        project_payload = self._api_get_json("/projects", {"search": project_name, "limit": 100})
-        projects = project_payload.get("data") if isinstance(project_payload, dict) else project_payload
-        if not isinstance(projects, list):
-            projects = []
-
-        out_projects: List[Dict[str, Any]] = []
-        for p in projects:
-            pid = clean_text(p.get("id") or p.get("project_id"))
-            pname = clean_text(p.get("name") or p.get("title") or p.get("project_name"))
-            if not pid and not pname:
-                continue
-            imput_payload = self._api_get_json("/imputations", {"project_id": pid, "limit": 5000})
-            imputations = imput_payload.get("data") if isinstance(imput_payload, dict) else imput_payload
-            if not isinstance(imputations, list):
-                imputations = []
-            out_projects.append({"project_id": pid, "project_name": pname, "imputations": imputations})
-        return {"projects": out_projects, "mode": "api"}
-
-    @staticmethod
-    def _imputation_month(row: Dict[str, Any]) -> str:
-        month = clean_text(row.get("month"))
-        if re.match(r"^\d{4}-\d{2}$", month):
-            return month
-        for field in ("date", "work_date", "entry_date"):
-            dt = MetronomeService._parse_date_value(clean_text(row.get(field)))
-            if dt:
-                return f"{dt.year:04d}-{dt.month:02d}"
-        return ""
-
-    def boond_imputations_for_project(self, project_name: str) -> Dict[str, Any]:
-        project_name = clean_text(project_name)
-        if not project_name:
-            raise HTTPException(status_code=400, detail="Le paramètre project est requis")
-
-        has_api_auth = bool(self.api_token) or bool(self.client_token and self.client_key)
-        source = self._load_from_api(project_name) if (self.api_base_url and has_api_auth) else self._load_from_file()
-        raw_projects = source.get("projects", [])
-        best: Optional[Dict[str, Any]] = None
-        best_score = 0
-        for candidate in raw_projects:
-            candidate_name = clean_text(candidate.get("project_name") or candidate.get("name") or candidate.get("project"))
-            score = self._score_match(project_name, candidate_name)
-            if score > best_score:
-                best_score = score
-                best = candidate
-
-        if not best or best_score < 55:
-            raise HTTPException(status_code=404, detail=f"Projet BOOND introuvable pour : {project_name}")
-
-        rows = best.get("imputations", []) if isinstance(best.get("imputations"), list) else []
-        grouped: Dict[Tuple[str, str], Dict[str, Any]] = {}
-        for row in rows:
-            resource = clean_text(row.get("resource") or row.get("collaborateur") or row.get("user") or row.get("name"))
-            month = self._imputation_month(row)
-            days = clean_number(row.get("days") if row.get("days") is not None else row.get("jours"))
-            cost_day = clean_number(row.get("cost_day") if row.get("cost_day") is not None else row.get("cout_journalier"))
-            total_cost = clean_number(row.get("total_cost") if row.get("total_cost") is not None else row.get("cout_total"))
-            if not resource or not month:
-                continue
-            key = (resource, month)
-            rec = grouped.setdefault(key, {
-                "resource": resource,
-                "month": month,
-                "days": 0.0,
-                "cost_day": 0.0,
-                "total_cost": 0.0,
-            })
-            rec["days"] += days
-            rec["total_cost"] += total_cost
-            if cost_day > 0:
-                rec["cost_day"] = cost_day
-
-        imputations: List[Dict[str, Any]] = []
-        for rec in grouped.values():
-            days = round(clean_number(rec.get("days")), 2)
-            total_cost = round(clean_number(rec.get("total_cost")), 2)
-            cost_day = clean_number(rec.get("cost_day"))
-            if cost_day <= 0 and days > 0 and total_cost > 0:
-                cost_day = total_cost / days
-            imputations.append({
-                "resource": rec.get("resource", ""),
-                "month": rec.get("month", ""),
-                "days": days,
-                "cost_day": round(cost_day, 2),
-                "total_cost": total_cost,
-            })
-
-        imputations.sort(key=lambda x: (x.get("month", ""), x.get("resource", "")))
-        return {
-            "project": project_name,
-            "boond_project_id": clean_text(best.get("project_id") or best.get("id")),
-            "imputations": imputations,
-            "source": source.get("mode", "file"),
-        }
-
-
 service = FinanceService(WORKBOOK_PATH, SHEET_NAME, CACHE_FILE)
 metronome_service = MetronomeService(METRONOME_BASE_PATH)
 pointage_service = PointageService(POINTAGE_STORE_FILE)
+boond_client = BoondClient(
+    api_server=BOOND_API_SERVER,
+    api_version=BOOND_API_VERSION,
+    login=BOOND_LOGIN,
+    password=BOOND_PASSWORD,
+    timeout=BOOND_TIMEOUT,
+)
 boond_imputation_service = BoondImputationService(
-    BOOND_IMPUTATION_FILE,
-    api_base_url=BOOND_API_BASE_URL,
-    api_token=BOOND_API_TOKEN,
-    client_id=BOOND_API_CLIENT_ID,
-    client_token=BOOND_API_CLIENT_TOKEN,
-    client_key=BOOND_API_CLIENT_KEY,
-    auth_mode=BOOND_API_AUTH_MODE,
+    client=boond_client,
+    cache_file=BOOND_IMPUTATION_CACHE_FILE,
+    hours_per_day=BOOND_HOURS_PER_DAY,
 )
 
 
@@ -2957,18 +2773,23 @@ def api_project_management_pointage_export(affaire_id: str = Query(default=""), 
 @app.get("/api/imputation/boond/config", response_class=JSONResponse)
 def api_imputation_boond_config():
     return {
-        "mode": "api" if (BOOND_API_BASE_URL and (BOOND_API_TOKEN or (BOOND_API_CLIENT_TOKEN and BOOND_API_CLIENT_KEY))) else "file",
-        "api_base_url_configured": bool(BOOND_API_BASE_URL),
-        "api_token_configured": bool(BOOND_API_TOKEN),
-        "api_client_id_configured": bool(BOOND_API_CLIENT_ID),
-        "api_client_token_configured": bool(BOOND_API_CLIENT_TOKEN),
-        "api_client_key_configured": bool(BOOND_API_CLIENT_KEY),
-        "api_auth_mode": BOOND_API_AUTH_MODE,
-        "file_source": str(BOOND_IMPUTATION_FILE),
+        "api_server": BOOND_API_SERVER,
+        "api_version": BOOND_API_VERSION,
+        "auth_mode": "basic",
+        "cache_file": str(BOOND_IMPUTATION_CACHE_FILE),
+        "boond_enabled": bool(BOOND_API_SERVER and BOOND_LOGIN and BOOND_PASSWORD),
     }
+
+
 @app.get("/api/imputation/boond", response_class=JSONResponse)
-def api_imputation_boond(project: str = Query(default="")):
-    return boond_imputation_service.boond_imputations_for_project(project)
+def api_imputation_boond(project: str = Query(default=""), refresh: bool = Query(default=False)):
+    try:
+        return boond_imputation_service.get_imputations(project=project, refresh=refresh)
+    except BoondApiError as exc:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"ok": False, "reason": exc.reason, "message": exc.message},
+        )
 
 
 @app.get("/api/finance/affaire/{affaire_id}/export-csv")
