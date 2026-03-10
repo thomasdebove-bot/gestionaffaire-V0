@@ -713,6 +713,14 @@ class MetronomeService:
         return clean_text(value) or "Non attribué"
 
     @staticmethod
+    def _company_logo_from_row(row: Dict[str, Any]) -> str:
+        for key in ["Logo", "Logo URL", "Avatar", "Avatar URL", "Icon", "Icon URL"]:
+            val = clean_text(row.get(key))
+            if val:
+                return val
+        return ""
+
+    @staticmethod
     def reminder_level(deadline: Optional[date], completed: bool, ref_date: date) -> Optional[int]:
         if completed or not deadline:
             return None
@@ -743,6 +751,7 @@ class MetronomeService:
         start_date: Optional[date] = None,
         end_date: Optional[date] = None,
         entries_override: Optional[List[Dict[str, Any]]] = None,
+        company_logos: Optional[Dict[str, str]] = None,
     ) -> List[Dict[str, Any]]:
         source = entries_override or []
         rows: List[Dict[str, Any]] = []
@@ -776,7 +785,7 @@ class MetronomeService:
                     "__reminder__": int(lvl),
                     "__zone__": self._normalize_zone(zone),
                     "__company__": company,
-                    "__logo__": "",
+                    "__logo__": clean_text((company_logos or {}).get(company, "")),
                 })
         rows.sort(key=lambda r: (-r["__reminder__"], r.get("__deadline__") or date.max))
         return rows
@@ -789,6 +798,7 @@ class MetronomeService:
         start_date: Optional[date] = None,
         end_date: Optional[date] = None,
         entries_override: Optional[List[Dict[str, Any]]] = None,
+        company_logos: Optional[Dict[str, str]] = None,
     ) -> List[Dict[str, Any]]:
         source = entries_override or []
         excluded = {clean_text(v) for v in (exclude_entry_ids or []) if clean_text(v)}
@@ -990,6 +1000,12 @@ class MetronomeService:
         packages = self._idx(packages_rows)
         companies = self._idx(companies_rows)
         users = self._idx(users_rows)
+        company_logos_by_name: Dict[str, str] = {}
+        for comp in companies_rows:
+            cname = self._normalize_company(comp.get("Name"))
+            logo = self._company_logo_from_row(comp)
+            if cname not in company_logos_by_name or logo:
+                company_logos_by_name[cname] = logo
 
         comments_by_entry: Dict[str, List[str]] = {}
         memo_comments_by_entry: Dict[str, List[Dict[str, Any]]] = {}
@@ -1051,6 +1067,8 @@ class MetronomeService:
         today = datetime.now().date()
         rows_filtered_by_title = 0
         rows_filtered_by_id = 0
+        filter_mode = "id" if resolved_id else "title"
+        match_debug["filter_mode"] = filter_mode
 
         def parse_date(value: str) -> Optional[date]:
             txt = clean_text(value)
@@ -1070,14 +1088,12 @@ class MetronomeService:
             entry_project_id = self._get_first_value(e, METRONOME_COLUMN_ALIASES["entry_project_id"])
 
             use_row = False
-            if resolved_title and entry_project_title == resolved_title:
+            if resolved_id:
+                if entry_project_id == resolved_id:
+                    rows_filtered_by_id += 1
+                    use_row = True
+            elif resolved_title and entry_project_title == resolved_title:
                 rows_filtered_by_title += 1
-                use_row = True
-            elif not resolved_title and resolved_id and entry_project_id == resolved_id:
-                rows_filtered_by_id += 1
-                use_row = True
-            elif resolved_id and entry_project_id == resolved_id and rows_filtered_by_title == 0:
-                rows_filtered_by_id += 1
                 use_row = True
 
             if not use_row:
@@ -1216,6 +1232,7 @@ class MetronomeService:
             start_date=range_start,
             end_date=range_end,
             entries_override=selected_entries,
+            company_logos=company_logos_by_name,
         )
         fol_rows = self.followups_for_project(
             resolved_title or target,
@@ -1862,7 +1879,7 @@ def gestion_projet_html() -> str:
 .kpis{margin-top:12px;padding:14px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.k{border:1px solid var(--line);border-radius:14px;padding:14px;background:#fbfdff}.k .v{font-size:34px;font-weight:900;margin-top:6px}
 .section{margin-top:12px;padding:14px}.subgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:14px}table{width:100%;border-collapse:collapse}th,td{padding:10px 12px;border-bottom:1px solid var(--line);font-size:13px;text-align:left}th{background:#f7f9fc;font-size:12px;color:#5b6880;text-transform:uppercase}.small{color:var(--muted);font-size:13px}
 .bar{height:10px;background:#edf1f8;border-radius:999px;overflow:hidden}.fill{height:100%;background:#ef8d00}
-.loading-wrap{margin-top:8px;padding:8px 10px;border:1px solid #d8e0ee;border-radius:12px;background:#fff}.loading-label{font-size:12px;color:#5b6880;margin-bottom:6px;font-weight:700}.loading-track{height:8px;border-radius:999px;background:#eef2f8;overflow:hidden}.loading-bar{height:100%;width:35%;background:linear-gradient(90deg,#ef8d00,#ffd08a);animation:loadmove 1.2s infinite ease-in-out}@keyframes loadmove{0%{margin-left:-35%}100%{margin-left:100%}}.match-box{margin-top:10px;border:1px solid var(--line);border-radius:10px;padding:8px;background:#fffaf2}.match-box.ok{border-color:#49a66a;background:#f4fcf6}.match-box.warn{border-color:#ef8d00;background:#fff7ec}.match-title{font-weight:700;margin-bottom:4px;font-size:13px}.conf-badge{display:inline-block;margin-left:8px;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:800;background:#eef2f8;color:#3b4f6f}.match-grid{display:none}.match-item{font-size:12px;color:#30425f}.match-item b{display:block;color:#6e7a90;font-size:11px;margin-bottom:2px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-word}.pilot-box{margin-top:12px;border:1px solid #cfd8e8;border-radius:18px;padding:16px;background:#f8fbff}.pilot-title{font-size:34px;font-weight:900;margin:4px 0 10px}.pilot-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.pilot-card{background:#fff;border:1px solid #d8e0ee;border-radius:18px;padding:14px}.pilot-card .t{font-size:15px;color:#4b5d7a;font-weight:800}.pilot-card .v{font-size:44px;font-weight:900;margin-top:8px}.pilot-list{margin-top:12px;border:1px solid #d8e0ee;border-radius:18px;background:#fff;padding:8px 14px}.pilot-row{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px dashed #d8e0ee}.pilot-row:last-child{border-bottom:none}.pilot-row .name{font-weight:700}
+.loading-wrap{margin-top:8px;padding:8px 10px;border:1px solid #d8e0ee;border-radius:12px;background:#fff}.loading-label{font-size:12px;color:#5b6880;margin-bottom:6px;font-weight:700}.loading-track{height:8px;border-radius:999px;background:#eef2f8;overflow:hidden}.loading-bar{height:100%;width:35%;background:linear-gradient(90deg,#ef8d00,#ffd08a);animation:loadmove 1.2s infinite ease-in-out}@keyframes loadmove{0%{margin-left:-35%}100%{margin-left:100%}}.match-box{margin-top:10px;border:1px solid var(--line);border-radius:10px;padding:8px;background:#fffaf2}.match-box.ok{border-color:#49a66a;background:#f4fcf6}.match-box.warn{border-color:#ef8d00;background:#fff7ec}.match-title{font-weight:700;margin-bottom:4px;font-size:13px}.conf-badge{display:inline-block;margin-left:8px;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:800;background:#eef2f8;color:#3b4f6f}.match-grid{display:none}.match-item{font-size:12px;color:#30425f}.match-item b{display:block;color:#6e7a90;font-size:11px;margin-bottom:2px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-word}.pilot-box{margin-top:12px;border:1px solid #cfd8e8;border-radius:18px;padding:16px;background:#f8fbff}.pilot-title{font-size:34px;font-weight:900;margin:4px 0 10px}.pilot-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.pilot-card{background:#fff;border:1px solid #d8e0ee;border-radius:18px;padding:14px}.pilot-card .t{font-size:15px;color:#4b5d7a;font-weight:800}.pilot-card .v{font-size:44px;font-weight:900;margin-top:8px}.pilot-list{margin-top:12px;border:1px solid #d8e0ee;border-radius:18px;background:#fff;padding:8px 14px}.pilot-row{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px dashed #d8e0ee}.pilot-row:last-child{border-bottom:none}.pilot-row .name{font-weight:700}.company-cell{display:flex;align-items:center;gap:10px}.company-logo{width:28px;height:28px;border-radius:50%;border:1px solid #d8e0ee;background:#fff;object-fit:cover;display:inline-flex;align-items:center;justify-content:center;font-size:11px;color:#6e7a90;font-weight:800}.proj-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.progress-card{border:1px solid #d8e0ee;border-radius:14px;padding:12px;background:#fff}.progress-title{font-weight:800;margin-bottom:8px}.progress-row{display:grid;grid-template-columns:180px 1fr 70px;gap:10px;align-items:center;padding:6px 0}.progress-track{height:10px;border-radius:999px;background:#edf1f8;overflow:hidden}.progress-fill{height:100%;background:#1b6ef3}.curve-wrap{border:1px solid #d8e0ee;border-radius:14px;padding:12px;background:#fff}
 @media (max-width:980px){.grid{grid-template-columns:repeat(2,1fr)}.subgrid{grid-template-columns:1fr}}@media (max-width:640px){.grid{grid-template-columns:1fr}}
 </style></head>
 <body><div class='wrap'>
@@ -1913,6 +1930,14 @@ def gestion_projet_html() -> str:
   </div>
 
   <div class='section'>
+    <h3>Pilotage global projet</h3>
+    <div class='proj-grid'>
+      <div id='projectProgressBars' class='progress-card'><div class='small'>Aucune donnée</div></div>
+      <div id='projectProgressCurve' class='curve-wrap'><div class='small'>Aucune donnée</div></div>
+    </div>
+  </div>
+
+  <div class='section'>
     <h3>Tâches ouvertes par entreprise (avec rappels)</h3>
     <div id='companyOpenList' class='pilot-list'><div class='small'>Aucune donnée</div></div>
   </div>
@@ -1933,7 +1958,9 @@ function setHtml(id,value){const el=document.getElementById(id);if(el) el.innerH
 function showLoading(on,label='Chargement des indicateurs projet…'){const w=document.getElementById('loadingWrap');if(!w) return;w.style.display=on?'block':'none';setText('loadingLabel',label);}
 function renderOpenTasksByCompany(b){const p=(b&&b.kpis_pilotage)||{};const analytics=(b&&b.analytics)||{};const companies=analytics.kpi_company_summary||[];const items=companies.length?companies.map(c=>({label:c.company,open_count:c.open_tasks,reminder_theoretical:c.reminder_count_theoretical||0,reminder_real:c.reminder_count_real||0})):((p.open_tasks_by_company||[]).map(x=>({label:x.label,open_count:x.open_count,reminder_theoretical:x.reminder_count||0,reminder_real:0})));const root=document.getElementById('companyOpenList');if(!items.length){root.innerHTML="<div class='small'>Aucune donnée</div>";return;}const seuil=p.reminder_threshold_weeks||2;root.innerHTML=items.map(x=>`<div class='pilot-row'><span class='name'>${esc(x.label)}</span><span><strong>${x.open_count}</strong> ouvertes · <strong>${x.reminder_theoretical}</strong> rappels théoriques (>${seuil} sem.) · <strong>${x.reminder_real}</strong> rappels réels</span></div>`).join('');}
 function renderAvgDelayByCompany(b){const p=(b&&b.kpis_pilotage)||{};const items=p.average_processing_days_by_company||[];const root=document.getElementById('companyDelayList');if(!items.length){root.innerHTML="<div class='small'>Pas assez de sujets clôturés pour calculer ce KPI.</div>";return;}root.innerHTML=items.map(x=>`<div class='pilot-row'><span class='name'>${esc(x.label)}</span><span><strong>${x.avg_days}</strong> jours (sur ${x.closed_count})</span></div>`).join('');}
-function renderPilotageKpis(b){const p=(b&&b.kpis_pilotage)||{};setText('kRappelsDate',String(p.reminders_open_count||p.rappels_ouverts_a_date||0));setText('kASuivre',String(p.followups_open_count||p.a_suivre_ouverts||0));setText('kDateRef',String(p.reference_date_text||p.reference_date||p.date_reference||'-'));const root=document.getElementById('pilotByCompany');const items=p.reminders_by_company||p.rappels_cumules_par_entreprise||[];if(!items.length){root.innerHTML="<div class='small'>Aucune donnée</div>";}else{root.innerHTML=items.map(x=>`<div class='pilot-row'><span class='name'>${esc(x.name||x.label)}</span><strong>${x.count}</strong></div>`).join('');}}
+function initials(v){const parts=String(v||'').trim().split(/\s+/).slice(0,2);return parts.map(x=>x[0]||'').join('').toUpperCase()||'?';}
+function companyLogoHtml(item){const name=item.name||item.label||'';const logo=item.logo||'';if(logo){return `<img class='company-logo' src='${esc(logo)}' alt='${esc(name)}'>`;}return `<span class='company-logo'>${esc(initials(name))}</span>`;}
+function renderPilotageKpis(b){const p=(b&&b.kpis_pilotage)||{};setText('kRappelsDate',String(p.reminders_open_count||p.rappels_ouverts_a_date||0));setText('kASuivre',String(p.followups_open_count||p.a_suivre_ouverts||0));setText('kDateRef',String(p.reference_date_text||p.reference_date||p.date_reference||'-'));const root=document.getElementById('pilotByCompany');const items=p.reminders_by_company||p.rappels_cumules_par_entreprise||[];if(!items.length){root.innerHTML="<div class='small'>Aucune donnée</div>";}else{root.innerHTML=items.map(x=>`<div class='pilot-row'><span class='company-cell'>${companyLogoHtml(x)}<span class='name'>${esc(x.name||x.label)}</span></span><strong>${x.count}</strong></div>`).join('');}}
 function renderMatchDiagnostics(b){const md=(b&&b.match_debug)||{};const box=document.getElementById('matchBox');
   setHtml('matchSearchName',`<b>Projet recherché</b>${esc(md.searched_project_name||b?.project_name||'-')}`);
   setHtml('matchSearchSlug',`<b>Slug recherché</b><span class='mono'>${esc(md.searched_project_slug||'-')}</span>`);
@@ -1961,7 +1988,8 @@ function renderMatchDiagnostics(b){const md=(b&&b.match_debug)||{};const box=doc
   const loaded=b.loaded_at?` · Chargement: ${b.loaded_at}`:'';
   const warn=b&&b.warning?` · ${b.warning_message||'matching partiel'}`:'';setText('matchReason',`Projet recherché et projet matché résolus.${loaded}${warn}`);
 }
-function renderBoard(){const b=state.board;if(!b||!b.ok){setText('kOpen','0');setText('kLate','0');setText('kProject','Projet METRONOME non trouvé');setText('kLoad',b&&b.loaded_at?b.loaded_at:'-');renderPilotageKpis({});renderOpenTasksByCompany({});renderAvgDelayByCompany({});renderMatchDiagnostics(b||{});return;}const k=b.kpis||{};setText('kOpen',String(k.open_topics||0));setText('kLate',String(k.overdue_topics||0));setText('kProject',b.warning?`${b.project_name||'-'} (partiel)`: (b.project_name||'-'));setText('kLoad',b.loaded_at||'-');renderPilotageKpis(b);renderOpenTasksByCompany(b);renderAvgDelayByCompany(b);renderMatchDiagnostics(b);} 
+function renderProjectProgress(b){const a=(b&&b.analytics)||{};const p=(a.kpi_project_progress)||{};const sum=(a.kpi_project_summary)||{};const bars=document.getElementById('projectProgressBars');const curve=document.getElementById('projectProgressCurve');if(!bars||!curve)return;const cal=Number(p.calendar_progress_pct||0);const op=Number(p.operational_progress_pct||0);const gap=Number(p.progress_gap_pct||0);const health=Number(sum.project_health_score||0);const rows=[['Avancement calendrier',cal],['Avancement opérationnel',op],['Écart (op - cal)',Math.max(0,Math.min(100,gap+50))],['Santé projet',health]];bars.innerHTML=`<div class='progress-title'>Barres de progression</div>${rows.map(r=>`<div class='progress-row'><div>${esc(r[0])}</div><div class='progress-track'><div class='progress-fill' style='width:${Math.max(0,Math.min(100,Number(r[1]||0)))}%'></div></div><div><strong>${Number(r[1]||0).toFixed(1)}%</strong></div></div>`).join('')}`;const points=[{x:10,y:90},{x:40,y:90-cal*0.8},{x:70,y:90-op*0.8},{x:95,y:90-health*0.8}];curve.innerHTML=`<div class='progress-title'>Courbe synthétique projet</div><svg viewBox='0 0 100 100' style='width:100%;height:180px'><polyline points='${points.map(p=>`${p.x},${p.y}`).join(' ')}' fill='none' stroke='#ef8d00' stroke-width='2'/><line x1='10' y1='90' x2='95' y2='90' stroke='#ccd6e8' stroke-width='1'/>${points.map(p=>`<circle cx='${p.x}' cy='${p.y}' r='2.2' fill='#1b6ef3'/>`).join('')}<text x='10' y='98' font-size='4'>Démarrage</text><text x='38' y='98' font-size='4'>Calendrier</text><text x='66' y='98' font-size='4'>Opérationnel</text><text x='90' y='98' font-size='4'>Santé</text></svg><div class='small'>Période projet: ${esc(p.start_date||'-')} → ${esc(p.end_date||'-')} (${esc(String(p.elapsed_days||0))}/${esc(String(p.total_days||0))} jours)</div>`;}
+function renderBoard(){const b=state.board;if(!b||!b.ok){setText('kOpen','0');setText('kLate','0');setText('kProject','Projet METRONOME non trouvé');setText('kLoad',b&&b.loaded_at?b.loaded_at:'-');renderPilotageKpis({});renderProjectProgress({});renderOpenTasksByCompany({});renderAvgDelayByCompany({});renderMatchDiagnostics(b||{});return;}const k=b.kpis||{};setText('kOpen',String(k.open_topics||0));setText('kLate',String(k.overdue_topics||0));setText('kProject',b.warning?`${b.project_name||'-'} (partiel)`: (b.project_name||'-'));setText('kLoad',b.loaded_at||'-');renderPilotageKpis(b);renderProjectProgress(b);renderOpenTasksByCompany(b);renderAvgDelayByCompany(b);renderMatchDiagnostics(b);} 
 async function loadBoard(id){if(!id){state.selectedId='';state.board=null;renderBoard();return;}state.selectedId=id;localStorage.setItem('selectedAffaireId',id);document.getElementById('financeBtn').href=`/finance?affaire_id=${encodeURIComponent(id)}`;document.getElementById('dashboardBtn').href=`/dashboard?affaire_id=${encodeURIComponent(id)}`;showLoading(true);try{state.board=await api(`/api/project-management/board?affaire_id=${encodeURIComponent(id)}`);}catch(err){state.board=null;showPageError(err);}finally{showLoading(false);}renderBoard();}
 async function loadAffaires(search=''){const d=await api(`/api/finance/affaires?search=${encodeURIComponent(search)}`);state.affaires=d.items||[];const sel=document.getElementById('affaireSelect');sel.innerHTML=`<option value=''>Sélectionnez une affaire</option>`+state.affaires.map(x=>`<option value="${esc(x.affaire_id)}">${esc(x.display_name)}</option>`).join('');if(state.selectedId&&state.affaires.some(x=>x.affaire_id===state.selectedId)){sel.value=state.selectedId;}}
 function showPageError(err){const box=document.getElementById('matchBox');if(box){box.classList.remove('ok');box.classList.add('warn');}setText('matchStatus','⚠ Erreur de chargement');setText('matchReason','Erreur de chargement : '+((err&&err.message)?err.message:String(err||'Erreur inconnue')));}
