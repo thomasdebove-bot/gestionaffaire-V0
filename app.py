@@ -6,6 +6,9 @@ import logging
 import os
 import re
 import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from threading import Lock
@@ -28,6 +31,10 @@ TEMPO_LOGO_PATH = os.getenv("TEMPO_LOGO_PATH", r"\\192.168.10.100\02 - affaires\
 METRONOME_BASE_PATH = os.getenv("METRONOME_BASE_PATH", r"\\192.168.10.100\02 - affaires\02.2 - SYNTHESE\ZZ - METRONOME")
 POINTAGE_STORE_FILE = Path(os.getenv("POINTAGE_STORE_FILE", "pointage_store.json"))
 BOOND_IMPUTATION_FILE = Path(os.getenv("BOOND_IMPUTATION_FILE", "boond_imputations.json"))
+BOOND_API_BASE_URL = os.getenv("BOOND_API_BASE_URL", "").strip()
+BOOND_API_TOKEN = os.getenv("BOOND_API_TOKEN", "").strip()
+BOOND_API_CLIENT_ID = os.getenv("BOOND_API_CLIENT_ID", "").strip()
+
 METRONOME_FILES = {
     "projects": "Projects.csv",
     "entries": "Entries (Tasks & Memos).csv",
@@ -2102,8 +2109,11 @@ class BoondImputationService:
         "de", "du", "des", "la", "le", "les", "a", "au", "aux", "et", "rep", "projet", "affaire",
     }
 
-    def __init__(self, source_file: Path) -> None:
+    def __init__(self, source_file: Path, api_base_url: str = "", api_token: str = "", client_id: str = "") -> None:
         self.source_file = Path(source_file)
+        self.api_base_url = clean_text(api_base_url).rstrip("/")
+        self.api_token = clean_text(api_token)
+        self.client_id = clean_text(client_id)
 
     @staticmethod
     def _tokenize(value: str) -> set[str]:
@@ -2127,7 +2137,7 @@ class BoondImputationService:
             score = max(score, min(45 + len(common) * 12, 95))
         return score
 
-    def _load(self) -> Dict[str, Any]:
+    def _load_from_file(self) -> Dict[str, Any]:
         if not self.source_file.exists():
             return {"projects": []}
         try:
@@ -2136,15 +2146,56 @@ class BoondImputationService:
             raise HTTPException(status_code=500, detail=f"Source BOOND illisible : {exc}")
 
         if isinstance(payload, list):
-            return {"projects": payload}
+            return {"projects": payload, "mode": "file"}
         if isinstance(payload, dict):
             projects = payload.get("projects")
             if isinstance(projects, list):
-                return {"projects": projects}
+                return {"projects": projects, "mode": "file"}
             imputations = payload.get("imputations")
             if isinstance(imputations, list):
-                return {"projects": [{"project_id": "", "project_name": "", "imputations": imputations}]}
-        return {"projects": []}
+                return {"projects": [{"project_id": "", "project_name": "", "imputations": imputations}], "mode": "file"}
+        return {"projects": [], "mode": "file"}
+
+    def _api_get_json(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        if not self.api_base_url or not self.api_token:
+            raise HTTPException(status_code=400, detail="Configuration BOOND API incomplète: BOOND_API_BASE_URL et BOOND_API_TOKEN requis")
+        query = urllib.parse.urlencode({k: v for k, v in (params or {}).items() if v not in (None, "")})
+        url = f"{self.api_base_url}{path}"
+        if query:
+            url = f"{url}?{query}"
+        req = urllib.request.Request(url)
+        req.add_header("Authorization", f"Bearer {self.api_token}")
+        req.add_header("Accept", "application/json")
+        if self.client_id:
+            req.add_header("X-Client-Id", self.client_id)
+        try:
+            with urllib.request.urlopen(req, timeout=20) as response:
+                body = response.read().decode("utf-8")
+            return json.loads(body)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore") if exc.fp else str(exc)
+            raise HTTPException(status_code=502, detail=f"Erreur BOOND API ({exc.code}): {detail[:300]}")
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Erreur accès BOOND API: {exc}")
+
+    def _load_from_api(self, project_name: str) -> Dict[str, Any]:
+        project_payload = self._api_get_json("/projects", {"search": project_name, "limit": 100})
+        projects = project_payload.get("data") if isinstance(project_payload, dict) else project_payload
+        if not isinstance(projects, list):
+            projects = []
+
+        out_projects: List[Dict[str, Any]] = []
+        for p in projects:
+            pid = clean_text(p.get("id") or p.get("project_id"))
+            pname = clean_text(p.get("name") or p.get("title") or p.get("project_name"))
+            if not pid and not pname:
+                continue
+            imput_payload = self._api_get_json("/imputations", {"project_id": pid, "limit": 5000})
+            imputations = imput_payload.get("data") if isinstance(imput_payload, dict) else imput_payload
+            if not isinstance(imputations, list):
+                imputations = []
+            out_projects.append({"project_id": pid, "project_name": pname, "imputations": imputations})
+        return {"projects": out_projects, "mode": "api"}
 
     @staticmethod
     def _imputation_month(row: Dict[str, Any]) -> str:
@@ -2162,7 +2213,8 @@ class BoondImputationService:
         if not project_name:
             raise HTTPException(status_code=400, detail="Le paramètre project est requis")
 
-        raw_projects = self._load().get("projects", [])
+        source = self._load_from_api(project_name) if (self.api_base_url and self.api_token) else self._load_from_file()
+        raw_projects = source.get("projects", [])
         best: Optional[Dict[str, Any]] = None
         best_score = 0
         for candidate in raw_projects:
@@ -2218,13 +2270,19 @@ class BoondImputationService:
             "project": project_name,
             "boond_project_id": clean_text(best.get("project_id") or best.get("id")),
             "imputations": imputations,
+            "source": source.get("mode", "file"),
         }
 
 
 service = FinanceService(WORKBOOK_PATH, SHEET_NAME, CACHE_FILE)
 metronome_service = MetronomeService(METRONOME_BASE_PATH)
 pointage_service = PointageService(POINTAGE_STORE_FILE)
-boond_imputation_service = BoondImputationService(BOOND_IMPUTATION_FILE)
+boond_imputation_service = BoondImputationService(
+    BOOND_IMPUTATION_FILE,
+    api_base_url=BOOND_API_BASE_URL,
+    api_token=BOOND_API_TOKEN,
+    client_id=BOOND_API_CLIENT_ID,
+)
 
 
 def pointage_finance_summary(affaire_id: str, commande_ht: float) -> Dict[str, float]:
@@ -2753,6 +2811,8 @@ def finance_index():
             "affaire": "/api/finance/affaire/{affaire_id}",
             "affaire_export_csv": "/api/finance/affaire/{affaire_id}/export-csv",
             "health": "/health",
+            "imputation_boond": "/api/imputation/boond?project=...",
+            "imputation_boond_config": "/api/imputation/boond/config",
         },
     }
 
@@ -2870,6 +2930,17 @@ def api_project_management_pointage_export(affaire_id: str = Query(default=""), 
     return pointage_service.export_suivi(key)
 
 
+
+
+@app.get("/api/imputation/boond/config", response_class=JSONResponse)
+def api_imputation_boond_config():
+    return {
+        "mode": "api" if (BOOND_API_BASE_URL and BOOND_API_TOKEN) else "file",
+        "api_base_url_configured": bool(BOOND_API_BASE_URL),
+        "api_token_configured": bool(BOOND_API_TOKEN),
+        "api_client_id_configured": bool(BOOND_API_CLIENT_ID),
+        "file_source": str(BOOND_IMPUTATION_FILE),
+    }
 @app.get("/api/imputation/boond", response_class=JSONResponse)
 def api_imputation_boond(project: str = Query(default="")):
     return boond_imputation_service.boond_imputations_for_project(project)
