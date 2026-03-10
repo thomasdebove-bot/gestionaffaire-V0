@@ -44,6 +44,8 @@ METRONOME_COLUMN_ALIASES = {
     "project_name_projects": ["Name", "Title"],
     "project_start": ["Start Date", "StartDate", "Start"],
     "project_end": ["End Date", "EndDate", "End"],
+    "project_image": ["Image", "Image URL", "Project Image"],
+    "project_description": ["Description", "Start Sentence"],
     "entry_done_date": ["Done Date", "DoneDate", "Completed Date", "CompletedDate", "Completed/Declared End", "ClosedDate", "UpdatedAt"],
     "entry_category": ["Category/Name to display", "Category"],
     "entry_project_id": ["Project/ID", "Project"],
@@ -689,6 +691,22 @@ class MetronomeService:
                 return datetime.strptime(txt[:19], fmt)
             except Exception:
                 continue
+        simple = slugify(txt).replace("-", " ")
+        match = re.match(r"^(\d{1,2})\s+([a-z]+)\s+(\d{4})$", simple)
+        if match:
+            day = int(match.group(1))
+            month_txt = match.group(2)
+            year = int(match.group(3))
+            months = {
+                "janvier": 1, "fevrier": 2, "mars": 3, "avril": 4, "mai": 5, "juin": 6,
+                "juillet": 7, "aout": 8, "septembre": 9, "octobre": 10, "novembre": 11, "decembre": 12,
+            }
+            month = months.get(month_txt)
+            if month:
+                try:
+                    return datetime(year, month, day)
+                except Exception:
+                    return None
         return None
 
     @classmethod
@@ -1092,7 +1110,7 @@ class MetronomeService:
                     return datetime.strptime(txt[:10], fmt).date()
                 except Exception:
                     continue
-            return None
+            return self._parse_date_only(txt)
 
         selected_entries: List[Dict[str, Any]] = []
 
@@ -1617,8 +1635,19 @@ class MetronomeService:
         open_tasks_today = [t for t in fact_tasks if t.get("is_open")]
         overdue_tasks_today = [t for t in open_tasks_today if t.get("deadline") and parse_date(t.get("deadline")) and parse_date(t.get("deadline")) < today]
         reminder_tasks_today: List[Dict[str, Any]] = []
+        reminder_tasks_cumulative: List[Dict[str, Any]] = []
         followup_tasks_today: List[Dict[str, Any]] = []
         open_not_due_tasks_today: List[Dict[str, Any]] = []
+        for task in fact_tasks:
+            deadline_txt = task.get("deadline")
+            deadline_dt = parse_date(deadline_txt) if deadline_txt else None
+            if not deadline_dt:
+                continue
+            pivot_dt = task.get("done_date") if task.get("is_closed") and task.get("done_date") else today
+            delta_biz_cum = self._business_day_delta(deadline_dt, pivot_dt)
+            if delta_biz_cum < 0 and abs(delta_biz_cum) >= 7:
+                reminder_tasks_cumulative.append(task)
+
         for task in open_tasks_today:
             deadline_txt = task.get("deadline")
             deadline_dt = parse_date(deadline_txt) if deadline_txt else None
@@ -1680,10 +1709,14 @@ class MetronomeService:
 
         project_display_name = resolved_title or target
         project_id = resolved_id or self._row_id(project_info)
+        project_image = self._get_first_value(project_info, METRONOME_COLUMN_ALIASES["project_image"])
+        project_description = self._get_first_value(project_info, METRONOME_COLUMN_ALIASES["project_description"])
         return {
             "ok": True,
             "project_name": project_display_name,
             "project_id": project_id,
+            "project_image": project_image,
+            "project_description": project_description,
             "confidence_level": confidence_level,
             "warning": warning,
             "warning_message": warning_message,
@@ -1711,7 +1744,7 @@ class MetronomeService:
                 "project_company_views": {
                     "open": group_company(open_not_due_tasks_today),
                     "followup": group_company(followup_tasks_today),
-                    "reminder": group_company(reminder_tasks_today),
+                    "reminder": group_company(reminder_tasks_cumulative),
                 },
                 "reactivity_by_company": reactivity_by_company,
             },
@@ -1957,26 +1990,27 @@ def gestion_projet_html() -> str:
 :root{--line:#dfe5ef;--ink:#122033;--muted:#6e7a90;--accent:#ef8d00;--panel:#fff;--shadow:0 12px 34px rgba(18,32,51,.07)}
 *{box-sizing:border-box}body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:#f3f6fb;color:var(--ink)}
 .wrap{max-width:1480px;margin:20px auto;padding:0 16px}.top,.kpis,.section{background:var(--panel);border:1px solid var(--line);border-radius:22px;box-shadow:var(--shadow)}
-.top{padding:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}.search,.select{height:44px;border:1px solid var(--line);border-radius:12px;padding:0 12px;min-width:280px}
+.top{padding:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}.search,.select{height:44px;border:1px solid var(--line);border-radius:12px;padding:0 12px;min-width:280px}.search.locked,.select.locked{background:#eef2f8;color:#6e7a90;pointer-events:none}
 .btn{height:44px;border-radius:12px;border:none;padding:0 14px;background:var(--accent);color:#fff;text-decoration:none;display:inline-flex;align-items:center;font-weight:800;cursor:pointer}
 .kpis{margin-top:12px;padding:14px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.k{border:1px solid var(--line);border-radius:14px;padding:14px;background:#fbfdff}.k .v{font-size:34px;font-weight:900;margin-top:6px}
 .section{margin-top:12px;padding:14px}.subgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:14px}table{width:100%;border-collapse:collapse}th,td{padding:10px 12px;border-bottom:1px solid var(--line);font-size:13px;text-align:left}th{background:#f7f9fc;font-size:12px;color:#5b6880;text-transform:uppercase}.small{color:var(--muted);font-size:13px}
 .bar{height:10px;background:#edf1f8;border-radius:999px;overflow:hidden}.fill{height:100%;background:#ef8d00}
-.loading-wrap{margin-top:8px;padding:8px 10px;border:1px solid #d8e0ee;border-radius:12px;background:#fff}.loading-label{font-size:12px;color:#5b6880;margin-bottom:6px;font-weight:700}.loading-track{height:8px;border-radius:999px;background:#eef2f8;overflow:hidden}.loading-bar{height:100%;width:35%;background:linear-gradient(90deg,#ef8d00,#ffd08a);animation:loadmove 1.2s infinite ease-in-out}@keyframes loadmove{0%{margin-left:-35%}100%{margin-left:100%}}.match-box{margin-top:10px;border:1px solid var(--line);border-radius:10px;padding:8px;background:#fffaf2}.match-box.ok{border-color:#49a66a;background:#f4fcf6}.match-box.warn{border-color:#ef8d00;background:#fff7ec}.match-title{font-weight:700;margin-bottom:4px;font-size:13px}.conf-badge{display:inline-block;margin-left:8px;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:800;background:#eef2f8;color:#3b4f6f}.match-grid{display:none;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.match-box:hover .match-grid,.match-box:focus-within .match-grid{display:grid}.match-item{font-size:12px;color:#30425f}.match-item b{display:block;color:#6e7a90;font-size:11px;margin-bottom:2px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-word}.pilot-box{margin-top:12px;border:1px solid #cfd8e8;border-radius:18px;padding:16px;background:#f8fbff}.pilot-title{font-size:34px;font-weight:900;margin:4px 0 10px}.pilot-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.pilot-card{background:#fff;border:1px solid #d8e0ee;border-radius:18px;padding:14px}.pilot-card .t{font-size:15px;color:#4b5d7a;font-weight:800}.pilot-card .v{font-size:44px;font-weight:900;margin-top:8px}.pilot-list{margin-top:12px;border:1px solid #d8e0ee;border-radius:18px;background:#fff;padding:8px 14px}.pilot-row{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px dashed #d8e0ee}.pilot-row:last-child{border-bottom:none}.pilot-row .name{font-weight:700}.company-cell{display:flex;align-items:center;gap:10px}.company-logo{width:28px;height:28px;border-radius:50%;border:1px solid #d8e0ee;background:#fff;object-fit:cover;display:inline-flex;align-items:center;justify-content:center;font-size:11px;color:#6e7a90;font-weight:800}.proj-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.progress-card{border:1px solid #d8e0ee;border-radius:14px;padding:12px;background:#fff}.progress-title{font-weight:800;margin-bottom:8px}.progress-row{display:grid;grid-template-columns:180px 1fr 70px;gap:10px;align-items:center;padding:6px 0}.progress-track{height:10px;border-radius:999px;background:#edf1f8;overflow:hidden}.progress-fill{height:100%;background:#1b6ef3}.curve-wrap{border:1px solid #d8e0ee;border-radius:14px;padding:12px;background:#fff}.project-title{font-size:30px;font-weight:900;margin:4px 0 2px}.timeline-box{margin:10px 0;border:1px solid #d8e0ee;border-radius:14px;background:#fff;padding:10px}.timeline-row{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px}.timeline-track{height:12px;border-radius:999px;background:#edf1f8;overflow:hidden}.timeline-fill{height:100%;background:#1b6ef3}.timeline-fill.over{background:#d64545}.chart-controls{display:flex;gap:8px;align-items:center;margin-bottom:8px}.chart-select{height:36px;border:1px solid var(--line);border-radius:10px;padding:0 10px}.react-row{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px dashed #d8e0ee}.react-row:last-child{border-bottom:none}
+.loading-wrap{margin-top:8px;padding:8px 10px;border:1px solid #d8e0ee;border-radius:12px;background:#fff}.loading-label{font-size:12px;color:#5b6880;margin-bottom:6px;font-weight:700}.loading-track{height:8px;border-radius:999px;background:#eef2f8;overflow:hidden}.loading-bar{height:100%;width:35%;background:linear-gradient(90deg,#ef8d00,#ffd08a);animation:loadmove 1.2s infinite ease-in-out}@keyframes loadmove{0%{margin-left:-35%}100%{margin-left:100%}}.match-box{margin-top:10px;border:1px solid var(--line);border-radius:10px;padding:8px;background:#fffaf2}.match-box.ok{border-color:#49a66a;background:#f4fcf6}.match-box.warn{border-color:#ef8d00;background:#fff7ec}.match-title{font-weight:700;margin-bottom:4px;font-size:13px}.conf-badge{display:inline-block;margin-left:8px;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:800;background:#eef2f8;color:#3b4f6f}.match-grid{display:none;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.match-box:hover .match-grid,.match-box:focus-within .match-grid{display:grid}.match-item{font-size:12px;color:#30425f}.match-item b{display:block;color:#6e7a90;font-size:11px;margin-bottom:2px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-word}.pilot-box{margin-top:12px;border:1px solid #cfd8e8;border-radius:18px;padding:16px;background:#f8fbff}.pilot-title{font-size:34px;font-weight:900;margin:4px 0 10px}.pilot-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.pilot-card{background:#fff;border:1px solid #d8e0ee;border-radius:18px;padding:14px}.pilot-card .t{font-size:15px;color:#4b5d7a;font-weight:800}.pilot-card .v{font-size:44px;font-weight:900;margin-top:8px}.pilot-list{margin-top:12px;border:1px solid #d8e0ee;border-radius:18px;background:#fff;padding:8px 14px}.pilot-row{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px dashed #d8e0ee}.pilot-row:last-child{border-bottom:none}.pilot-row .name{font-weight:700}.company-cell{display:flex;align-items:center;gap:10px}.company-logo{width:28px;height:28px;border-radius:50%;border:1px solid #d8e0ee;background:#fff;object-fit:cover;display:inline-flex;align-items:center;justify-content:center;font-size:11px;color:#6e7a90;font-weight:800}.proj-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.progress-card{border:1px solid #d8e0ee;border-radius:14px;padding:12px;background:#fff}.progress-title{font-weight:800;margin-bottom:8px}.progress-row{display:grid;grid-template-columns:180px 1fr 70px;gap:10px;align-items:center;padding:6px 0}.progress-track{height:10px;border-radius:999px;background:#edf1f8;overflow:hidden}.progress-fill{height:100%;background:#1b6ef3}.curve-wrap{border:1px solid #d8e0ee;border-radius:14px;padding:12px;background:#fff}.project-head{display:flex;align-items:center;gap:14px}.project-cover{width:88px;height:64px;border-radius:10px;border:1px solid #d8e0ee;object-fit:cover;background:#fff}.project-title{font-size:30px;font-weight:900;margin:4px 0 2px}.project-desc{color:#6e7a90;margin:2px 0 0}.timeline-box{margin:10px 0;border:1px solid #d8e0ee;border-radius:14px;background:#fff;padding:10px}.timeline-row{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px}.timeline-track{height:12px;border-radius:999px;background:#edf1f8;overflow:hidden}.timeline-fill{height:100%;background:#1b6ef3}.timeline-fill.over{background:#d64545}.chart-controls{display:flex;gap:8px;align-items:center;margin-bottom:8px}.chart-select{height:36px;border:1px solid var(--line);border-radius:10px;padding:0 10px}.react-row{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px dashed #d8e0ee}.react-row:last-child{border-bottom:none}
 @media (max-width:980px){.grid{grid-template-columns:repeat(2,1fr)}.subgrid{grid-template-columns:1fr}}@media (max-width:640px){.grid{grid-template-columns:1fr}}
 </style></head>
 <body><div class='wrap'>
   <div class='top'>
     <a class='btn' href='/'>Accueil</a>
-    <input id='searchInput' class='search' type='search' placeholder='Rechercher une affaire'>
-    <select id='affaireSelect' class='select'><option value=''>Sélectionnez une affaire</option></select>
+    <input id='searchInput' class='search locked' type='search' placeholder='Projet verrouillé (changer depuis Accueil)' readonly>
+    <select id='affaireSelect' class='select locked' disabled><option value=''>Projet verrouillé</option></select>
     <a id='financeBtn' class='btn' href='/finance'>Finances</a>
     <a id='dashboardBtn' class='btn' href='/dashboard'>Tableau de bord</a>
+    <a class='btn' href='/'>Changer de projet</a>
   </div>
   <div id='loadingWrap' class='loading-wrap' style='display:none'><div id='loadingLabel' class='loading-label'>Chargement des indicateurs projet…</div><div class='loading-track'><div class='loading-bar'></div></div></div>
 
   <div class='kpis'>
-    <div id='projectTitle' class='project-title'>-</div>
+    <div class='project-head'><img id='projectImage' class='project-cover' alt='Projet' src=''><div><div id='projectTitle' class='project-title'>-</div><div id='projectDesc' class='project-desc'>-</div></div></div>
     <div id='timelineBox' class='timeline-box'><div class='small'>Période projet indisponible</div></div>
     <div class='grid'>
       <div class='k'><div class='small'>Sujets ouverts</div><div id='kOpen' class='v'>0</div></div>
@@ -2042,10 +2076,8 @@ function renderTable(rows){const root=document.getElementById('boardTable');if(!
 function setText(id,value){const el=document.getElementById(id);if(el) el.textContent=value;}
 function setHtml(id,value){const el=document.getElementById(id);if(el) el.innerHTML=value;}
 function showLoading(on,label='Chargement des indicateurs projet…'){const w=document.getElementById('loadingWrap');if(!w) return;w.style.display=on?'block':'none';setText('loadingLabel',label);}
-function renderProjectTimeline(b){const p=((b&&b.analytics)||{}).kpi_project_progress||{};const root=document.getElementById('timelineBox');if(!root)return;const total=Number(p.total_days||0);if(!total){root.innerHTML="<div class='small'>Période projet indisponible</div>";return;}const elapsed=Number(p.elapsed_days||0);const over=Number(p.overrun_days||0);const overPct=Number(p.overrun_pct||0);const basePct=Math.max(0,Math.min(100,Number(p.calendar_progress_pct||0)));const fillClass=(p.is_overrun?'timeline-fill over':'timeline-fill');const extra= p.is_overrun ? ` · Dépassement: <strong>${over} jours (${overPct}%)</strong>` : '';root.innerHTML=`<div class='timeline-row'><span><strong>Progression temporelle projet</strong></span><span>${esc(p.start_date||'-')} → ${esc(p.end_date||'-')}</span></div><div class='timeline-track'><div class='${fillClass}' style='width:${basePct}%'></div></div><div class='small' style='margin-top:6px'>${elapsed}/${total} jours consommés${extra}</div>`;}
-function renderCompanyChart(b){const p=(b&&b.kpis_pilotage)||{};const metricEl=document.getElementById('companyMetric');const metric=(metricEl&&metricEl.value)||'open';const views=p.project_company_views||{};const items=views[metric]||[];const root=document.getElementById('companyChartList');if(!root)return;if(!items.length){root.innerHTML="<div class='small'>Aucune donnée</div>";return;}const max=Math.max(1,...items.map(x=>Number(x.count||0)));root.innerHTML=items.map(x=>`<div style='margin:8px 0'><div class='pilot-row' style='border-bottom:none;padding:0 0 4px'><span class='company-cell'>${companyLogoHtml(x)}<span class='name'>${esc(x.name)}</span></span><strong>${x.count}</strong></div><div class='bar'><div class='fill' style='width:${(Number(x.count||0)/max)*100}%'></div></div></div>`).join('');}
-function renderReactivity(b){const p=(b&&b.kpis_pilotage)||{};const items=p.reactivity_by_company||[];const root=document.getElementById('reactivityList');if(!root)return;if(!items.length){root.innerHTML="<div class='small'>Pas assez de tâches clôturées avec échéance.</div>";return;}root.innerHTML=items.map(x=>`<div class='react-row'><span class='company-cell'>${companyLogoHtml(x)}<span class='name'>${esc(x.name)}</span></span><span><strong>${x.avg_gap_days}</strong> j (sur ${x.closed_count})</span></div>`).join('');}
-function initials(v){const parts=String(v||'').trim().split(/\s+/).slice(0,2);return parts.map(x=>x[0]||'').join('').toUpperCase()||'?';}
+function fmtDateFr(v){if(!v)return '-';const d=new Date(v+'T00:00:00');if(Number.isNaN(d.getTime()))return v;return d.toLocaleDateString('fr-FR',{day:'numeric',month:'long',year:'numeric'});}function renderProjectTimeline(b){const p=((b&&b.analytics)||{}).kpi_project_progress||{};const root=document.getElementById('timelineBox');if(!root)return;const total=Number(p.total_days||0);if(!total){root.innerHTML="<div class='small'>Période projet indisponible</div>";return;}const elapsedRaw=Number(p.elapsed_days_raw||0);const over=Number(p.overrun_days||0);const overPct=Number(p.overrun_pct||0);const basePct=Math.max(0,Math.min(100,Number(p.calendar_progress_pct||0)));const fillClass=(p.is_overrun?'timeline-fill over':'timeline-fill');const extra= p.is_overrun ? ` · Dépassement: <strong>${over} jours (${overPct}%)</strong>` : '';root.innerHTML=`<div class='timeline-row'><span><strong>Progression temporelle</strong></span><span><strong>${basePct.toFixed(0)}%</strong></span></div><div class='timeline-track'><div class='${fillClass}' style='width:${basePct}%'></div></div><div class='small' style='margin-top:6px'>Commencé le ${esc(fmtDateFr(p.start_date))}.<br>Fin prévue le ${esc(fmtDateFr(p.end_date))}.<br>${elapsedRaw}/${total} jours écoulés${extra}</div>`;}function renderCompanyChart(b){const p=(b&&b.kpis_pilotage)||{};const metricEl=document.getElementById('companyMetric');const metric=(metricEl&&metricEl.value)||'open';const views=p.project_company_views||{};const items=views[metric]||[];const root=document.getElementById('companyChartList');if(!root)return;if(!items.length){root.innerHTML="<div class='small'>Aucune donnée</div>";return;}const max=Math.max(1,...items.map(x=>Number(x.count||0)));root.innerHTML=items.map(x=>`<div style='margin:8px 0'><div class='pilot-row' style='border-bottom:none;padding:0 0 4px'><span class='company-cell'>${companyLogoHtml(x)}<span class='name'>${esc(x.name)}</span></span><strong>${x.count}</strong></div><div class='bar'><div class='fill' style='width:${(Number(x.count||0)/max)*100}%'></div></div></div>`).join('');}
+function renderReactivity(b){const p=(b&&b.kpis_pilotage)||{};const items=p.reactivity_by_company||[];const root=document.getElementById('reactivityList');if(!root)return;if(!items.length){root.innerHTML="<div class='small'>Pas assez de tâches clôturées avec échéance.</div>";return;}const vals=items.map(x=>Math.abs(Number(x.avg_gap_days||0)));const max=Math.max(1,...vals);root.innerHTML=`<div style='display:flex;align-items:flex-end;gap:14px;height:240px;padding:10px 0'>${items.map(x=>{const v=Number(x.avg_gap_days||0);const h=Math.max(8,(Math.abs(v)/max)*190);const color=v>0?'#d64545':'#1b6ef3';return `<div style='flex:1;min-width:60px;text-align:center'><div title='${esc(x.name)}: ${v} j' style='margin:0 auto;width:34px;height:${h}px;background:${color};border-radius:8px 8px 0 0'></div><div style='font-size:11px;margin-top:6px;font-weight:700'>${esc(x.name)}</div><div style='font-size:11px;color:#6e7a90'>${v} j</div></div>`;}).join('')}</div>`;}function initials(v){const parts=String(v||'').trim().split(/\s+/).slice(0,2);return parts.map(x=>x[0]||'').join('').toUpperCase()||'?';}
 function companyLogoHtml(item){const name=item.name||item.label||'';const logo=item.logo||'';if(logo){return `<img class='company-logo' src='${esc(logo)}' alt='${esc(name)}'>`;}return `<span class='company-logo'>${esc(initials(name))}</span>`;}
 function renderPilotageKpis(b){const p=(b&&b.kpis_pilotage)||{};setText('kRappelsDate',String(p.reminders_open_count||p.rappels_ouverts_a_date||0));setText('kASuivre',String(p.followups_open_count||p.a_suivre_ouverts||0));setText('kDateRef',String(p.reference_date_text||p.reference_date||p.date_reference||'-'));const root=document.getElementById('pilotByCompany');const items=p.reminders_by_company||p.rappels_cumules_par_entreprise||[];if(!items.length){root.innerHTML="<div class='small'>Aucune donnée</div>";}else{root.innerHTML=items.map(x=>`<div class='pilot-row'><span class='company-cell'>${companyLogoHtml(x)}<span class='name'>${esc(x.name||x.label)}</span></span><strong>${x.count}</strong></div>`).join('');}}
 function renderMatchDiagnostics(b){const md=(b&&b.match_debug)||{};const box=document.getElementById('matchBox');
@@ -2073,7 +2105,7 @@ function renderMatchDiagnostics(b){const md=(b&&b.match_debug)||{};const box=doc
   const loaded=b.loaded_at?` · Chargement: ${b.loaded_at}`:'';
   const warn=b&&b.warning?` · ${b.warning_message||'matching partiel'}`:'';setText('matchReason',`Projet recherché et projet matché résolus.${loaded}${warn}`);
 }
-function renderBoard(){const b=state.board;if(!b||!b.ok){setText('kOpen','0');setText('kLate','0');setText('kTopRappels','0');setText('kTopASuivre','0');setText('projectTitle','Projet METRONOME non trouvé');renderPilotageKpis({});renderProjectTimeline({});renderCompanyChart({});renderReactivity({});renderMatchDiagnostics(b||{});return;}const k=b.kpis||{};const p=b.kpis_pilotage||{};setText('kOpen',String(k.open_topics||0));setText('kLate',String(k.overdue_topics||0));setText('kTopRappels',String(p.reminders_open_count||0));setText('kTopASuivre',String(p.followups_open_count||0));setText('projectTitle',b.warning?`${b.project_name||'-'} (partiel)`: (b.project_name||'-'));renderPilotageKpis(b);renderProjectTimeline(b);renderCompanyChart(b);renderReactivity(b);renderMatchDiagnostics(b);} 
+function renderBoard(){const b=state.board;if(!b||!b.ok){setText('kOpen','0');setText('kLate','0');setText('kTopRappels','0');setText('kTopASuivre','0');setText('projectTitle','Projet METRONOME non trouvé');setText('projectDesc','-');const im=document.getElementById('projectImage');if(im){im.src='';im.style.display='none';}renderPilotageKpis({});renderProjectTimeline({});renderCompanyChart({});renderReactivity({});renderMatchDiagnostics(b||{});return;}const k=b.kpis||{};const p=b.kpis_pilotage||{};setText('kOpen',String(k.open_topics||0));setText('kLate',String(k.overdue_topics||0));setText('kTopRappels',String(p.reminders_open_count||0));setText('kTopASuivre',String(p.followups_open_count||0));setText('projectTitle',b.warning?`${b.project_name||'-'} (partiel)`: (b.project_name||'-'));setText('projectDesc',b.project_description||'');const im=document.getElementById('projectImage');if(im){if(b.project_image){im.src=b.project_image;im.style.display='block';}else{im.src='';im.style.display='none';}}renderPilotageKpis(b);renderProjectTimeline(b);renderCompanyChart(b);renderReactivity(b);renderMatchDiagnostics(b);} 
 async function loadBoard(id){if(!id){state.selectedId='';state.board=null;renderBoard();return;}state.selectedId=id;localStorage.setItem('selectedAffaireId',id);document.getElementById('financeBtn').href=`/finance?affaire_id=${encodeURIComponent(id)}`;document.getElementById('dashboardBtn').href=`/dashboard?affaire_id=${encodeURIComponent(id)}`;showLoading(true);try{state.board=await api(`/api/project-management/board?affaire_id=${encodeURIComponent(id)}`);}catch(err){state.board=null;showPageError(err);}finally{showLoading(false);}renderBoard();}
 async function loadAffaires(search=''){const d=await api(`/api/finance/affaires?search=${encodeURIComponent(search)}`);state.affaires=d.items||[];const sel=document.getElementById('affaireSelect');sel.innerHTML=`<option value=''>Sélectionnez une affaire</option>`+state.affaires.map(x=>`<option value="${esc(x.affaire_id)}">${esc(x.display_name)}</option>`).join('');if(state.selectedId&&state.affaires.some(x=>x.affaire_id===state.selectedId)){sel.value=state.selectedId;}}
 function showPageError(err){const box=document.getElementById('matchBox');if(box){box.classList.remove('ok');box.classList.add('warn');}setText('matchStatus','⚠ Erreur de chargement');setText('matchReason','Erreur de chargement : '+((err&&err.message)?err.message:String(err||'Erreur inconnue')));}
@@ -2094,7 +2126,6 @@ async function init(){
       }
       await loadBoard(initialId);
     }else{renderBoard();}
-    document.getElementById('searchInput').addEventListener('input',async e=>{await loadAffaires(e.target.value||'');});
     document.getElementById('affaireSelect').addEventListener('change',async e=>{await loadBoard(e.target.value||'');});
     document.getElementById('companyMetric').addEventListener('change',()=>renderCompanyChart(state.board||{}));
   }catch(err){console.error(err);renderBoard();showPageError(err);}
@@ -2113,7 +2144,7 @@ def dashboard_html() -> str:
 :root{--line:#dfe5ef;--ink:#122033;--muted:#6e7a90;--accent:#ef8d00;--panel:#fff;--shadow:0 12px 34px rgba(18,32,51,.07)}
 *{box-sizing:border-box}body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:#f3f6fb;color:var(--ink)}
 .wrap{max-width:1320px;margin:22px auto;padding:0 16px}.top,.hero,.kpis,.chart{background:var(--panel);border:1px solid var(--line);border-radius:22px;box-shadow:var(--shadow)}
-.top{padding:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}.search,.select{height:44px;border:1px solid var(--line);border-radius:12px;padding:0 12px;min-width:280px}
+.top{padding:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}.search,.select{height:44px;border:1px solid var(--line);border-radius:12px;padding:0 12px;min-width:280px}.search.locked,.select.locked{background:#eef2f8;color:#6e7a90;pointer-events:none}
 .btn{height:44px;border-radius:12px;border:none;padding:0 14px;background:var(--accent);color:#fff;text-decoration:none;display:inline-flex;align-items:center;font-weight:800;cursor:pointer}
 .hero{padding:18px;margin-top:14px}.eyeb{font-size:12px;font-weight:800;letter-spacing:.12em;color:var(--accent);text-transform:uppercase}.title{font-size:36px;font-weight:900;margin:6px 0}.muted{color:var(--muted)}
 .kpis{padding:14px;margin-top:14px}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.k{border:1px solid var(--line);border-radius:14px;padding:14px;background:#fbfdff}.k .v{font-size:36px;font-weight:900;margin-top:6px}
@@ -2124,8 +2155,8 @@ def dashboard_html() -> str:
 <div class='wrap'>
   <div class='top'>
     <a class='btn' href='/'>Accueil</a>
-    <input id='searchInput' class='search' type='search' placeholder='Rechercher une affaire'>
-    <select id='affaireSelect' class='select'><option value=''>Sélectionnez une affaire</option></select>
+    <input id='searchInput' class='search locked' type='search' placeholder='Projet verrouillé (changer depuis Accueil)' readonly>
+    <select id='affaireSelect' class='select locked' disabled><option value=''>Projet verrouillé</option></select>
     <a id='financeBtn' class='btn' href='/finance'>Finances</a>
     <a id='pmBtn' class='btn' href='/gestion-projet'>Gestion de projet</a>
     <button id='exportBtn' class='btn' disabled>Exporter CSV</button>
