@@ -6,7 +6,7 @@ import logging
 import os
 import re
 import unicodedata
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List, Optional
@@ -35,6 +35,7 @@ METRONOME_FILES = {
     "companies": "Companies.csv",
     "users": "Users.csv",
     "comments": "Comments.csv",
+    "documents": "Documents.csv",
 }
 
 METRONOME_COLUMN_ALIASES = {
@@ -44,6 +45,33 @@ METRONOME_COLUMN_ALIASES = {
     "project_start": ["Start Date", "StartDate", "Start"],
     "project_end": ["End Date", "EndDate", "End"],
     "entry_done_date": ["Done Date", "DoneDate", "Completed Date", "CompletedDate", "ClosedDate", "UpdatedAt"],
+    "entry_category": ["Category/Name to display", "Category"],
+    "entry_project_id": ["Project/ID", "Project"],
+    "entry_meeting_id": ["Meeting/ID", "Meeting"],
+    "entry_owner_id": ["Owner for Tasks/ID", "Owner/ID", "Assignee"],
+    "entry_created_by_id": ["Created by/ID", "CreatedBy/ID"],
+    "entry_comment_editor_id": ["Comment for Tasks/Editor ID"],
+    "entry_completed_reporting_user_id": ["Completed/Reporting User ID"],
+    "entry_completed_declared_user_id": ["Completed/Declared User ID"],
+    "entry_task_package_id": ["Packages/ID for Task", "Package", "Package/ID"],
+    "entry_memo_package_ids": ["Packages/IDs for Memos"],
+    "entry_area_ids": ["Areas/IDs", "Area/ID", "Area"],
+    "entry_deadline": ["Deadline & Status for Tasks/Deadline", "DueDate"],
+    "entry_status_id": ["Deadline & Status for Tasks/Status ID", "Status ID"],
+    "entry_status_label": ["Deadline & Status for Tasks/Status Emoji + Text", "Status"],
+    "entry_comment_text": ["Comment for Tasks/Text", "Comment", "Text"],
+    "comment_memo_id": ["Memo/ID", "Entry", "Memo"],
+    "comment_owner_id": ["Owner/ID", "Owner"],
+    "comment_date": ["Date", "Created", "Creation Date", "UpdatedAt"],
+    "meeting_date": ["Date", "Meeting Date"],
+    "meeting_attending_company_ids": ["Companies/Attending IDs"],
+    "meeting_missing_company_ids": ["Companies/Missing IDs", "Companies/Missing Calculated IDs (dev)"],
+    "package_company_id": ["Company/ID", "Company"],
+    "package_project_id": ["Project/ID"],
+    "area_project_id": ["Project/ID"],
+    "company_collaborators_ids": ["Collaborators/IDs"],
+    "documents_project_id": ["Project/ID"],
+    "documents_meeting_id": ["Meeting/ID"],
 }
 
 MONTHS = [
@@ -599,10 +627,14 @@ class MetronomeService:
             return dict(self._cache)
 
     @staticmethod
+    def _row_id(row: Dict[str, str]) -> str:
+        return clean_text(row.get("🔒 Row ID") or row.get("Row ID") or row.get("ID"))
+
+    @staticmethod
     def _idx(rows: List[Dict[str, str]], key: str = "ID") -> Dict[str, Dict[str, str]]:
         out: Dict[str, Dict[str, str]] = {}
         for r in rows:
-            k = clean_text(r.get(key))
+            k = clean_text(r.get(key)) or MetronomeService._row_id(r)
             if k:
                 out[k] = r
         return out
@@ -620,6 +652,45 @@ class MetronomeService:
             if val:
                 return val
         return ""
+    @staticmethod
+    def _is_empty_value(value: Any) -> bool:
+        txt = clean_text(value).lower()
+        return txt in {"", "none", "null", "nan", "na"}
+
+    def _split_multi_values(self, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            parts = value
+        else:
+            parts = str(value).split(",")
+        out: List[str] = []
+        for p in parts:
+            t = clean_text(p)
+            if self._is_empty_value(t):
+                continue
+            out.append(t)
+        return out
+
+    @staticmethod
+    def _parse_bool(value: Any) -> bool:
+        txt = clean_text(value).lower()
+        return txt in {"true", "1", "yes", "oui", "vrai"}
+
+    @staticmethod
+    def _parse_date_value(value: str) -> Optional[datetime]:
+        txt = clean_text(value)
+        if not txt:
+            return None
+        for fmt in (
+            "%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d", "%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%d/%m/%y %H:%M:%S"
+        ):
+            try:
+                return datetime.strptime(txt[:19], fmt)
+            except Exception:
+                continue
+        return None
+
 
     def _score_project_match(self, target_slug: str, target_tokens: set[str], candidate_name: str) -> int:
         candidate_slug = slugify(candidate_name)
@@ -725,18 +796,38 @@ class MetronomeService:
         t = cache.get("tables", {})
         projects = t.get("projects", [])
         entries = t.get("entries", [])
-        meetings = self._idx(t.get("meetings", []))
-        areas = self._idx(t.get("areas", []))
-        packages = self._idx(t.get("packages", []))
-        companies = self._idx(t.get("companies", []))
-        users = self._idx(t.get("users", []))
+        meetings_rows = t.get("meetings", [])
+        areas_rows = t.get("areas", [])
+        packages_rows = t.get("packages", [])
+        companies_rows = t.get("companies", [])
+        users_rows = t.get("users", [])
+        comments_rows = t.get("comments", [])
+        documents_rows = t.get("documents", [])
+
+        meetings = self._idx(meetings_rows)
+        areas = self._idx(areas_rows)
+        packages = self._idx(packages_rows)
+        companies = self._idx(companies_rows)
+        users = self._idx(users_rows)
 
         comments_by_entry: Dict[str, List[str]] = {}
-        for c in t.get("comments", []):
-            eid = clean_text(c.get("Entry"))
-            txt = clean_text(c.get("Comment") or c.get("Entry") or c.get("Text"))
+        memo_comments_by_entry: Dict[str, List[Dict[str, Any]]] = {}
+        for c in comments_rows:
+            eid = self._get_first_value(c, METRONOME_COLUMN_ALIASES["comment_memo_id"])
+            txt = clean_text(c.get("Comment") or c.get("Text") or c.get("Entry"))
+            owner_id = self._get_first_value(c, METRONOME_COLUMN_ALIASES["comment_owner_id"])
+            created_at = self._parse_date_value(self._get_first_value(c, METRONOME_COLUMN_ALIASES["comment_date"]))
             if eid and txt:
                 comments_by_entry.setdefault(eid, []).append(txt)
+                memo_comments_by_entry.setdefault(eid, []).append({
+                    "comment_id": self._row_id(c),
+                    "memo_id": eid,
+                    "text": txt,
+                    "owner_user_id": owner_id,
+                    "owner_user_name": clean_text(users.get(owner_id, {}).get("Name")),
+                    "created_at": created_at.isoformat(sep=" ") if created_at else "",
+                    "raw": c,
+                })
 
         target = clean_text(project_name)
         match_debug = self._resolve_project(projects, entries, target)
@@ -792,7 +883,7 @@ class MetronomeService:
 
         for e in entries:
             entry_project_title = self._get_first_value(e, METRONOME_COLUMN_ALIASES["project_title_entries"])
-            entry_project_id = clean_text(e.get("Project"))
+            entry_project_id = self._get_first_value(e, METRONOME_COLUMN_ALIASES["entry_project_id"])
 
             use_row = False
             if resolved_title and entry_project_title == resolved_title:
@@ -808,25 +899,79 @@ class MetronomeService:
             if not use_row:
                 continue
 
-            status = clean_text(e.get("Status")).lower()
+            status = clean_text(self._get_first_value(e, ["Status", "Deadline & Status for Tasks/Status Emoji + Text"])).lower()
             is_closed = status in {"closed", "close", "done", "termine", "terminé"}
 
-            entry_id = clean_text(e.get("ID"))
-            area = areas.get(clean_text(e.get("Area")), {})
-            pkg = packages.get(clean_text(e.get("Package")), {})
-            company = companies.get(clean_text(e.get("Company")), {})
-            user = users.get(clean_text(e.get("Assignee")), {})
-            meeting = meetings.get(clean_text(e.get("Meeting")), {})
-            due = clean_text(e.get("DueDate"))
-            meeting_date = clean_text(meeting.get("Date"))
+            entry_id = self._row_id(e)
+            area_ids = self._split_multi_values(self._get_first_value(e, METRONOME_COLUMN_ALIASES["entry_area_ids"]))
+            area = areas.get(area_ids[0], {}) if area_ids else {}
+            task_pkg_id = self._get_first_value(e, METRONOME_COLUMN_ALIASES["entry_task_package_id"])
+            pkg = packages.get(task_pkg_id, {})
+            company_id_for_task = self._get_first_value(e, ["Company/ID"])
+            company_name_for_task = self._get_first_value(e, ["Company/Name for Tasks", "Company"])
+            pkg_company_id = self._get_first_value(pkg, METRONOME_COLUMN_ALIASES["package_company_id"])
+            company = companies.get(company_id_for_task) or companies.get(pkg_company_id) or {}
+            owner_user_id = self._get_first_value(e, METRONOME_COLUMN_ALIASES["entry_owner_id"])
+            user = users.get(owner_user_id, {})
+            meeting_id = self._get_first_value(e, METRONOME_COLUMN_ALIASES["entry_meeting_id"])
+            meeting = meetings.get(meeting_id, {})
+            due = self._get_first_value(e, METRONOME_COLUMN_ALIASES["entry_deadline"])
+            meeting_date = self._get_first_value(meeting, METRONOME_COLUMN_ALIASES["meeting_date"])
             done_date = parse_date(self._get_first_value(e, METRONOME_COLUMN_ALIASES["entry_done_date"]))
             request_date = parse_date(due) or parse_date(meeting_date)
 
+            category_label = self._get_first_value(e, METRONOME_COLUMN_ALIASES["entry_category"]) or ""
+            category_slug = slugify(category_label)
+            is_task_entry = "tache" in category_slug
+            is_memo_entry = "memo" in category_slug
+            memo_package_ids = self._split_multi_values(self._get_first_value(e, METRONOME_COLUMN_ALIASES["entry_memo_package_ids"]))
+            memo_package_labels = [clean_text(packages.get(pid, {}).get("Name")) for pid in memo_package_ids if pid]
+            created_by_id = self._get_first_value(e, METRONOME_COLUMN_ALIASES["entry_created_by_id"])
+            last_comment_text = clean_text(self._get_first_value(e, METRONOME_COLUMN_ALIASES["entry_comment_text"]))
+            memo_comments = memo_comments_by_entry.get(entry_id, []) if is_memo_entry else []
             selected_entries.append({
-                "company": clean_text(company.get("Name")) or "Non défini",
+                "entry_id": entry_id,
+                "entry_title": clean_text(e.get("Title")),
+                "entry_type": "Tâche" if is_task_entry else ("Mémo" if is_memo_entry else category_label),
+                "is_task": is_task_entry,
+                "is_memo": is_memo_entry,
+                "project_id": resolved_id,
+                "project_title": resolved_title,
+                "project_archived": self._parse_bool(self._get_first_value(project_info, ["Archived", "Is Archived"])),
+                "meeting_id": meeting_id,
+                "meeting_date": meeting_date,
+                "created_by_user_id": created_by_id,
+                "created_by_user_name": clean_text(users.get(created_by_id, {}).get("Name")),
+                "package_id": task_pkg_id,
+                "package_name": clean_text(pkg.get("Name")),
+                "package_label": clean_text(pkg.get("Label") or pkg.get("Name")),
+                "package_company_id": pkg_company_id,
+                "package_company_name": clean_text(companies.get(pkg_company_id, {}).get("Name")),
+                "memo_package_ids": memo_package_ids,
+                "memo_package_labels": [x for x in memo_package_labels if x],
+                "area_ids": area_ids,
+                "area_names": [clean_text(areas.get(aid, {}).get("Name")) for aid in area_ids if aid],
+                "owner_user_id": owner_user_id,
+                "owner_full_name": clean_text(user.get("Name")),
+                "deadline": due,
+                "status_id": self._get_first_value(e, METRONOME_COLUMN_ALIASES["entry_status_id"]),
+                "status_label": self._get_first_value(e, METRONOME_COLUMN_ALIASES["entry_status_label"]),
+                "completed": is_closed,
+                "completed_state": "closed" if is_closed else "open",
+                "completed_at": done_date.isoformat() if done_date else "",
+                "first_response_at": memo_comments[0]["created_at"] if memo_comments else "",
+                "last_activity_at": (memo_comments[-1]["created_at"] if memo_comments else (done_date.isoformat() if done_date else "")),
+                "last_comment_text": last_comment_text or (memo_comments[-1]["text"] if memo_comments else ""),
+                "last_comment_date": memo_comments[-1]["created_at"] if memo_comments else "",
+                "last_comment_user_id": memo_comments[-1]["owner_user_id"] if memo_comments else self._get_first_value(e, METRONOME_COLUMN_ALIASES["entry_comment_editor_id"]),
+                "last_comment_user_name": memo_comments[-1]["owner_user_name"] if memo_comments else clean_text(users.get(self._get_first_value(e, METRONOME_COLUMN_ALIASES["entry_comment_editor_id"]), {}).get("Name")),
+                "memo_comments_count": len(memo_comments),
+                "memo_comments": memo_comments,
                 "request_date": request_date,
                 "done_date": done_date,
                 "is_closed": is_closed,
+                "company": clean_text(company_name_for_task) or clean_text(company.get("Name")) or clean_text(companies.get(pkg_company_id, {}).get("Name")) or "Non défini",
+                "raw": e,
             })
 
             if is_closed:
@@ -898,16 +1043,248 @@ class MetronomeService:
             for k, v in sorted(delay_stats.items(), key=lambda x: (x[1]["sum_days"] / max(1, x[1]["count"]), x[0]))
         ]
 
-        project_start = parse_date(self._get_first_value(project_info, METRONOME_COLUMN_ALIASES["project_start"]))
-        project_end = parse_date(self._get_first_value(project_info, METRONOME_COLUMN_ALIASES["project_end"]))
-        if project_start and project_end and project_end > project_start:
-            total_days = (project_end - project_start).days
-            elapsed_days = min(max((today - project_start).days, 0), total_days)
-            progress_percent = round((elapsed_days / total_days) * 100, 1)
-        else:
-            total_days = 0
-            elapsed_days = 0
-            progress_percent = 0.0
+        fact_tasks: List[Dict[str, Any]] = []
+        fact_memos: List[Dict[str, Any]] = []
+        fact_memo_comments: List[Dict[str, Any]] = []
+        fact_interactions: List[Dict[str, Any]] = []
+
+        for item in selected_entries:
+            deadline_dt = parse_date(item.get("deadline", ""))
+            request_dt = item.get("request_date")
+            done_dt = item.get("done_date")
+            first_response_dt = self._parse_date_value(item.get("first_response_at", "")) if item.get("first_response_at") else None
+            last_activity_dt = self._parse_date_value(item.get("last_activity_at", "")) if item.get("last_activity_at") else None
+
+            if item.get("is_task"):
+                is_open = not item.get("is_closed")
+                is_closed = bool(item.get("is_closed"))
+                is_late = bool(is_open and deadline_dt and deadline_dt < today)
+                is_closed_late = bool(is_closed and deadline_dt and done_dt and done_dt > deadline_dt)
+                is_closed_on_time = bool(is_closed and deadline_dt and done_dt and done_dt <= deadline_dt)
+                days_late = max(0, (today - deadline_dt).days) if is_late and deadline_dt else 0
+                age_days = max(0, (today - request_dt).days) if is_open and request_dt else 0
+                days_to_deadline = (deadline_dt - today).days if deadline_dt else None
+                response_delay_days = (first_response_dt.date() - request_dt).days if (first_response_dt and request_dt) else None
+
+                fact_tasks.append({
+                    **item,
+                    "is_open": is_open,
+                    "is_closed": is_closed,
+                    "is_late": is_late,
+                    "is_closed_late": is_closed_late,
+                    "is_closed_on_time": is_closed_on_time,
+                    "days_late": days_late,
+                    "age_days": age_days,
+                    "days_to_deadline": days_to_deadline,
+                    "response_delay_days": response_delay_days,
+                    "completed_at": item.get("completed_at") or (done_dt.isoformat() if done_dt else ""),
+                    "first_response_at": item.get("first_response_at") or (first_response_dt.isoformat(sep=" ") if first_response_dt else ""),
+                    "last_activity_at": item.get("last_activity_at") or (last_activity_dt.isoformat(sep=" ") if last_activity_dt else ""),
+                })
+            elif item.get("is_memo"):
+                fact_memos.append(item)
+                for c in item.get("memo_comments", []):
+                    fact_memo_comments.append(c)
+
+            fact_interactions.append({
+                "entry_id": item.get("entry_id"),
+                "project_id": item.get("project_id"),
+                "meeting_id": item.get("meeting_id"),
+                "company": item.get("company"),
+                "event_type": "entry_closed" if item.get("is_closed") else "entry_open",
+                "event_at": item.get("completed_at") or item.get("meeting_date") or "",
+            })
+
+        meetings_count = 0
+        fact_meetings: List[Dict[str, Any]] = []
+        meeting_rows_for_project = []
+        for m in meetings_rows:
+            pid = self._get_first_value(m, ["Project/ID", "Project"])
+            if resolved_id and pid and pid != resolved_id:
+                continue
+            meeting_rows_for_project.append(m)
+
+        for m in meeting_rows_for_project:
+            mid = self._row_id(m)
+            mdate = self._get_first_value(m, METRONOME_COLUMN_ALIASES["meeting_date"])
+            meetings_count += 1
+            fact_meetings.append({
+                "meeting_id": mid,
+                "meeting_date": mdate,
+                "project_id": resolved_id,
+                "project_title": resolved_title,
+                "attending_company_ids": self._split_multi_values(self._get_first_value(m, METRONOME_COLUMN_ALIASES["meeting_attending_company_ids"])),
+                "missing_company_ids": self._split_multi_values(self._get_first_value(m, METRONOME_COLUMN_ALIASES["meeting_missing_company_ids"])),
+                "raw": m,
+            })
+
+        documents_for_project = [
+            d for d in documents_rows
+            if (not resolved_id or self._get_first_value(d, METRONOME_COLUMN_ALIASES["documents_project_id"]) in {"", resolved_id})
+        ]
+
+        total_tasks = len(fact_tasks)
+        closed_tasks = sum(1 for t in fact_tasks if t.get("is_closed"))
+        open_tasks = sum(1 for t in fact_tasks if t.get("is_open"))
+        late_open_tasks = sum(1 for t in fact_tasks if t.get("is_late"))
+        closure_rate = round((closed_tasks / total_tasks) * 100, 1) if total_tasks else 0.0
+        on_time_closed = sum(1 for t in fact_tasks if t.get("is_closed_on_time"))
+        on_time_closure_rate = round((on_time_closed / closed_tasks) * 100, 1) if closed_tasks else 0.0
+        avg_task_age_open = round(sum(t.get("age_days", 0) for t in fact_tasks if t.get("is_open")) / max(1, open_tasks), 1) if open_tasks else 0.0
+        avg_days_late = round(sum(t.get("days_late", 0) for t in fact_tasks if t.get("is_late")) / max(1, late_open_tasks), 1) if late_open_tasks else 0.0
+        tasks_per_meeting = round(total_tasks / max(1, meetings_count), 2)
+        memos_per_meeting = round(len(fact_memos) / max(1, meetings_count), 2)
+        operational_progress_pct = round((closed_tasks / total_tasks) * 100, 1) if total_tasks else 0.0
+        calendar_progress_pct = progress_percent
+        progress_gap_pct = round(operational_progress_pct - calendar_progress_pct, 1)
+        recent_threshold = today - timedelta(days=30)
+        closure_velocity_30d = sum(1 for t in fact_tasks if t.get("is_closed") and t.get("done_date") and t.get("done_date") >= recent_threshold)
+        project_health_score = max(0.0, min(100.0, round(0.45*closure_rate + 0.3*on_time_closure_rate + 0.25*max(0,100-(late_open_tasks*100/max(1,total_tasks))), 1)))
+
+        kpi_project_summary = {
+            "total_tasks": total_tasks,
+            "open_tasks": open_tasks,
+            "closed_tasks": closed_tasks,
+            "late_open_tasks": late_open_tasks,
+            "closure_rate": closure_rate,
+            "on_time_closure_rate": on_time_closure_rate,
+            "avg_task_age_open": avg_task_age_open,
+            "avg_days_late": avg_days_late,
+            "meetings_count": meetings_count,
+            "tasks_per_meeting": tasks_per_meeting,
+            "memos_per_meeting": memos_per_meeting,
+            "calendar_progress_pct": calendar_progress_pct,
+            "operational_progress_pct": operational_progress_pct,
+            "progress_gap_pct": progress_gap_pct,
+            "closure_velocity_30d": closure_velocity_30d,
+            "project_health_score": project_health_score,
+        }
+
+        company_task_map: Dict[str, List[Dict[str, Any]]] = {}
+        for t in fact_tasks:
+            company_task_map.setdefault(clean_text(t.get("company")) or "Non défini", []).append(t)
+
+        attendance_by_company: Dict[str, Dict[str, int]] = {}
+        for m in fact_meetings:
+            for cid in m.get("attending_company_ids", []):
+                cname = clean_text(companies.get(cid, {}).get("Name")) or cid
+                rec = attendance_by_company.setdefault(cname, {"attended": 0, "missing": 0})
+                rec["attended"] += 1
+            for cid in m.get("missing_company_ids", []):
+                cname = clean_text(companies.get(cid, {}).get("Name")) or cid
+                rec = attendance_by_company.setdefault(cname, {"attended": 0, "missing": 0})
+                rec["missing"] += 1
+
+        kpi_company_summary: List[Dict[str, Any]] = []
+        kpi_reactivity_company: List[Dict[str, Any]] = []
+        for cname, tasks in company_task_map.items():
+            total = len(tasks)
+            open_n = sum(1 for x in tasks if x.get("is_open"))
+            late_open = sum(1 for x in tasks if x.get("is_late"))
+            closed = sum(1 for x in tasks if x.get("is_closed"))
+            on_time = sum(1 for x in tasks if x.get("is_closed_on_time"))
+            delays = [x.get("days_late", 0) for x in tasks if x.get("is_late")]
+            response = [x.get("response_delay_days") for x in tasks if x.get("response_delay_days") is not None]
+            under3 = sum(1 for v in response if v <= 3)
+            no_response = sum(1 for x in tasks if x.get("response_delay_days") is None)
+            attend = attendance_by_company.get(cname, {"attended": 0, "missing": 0})
+            meetings_total_for_company = attend["attended"] + attend["missing"]
+            reminder_count = sum(1 for x in tasks if x.get("is_open") and x.get("age_days", 0) >= reminder_threshold_days)
+
+            rec = {
+                "company": cname,
+                "total_tasks": total,
+                "open_tasks": open_n,
+                "late_open_tasks": late_open,
+                "closure_rate": round((closed / total) * 100, 1) if total else 0.0,
+                "on_time_closure_rate": round((on_time / closed) * 100, 1) if closed else 0.0,
+                "avg_days_late": round(sum(delays)/len(delays),1) if delays else 0.0,
+                "avg_first_response_delay_days": round(sum(response)/len(response),1) if response else None,
+                "no_response_rate": round((no_response/total)*100,1) if total else 0.0,
+                "meetings_attended": attend["attended"],
+                "meetings_missing": attend["missing"],
+                "attendance_rate": round((attend["attended"]/meetings_total_for_company)*100,1) if meetings_total_for_company else None,
+                "reminder_count": reminder_count,
+                "reminder_per_task_ratio": round(reminder_count/total,2) if total else 0.0,
+            }
+            reactivity_score = 100.0
+            if rec["avg_first_response_delay_days"] is not None:
+                reactivity_score -= min(40.0, rec["avg_first_response_delay_days"] * 4)
+            reactivity_score -= min(35.0, rec["no_response_rate"] * 0.35)
+            reactivity_score += min(20.0, (under3 / max(1, len(response))) * 20 if response else 0)
+            rec["reactivity_score"] = round(max(0.0, min(100.0, reactivity_score)), 1)
+            kpi_company_summary.append(rec)
+            kpi_reactivity_company.append({
+                "company": cname,
+                "avg_first_response_delay_days": rec["avg_first_response_delay_days"],
+                "reaction_under_3d_rate": round((under3/len(response))*100,1) if response else 0.0,
+                "tasks_without_response_rate": rec["no_response_rate"],
+                "avg_processing_days": round(sum((x.get("done_date")-x.get("request_date")).days for x in tasks if x.get("done_date") and x.get("request_date")) / max(1, sum(1 for x in tasks if x.get("done_date") and x.get("request_date"))),1) if any(x.get("done_date") and x.get("request_date") for x in tasks) else None,
+                "reactivity_score": rec["reactivity_score"],
+            })
+
+        kpi_company_summary.sort(key=lambda x: (-x["open_tasks"], x["company"]))
+        kpi_reactivity_company.sort(key=lambda x: (x["reactivity_score"] if x["reactivity_score"] is not None else 999, x["company"]))
+
+        package_map: Dict[str, List[Dict[str, Any]]] = {}
+        for t in fact_tasks:
+            package_label = clean_text(t.get("package_label") or t.get("package_name") or "Non défini")
+            package_map.setdefault(package_label, []).append(t)
+        kpi_package_summary: List[Dict[str, Any]] = []
+        for plabel, tasks in package_map.items():
+            total = len(tasks)
+            open_n = sum(1 for x in tasks if x.get("is_open"))
+            late_open = sum(1 for x in tasks if x.get("is_late"))
+            closed = sum(1 for x in tasks if x.get("is_closed"))
+            memos_count = sum(1 for m in fact_memos if plabel in [clean_text(v) for v in m.get("memo_package_labels", [])])
+            impacted_areas_count = len({a for x in tasks for a in x.get("area_names", []) if clean_text(a)})
+            criticality = round(min(100.0, late_open*12 + open_n*3 + impacted_areas_count*5),1)
+            kpi_package_summary.append({
+                "package": plabel,
+                "total_tasks": total,
+                "open_tasks": open_n,
+                "late_open_tasks": late_open,
+                "closure_rate": round((closed/total)*100,1) if total else 0.0,
+                "avg_days_late": round(sum(x.get("days_late",0) for x in tasks if x.get("is_late"))/max(1,late_open),1) if late_open else 0.0,
+                "tasks_due_7d": sum(1 for x in tasks if x.get("days_to_deadline") is not None and 0 <= x.get("days_to_deadline") <= 7),
+                "memos_count": memos_count,
+                "impacted_areas_count": impacted_areas_count,
+                "package_criticality_score": criticality,
+            })
+        kpi_package_summary.sort(key=lambda x: (-x["late_open_tasks"], -x["open_tasks"], x["package"]))
+
+        zone_map: Dict[str, List[Dict[str, Any]]] = {}
+        for t in fact_tasks:
+            names = t.get("area_names") or ["Non défini"]
+            for z in names:
+                zone = clean_text(z) or "Non défini"
+                zone_map.setdefault(zone, []).append(t)
+        kpi_zone_summary: List[Dict[str, Any]] = []
+        for zname, tasks in zone_map.items():
+            total = len(tasks)
+            open_n = sum(1 for x in tasks if x.get("is_open"))
+            late_open = sum(1 for x in tasks if x.get("is_late"))
+            closed = sum(1 for x in tasks if x.get("is_closed"))
+            critical_packages_count = len({clean_text(x.get("package_label")) for x in tasks if x.get("is_late")})
+            kpi_zone_summary.append({
+                "zone": zname,
+                "total_tasks": total,
+                "open_tasks": open_n,
+                "late_open_tasks": late_open,
+                "closure_rate": round((closed/total)*100,1) if total else 0.0,
+                "critical_packages_count": critical_packages_count,
+            })
+        kpi_zone_summary.sort(key=lambda x: (-x["late_open_tasks"], -x["open_tasks"], x["zone"]))
+
+        kpi_project_progress = {
+            "calendar_progress_pct": calendar_progress_pct,
+            "operational_progress_pct": operational_progress_pct,
+            "progress_gap_pct": progress_gap_pct,
+            "start_date": project_start.isoformat() if project_start else "",
+            "end_date": project_end.isoformat() if project_end else "",
+            "elapsed_days": elapsed_days,
+            "total_days": total_days,
+        }
 
         project_display_name = resolved_title or target
         project_id = resolved_id or clean_text(project_info.get("ID"))
@@ -938,6 +1315,20 @@ class MetronomeService:
                     "total_days": total_days,
                     "progress_percent": progress_percent,
                 },
+            },
+            "analytics": {
+                "fact_tasks": fact_tasks,
+                "fact_memos": fact_memos,
+                "fact_memo_comments": fact_memo_comments,
+                "fact_meetings": fact_meetings,
+                "fact_interactions": fact_interactions,
+                "kpi_project_summary": kpi_project_summary,
+                "kpi_company_summary": kpi_company_summary,
+                "kpi_package_summary": kpi_package_summary,
+                "kpi_zone_summary": kpi_zone_summary,
+                "kpi_project_progress": kpi_project_progress,
+                "kpi_reactivity_company": kpi_reactivity_company,
+                "documents_count": len(documents_for_project),
             },
             "rows": rows,
             "missing_files": cache.get("missing", []),
