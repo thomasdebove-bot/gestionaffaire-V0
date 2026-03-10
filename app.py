@@ -1149,6 +1149,17 @@ class MetronomeService:
             if (not resolved_id or self._get_first_value(d, METRONOME_COLUMN_ALIASES["documents_project_id"]) in {"", resolved_id})
         ]
 
+        project_start = parse_date(self._get_first_value(project_info, METRONOME_COLUMN_ALIASES["project_start"]))
+        project_end = parse_date(self._get_first_value(project_info, METRONOME_COLUMN_ALIASES["project_end"]))
+        if project_start and project_end and project_end > project_start:
+            total_days = (project_end - project_start).days
+            elapsed_days = min(max((today - project_start).days, 0), total_days)
+            progress_percent = round((elapsed_days / total_days) * 100, 1)
+        else:
+            total_days = 0
+            elapsed_days = 0
+            progress_percent = 0.0
+
         total_tasks = len(fact_tasks)
         closed_tasks = sum(1 for t in fact_tasks if t.get("is_closed"))
         open_tasks = sum(1 for t in fact_tasks if t.get("is_open"))
