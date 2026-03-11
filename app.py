@@ -787,16 +787,6 @@ class BoondService:
 
         return rows
 
-    @staticmethod
-    def extract_project_id_from_positioning_detail(detail: Dict[str, Any]) -> Optional[str]:
-        data = detail.get("data") or detail
-        rel = data.get("relationships") or {}
-        pid = clean_text((((rel.get("project") or {}).get("data") or {}).get("id")))
-        if pid:
-            return pid
-        oid = clean_text((((rel.get("opportunity") or {}).get("data") or {}).get("id")))
-        return oid or None
-
     def find_active_positioning_by_date(
         self,
         work_date: str,
@@ -3641,8 +3631,7 @@ def api_boond_debug_positioning_match_check(positioning_id: str, project_id: str
         "input_project_id": str(project_id),
         "project_rel_id": project_rel_id,
         "opportunity_rel_id": opportunity_rel_id,
-        "match_on_project": project_rel_id == str(project_id),
-        "match_on_opportunity": opportunity_rel_id == str(project_id),
+        "note": "No project/opportunity equality check is used in cost computation; active positioning is selected by resource + date only.",
     }
 
 
