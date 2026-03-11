@@ -787,6 +787,104 @@ class BoondService:
 
         return rows
 
+    @staticmethod
+    def extract_project_id_from_positioning_detail(detail: Dict[str, Any]) -> Optional[str]:
+        data = detail.get("data") or detail
+        rel = data.get("relationships") or {}
+        pid = clean_text((((rel.get("project") or {}).get("data") or {}).get("id")))
+        if pid:
+            return pid
+        oid = clean_text((((rel.get("opportunity") or {}).get("data") or {}).get("id")))
+        return oid or None
+
+    def find_active_project_positioning_for_time(
+        self,
+        work_date: str,
+        project_id: str,
+        normalized_positionings: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        wd = clean_text(work_date)[:10]
+        pid = clean_text(project_id)
+        candidates: List[Dict[str, Any]] = []
+        for pos in normalized_positionings:
+            pos_pid = clean_text(pos.get("related_project_id"))
+            if pid and pos_pid and pos_pid != pid:
+                continue
+            start = clean_text(pos.get("start_date"))[:10]
+            end = clean_text(pos.get("end_date"))[:10]
+            in_range = True
+            if start and wd and wd < start:
+                in_range = False
+            if end and wd and wd > end:
+                in_range = False
+            if in_range:
+                candidates.append(pos)
+
+        if candidates:
+            candidates.sort(key=lambda x: (clean_text(x.get("start_date")), clean_text(x.get("id"))), reverse=True)
+            return candidates[0]
+
+        # fallback: plus récent sur le bon projet
+        fallback = [p for p in normalized_positionings if clean_text(p.get("related_project_id")) == pid]
+        if fallback:
+            fallback.sort(key=lambda x: (clean_text(x.get("start_date")), clean_text(x.get("id"))), reverse=True)
+            return fallback[0]
+        return None
+
+    def resolve_line_cost_from_positioning(
+        self,
+        times_report_id: str,
+        work_date: str,
+        duration: float,
+        project_id: str,
+    ) -> Dict[str, Any]:
+        tr_payload, _ = self.get_times_report_cached(times_report_id, ttl_seconds=86400)
+        resource_id = self._extract_resource_id_from_times_report(tr_payload)
+        if not resource_id:
+            return {"resource_id": "", "positioning_id": None, "average_daily_cost": None, "line_cost": None}
+
+        pos_list_cache_key = f"boond:resource:{resource_id}:positionings"
+        pos_list_payload = self.get_api_cache(pos_list_cache_key)
+        if pos_list_payload is None:
+            try:
+                pos_list_payload = self.boond_get(f"/resources/{resource_id}/positionings", params={"perPage": 200})
+            except Exception:
+                pos_list_payload = {"data": []}
+            self.set_api_cache(pos_list_cache_key, pos_list_payload, ttl_seconds=86400)
+
+        normalized_positionings: List[Dict[str, Any]] = []
+        for pos in (pos_list_payload.get("data") or []):
+            pos_id = clean_text(pos.get("id"))
+            if not pos_id:
+                continue
+            detail_cache_key = f"boond:positioning:{pos_id}"
+            detail = self.get_api_cache(detail_cache_key)
+            if detail is None:
+                try:
+                    detail = self.boond_get(f"/positionings/{pos_id}")
+                    self.set_api_cache(detail_cache_key, detail, ttl_seconds=86400)
+                except Exception:
+                    continue
+            nd = self.normalize_positioning_detail(detail)
+            nd["related_project_id"] = self.extract_project_id_from_positioning_detail(detail)
+            normalized_positionings.append(nd)
+
+        active = self.find_active_project_positioning_for_time(work_date, project_id, normalized_positionings)
+        if not active:
+            return {"resource_id": resource_id, "positioning_id": None, "average_daily_cost": None, "line_cost": None}
+
+        rate = clean_number(active.get("average_daily_cost"))
+        if rate <= 0:
+            return {"resource_id": resource_id, "positioning_id": clean_text(active.get("id")), "average_daily_cost": None, "line_cost": None}
+
+        line_cost = clean_number(duration) * rate
+        return {
+            "resource_id": resource_id,
+            "positioning_id": clean_text(active.get("id")),
+            "average_daily_cost": rate,
+            "line_cost": line_cost,
+        }
+
     def _resources_directory(self) -> List[Dict[str, Any]]:
         return self.get_all_boond_resources()
 
@@ -951,52 +1049,91 @@ class BoondService:
         if cached is not None:
             return cached
 
-        # Optimisation: ne traiter que les mois réellement présents dans les jours du projet.
         rows = self.get_project_workplaces_times(project_id)
-        useful_months = {
-            clean_text((row.get("attributes") or {}).get("startDate"))[:7]
-            for row in rows
-            if re.match(r"^\d{4}-\d{2}$", clean_text((row.get("attributes") or {}).get("startDate"))[:7])
-        }
-
+        total_days = 0.0
         total_cost = 0.0
-        total_duration = 0.0
+        rated_days = 0.0
+        unrated_days = 0.0
         by_month: Dict[str, Dict[str, float]] = defaultdict(lambda: {"days": 0.0, "cost": 0.0})
 
-        resources = self._resources_directory()
-        for res in resources:
-            rid = clean_text(res.get("id"))
-            if not rid:
+        times_report_cache: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            attrs = row.get("attributes", {}) or {}
+            rel = row.get("relationships", {}) or {}
+            duration = clean_number(attrs.get("duration"))
+            if duration <= 0:
                 continue
-            rec = self.compute_resource_month_costs(rid, end_term)
-            for line in rec.get("lines", []):
-                if clean_text(line.get("project_id")) != clean_text(project_id):
-                    continue
-                month = clean_text(line.get("date"))[:7]
-                if useful_months and month not in useful_months:
-                    continue
-                duration = clean_number(line.get("duration"))
-                line_cost = clean_number(line.get("cost"))
-                total_duration += duration
-                total_cost += line_cost
-                if re.match(r"^\d{4}-\d{2}$", month):
-                    by_month[month]["days"] += duration
-                    by_month[month]["cost"] += line_cost
+            work_date = clean_text(attrs.get("startDate"))
+            month = work_date[:7]
+            total_days += duration
+            if re.match(r"^\d{4}-\d{2}$", month):
+                by_month[month]["days"] += duration
 
-        total_days = round(total_duration, 2)
-        total_cost_out = round(total_cost, 2) if total_cost > 0 else None
-        average_daily_cost = round(total_cost / total_duration, 2) if total_duration > 0 and total_cost > 0 else None
-        cost_status = "ok" if total_cost_out is not None else "missing_rate"
+            times_report_id = clean_text((((rel.get("timesReport") or {}).get("data") or {}).get("id")))
+            if not times_report_id:
+                unrated_days += duration
+                continue
+
+            if times_report_id in times_report_cache:
+                _ = times_report_cache[times_report_id]
+            else:
+                tr_payload, _src = self.get_times_report_cached(times_report_id, ttl_seconds=86400)
+                times_report_cache[times_report_id] = tr_payload
+
+            line_cost_info = self.resolve_line_cost_from_positioning(
+                times_report_id=times_report_id,
+                work_date=work_date,
+                duration=duration,
+                project_id=project_id,
+            )
+            line_cost = line_cost_info.get("line_cost")
+            if line_cost is not None:
+                total_cost += clean_number(line_cost)
+                rated_days += duration
+                if re.match(r"^\d{4}-\d{2}$", month):
+                    by_month[month]["cost"] += clean_number(line_cost)
+                logger.info(
+                    "[BOOND COST] project=%s times_report=%s resource=%s positioning=%s rate=%s days=%s cost=%s",
+                    project_id,
+                    times_report_id,
+                    line_cost_info.get("resource_id"),
+                    line_cost_info.get("positioning_id"),
+                    line_cost_info.get("average_daily_cost"),
+                    duration,
+                    line_cost,
+                )
+            else:
+                unrated_days += duration
+
+        cost_coverage_ratio = (rated_days / total_days) if total_days > 0 else 0.0
+        average_daily_cost = (total_cost / rated_days) if rated_days > 0 else None
+        if rated_days == total_days and total_cost > 0:
+            cost_status = "ok"
+            total_cost_out = round(total_cost, 2)
+        elif rated_days > 0 and unrated_days > 0:
+            cost_status = "partial"
+            total_cost_out = round(total_cost, 2)
+        else:
+            cost_status = "missing_rate"
+            total_cost_out = None
 
         result = {
             "project_id": clean_text(project_id),
-            "total_days": total_days,
+            "total_days": round(total_days, 2),
+            "rated_days": round(rated_days, 2),
+            "unrated_days": round(unrated_days, 2),
+            "cost_coverage_ratio": round(cost_coverage_ratio, 4),
             "total_cost": total_cost_out,
-            "average_daily_cost": average_daily_cost,
-            "rate_sources_count": {"resource": 0, "resource_rates": 0, "delivery": 0, "missing": 0},
+            "average_daily_cost": round(average_daily_cost, 2) if average_daily_cost is not None else None,
+            "rate_sources_count": {"resource": rated_days, "resource_rates": 0, "delivery": 0, "missing": unrated_days},
             "by_month": [
-                {"month": m, "days": round(v["days"], 2), "cost": round(v["cost"], 2) if v["cost"] > 0 else None}
+                {
+                    "month": m,
+                    "days": round(v["days"], 2),
+                    "cost": round(v["cost"], 2) if v["cost"] > 0 else None,
+                }
                 for m, v in sorted(by_month.items())
+                if (not end_term) or (m <= end_term)
             ],
             "cost_status": cost_status,
         }
@@ -1159,27 +1296,16 @@ class BoondService:
             if re.match(r"^\d{4}-\d{2}$", month):
                 by_month_map[month] += duration
 
-        # Coût: lecture cache agrégé uniquement (calcul lourd déporté sur route dédiée).
+        # Coût: moteur positioning actif (source fiable)
         end_term = now_iso()[:7]
-        cost_engine = self.get_cached_project_cumulative_cost(project_id, end_term)
-
-        if cost_engine:
-            cost_total_days = clean_number(cost_engine.get("total_days"))
-            total_cost_out = cost_engine.get("total_cost")
-            average_daily_rate = cost_engine.get("average_daily_cost")
-            cost_status = clean_text(cost_engine.get("cost_status")) or "missing_rate"
-            rated_days = min(total_days, cost_total_days) if cost_total_days > 0 else 0.0
-            unrated_days = max(0.0, total_days - rated_days)
-            cost_coverage_ratio = (rated_days / total_days) if total_days > 0 else 0.0
-            month_cost_map = {clean_text(x.get("month")): clean_number(x.get("cost")) for x in (cost_engine.get("by_month") or [])}
-        else:
-            total_cost_out = None
-            average_daily_rate = None
-            cost_status = "pending"
-            rated_days = 0.0
-            unrated_days = total_days
-            cost_coverage_ratio = 0.0
-            month_cost_map = {}
+        cost_engine = self.compute_project_cumulative_cost_from_existing_engine(project_id, end_term)
+        total_cost_out = cost_engine.get("total_cost")
+        average_daily_rate = cost_engine.get("average_daily_cost")
+        cost_status = clean_text(cost_engine.get("cost_status")) or "missing_rate"
+        rated_days = clean_number(cost_engine.get("rated_days"))
+        unrated_days = clean_number(cost_engine.get("unrated_days"))
+        cost_coverage_ratio = clean_number(cost_engine.get("cost_coverage_ratio"))
+        month_cost_map = {clean_text(x.get("month")): clean_number(x.get("cost")) for x in (cost_engine.get("by_month") or [])}
 
         by_month = []
         for month, days in sorted((by_month_map or {}).items()):
@@ -1192,12 +1318,10 @@ class BoondService:
             })
 
         message = "OK"
-        if cost_status == "pending":
-            message = "Coût en cours de calcul"
-        elif cost_status == "missing_rate":
+        if cost_status == "missing_rate":
             message = "Coût indisponible: aucun taux journalier fiable trouvé."
         elif cost_status == "partial":
-            message = "Coût partiel: certaines imputations n'ont pas de taux journalier exploitable."
+            message = "Coût partiel : certaines imputations n’ont pas trouvé de positioning actif"
 
         return {
             "input_project_name": project_name,
@@ -3269,23 +3393,8 @@ function fmt(v){const n=Number(v||0);return n.toLocaleString('fr-FR',{maximumFra
     document.getElementById('kpiDays').textContent=fmt(d.totals.total_days);
     document.getElementById('kpiCost').textContent=d.totals.total_cost==null?'Indisponible':fmt(d.totals.total_cost)+' €';
     const coverage=((d.totals||{}).cost_coverage_ratio||0)*100;document.getElementById('costCoverage').textContent=`Couverture coût: ${fmt(coverage)}%`;
-    const term=new Date().toISOString().slice(0,7);
-    const projectId=((d.matched_project||{}).project_id||'');
     const warning=document.getElementById('warning');
-
-    if(d.totals.cost_status==='pending' && projectId){
-      warning.style.display='block';
-      warning.innerHTML=`Coût en cours de calcul. <button id="btnRebuildCost" style="margin-left:8px">Calculer / rafraîchir le coût</button>`;
-      const rr=await fetch(`/api/boond/project-cumulative-cost?project_id=${encodeURIComponent(projectId)}&term=${encodeURIComponent(term)}`);
-      const cd=await rr.json();
-      if(cd && cd.cost_status!=='pending'){
-        document.getElementById('kpiCost').textContent=cd.total_cost==null?'Indisponible':fmt(cd.total_cost)+' €';
-        const cov=((Number(cd.total_days||0)>0)?(Number(cd.total_days||0)/Number(d.totals.total_days||1))*100:0);
-        document.getElementById('costCoverage').textContent=`Couverture coût: ${fmt(cov)}%`;
-      }
-      const btn=document.getElementById('btnRebuildCost');
-      if(btn){btn.onclick=async()=>{btn.disabled=true;btn.textContent='Calcul…';const br=await fetch(`/api/boond/project-cumulative-cost/rebuild?project_id=${encodeURIComponent(projectId)}&term=${encodeURIComponent(term)}`);const bd=await br.json();document.getElementById('kpiCost').textContent=bd.total_cost==null?'Indisponible':fmt(bd.total_cost)+' €';warning.style.display='none';};}
-    }else if(d.totals.cost_status!=='ok'){
+    if(d.totals.cost_status!=='ok'){
       warning.style.display='block';
       warning.textContent=d.message||'Coût indisponible faute de taux journalier.';
     }
@@ -3478,6 +3587,11 @@ def api_boond_debug_project_cost_path(project_name: str):
         "matched_project": matched,
         "sample_rows": sample_rows,
     }
+
+
+@app.get("/api/boond/debug/line-cost", response_class=JSONResponse)
+def api_boond_debug_line_cost(times_report_id: str, work_date: str, duration: float, project_id: str):
+    return boond_service.resolve_line_cost_from_positioning(times_report_id, work_date, duration, project_id)
 
 
 @app.get("/api/boond/project-cumulative-cost/rebuild", response_class=JSONResponse)
