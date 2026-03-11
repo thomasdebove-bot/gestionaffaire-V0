@@ -13,6 +13,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode, urljoin
+import urllib.error as urllib_error
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -162,6 +163,7 @@ class BoondService:
 
     def boond_headers(self) -> Dict[str, str]:
         jwt_value = self.build_boond_jwt()
+
         return {
             "Accept": "application/json",
             "Content-Type": "application/json",
@@ -172,26 +174,24 @@ class BoondService:
     def boond_get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         self._validate_config()
         base = self.base_url.rstrip("/") + "/"
-        path_clean = path.lstrip("/")
-        url = urljoin(base, path_clean)
+        clean_path = path.lstrip("/")
+        url = urljoin(base, clean_path)
         if params:
             url = f"{url}?{urlencode(params, doseq=True)}"
         req = Request(url, headers=self.boond_headers(), method="GET")
         try:
             with urlopen(req, timeout=30) as resp:
                 return json.loads(resp.read().decode("utf-8"))
-        except HTTPError as exc:
-            body = ""
+        except urllib_error.HTTPError as exc:
             try:
-                raw = exc.read()
-                body = raw.decode("utf-8", errors="ignore") if raw else ""
+                body = exc.read().decode("utf-8", errors="ignore")
             except Exception:
-                body = ""
-            logger.error("[BOOND] HTTP %s sur %s | %s", exc.code, url, body[:500])
-            detail = f"HTTP Error {exc.code}: {exc.reason}"
-            if body:
-                detail = f"{detail} | {body[:300]}"
-            raise RuntimeError(f"Erreur BOOND sur {path}: {detail}")
+                body = "<no body>"
+            logger.error("[BOOND] HTTP %s sur %s | %s", exc.code, url, body)
+            raise HTTPException(
+                status_code=502,
+                detail=f"Erreur Boond {exc.code} sur {clean_path}: {body[:1000]}"
+            ) from exc
         except URLError as exc:
             logger.error("[BOOND] Réseau KO sur %s | %s", url, exc)
             raise RuntimeError(f"Erreur BOOND sur {path}: {exc}")
