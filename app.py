@@ -156,13 +156,17 @@ class BoondService:
         if missing:
             raise RuntimeError(f"[BOOND] Variables .env manquantes: {', '.join(missing)}")
 
-    def boond_headers(self) -> Dict[str, str]:
+    def build_boond_jwt(self) -> str:
         self._validate_config()
-        auth = f"{self.client_token}:{self.client_key}:{self.user_token}"
+        return f"{self.client_token}:{self.client_key}:{self.user_token}"
+
+    def boond_headers(self) -> Dict[str, str]:
+        jwt_value = self.build_boond_jwt()
         return {
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "X-Jwt-Client-Boondmanager": auth,
+            "xJwtClient": jwt_value,
+            "X-Jwt-Client-BoondManager": jwt_value,
         }
 
     def boond_get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
