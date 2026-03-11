@@ -273,40 +273,38 @@ class BoondService:
         return resources
 
     @staticmethod
-    def extract_resource_daily_rate(resource_payload: Dict[str, Any]) -> Optional[float]:
-        attrs = resource_payload.get("attributes", {}) or {}
-        candidate_fields = [
-            "dailyRate", "costRate", "internalDailyRate", "productionDailyRate",
-            "daily_cost", "daily_rate", "cost_rate", "tj", "rate",
+    def extract_resource_daily_rate(resource: Dict[str, Any]) -> Optional[float]:
+
+        attrs = resource.get("attributes", {}) or {}
+
+        candidates = [
+            "productionDailyRate",
+            "internalDailyRate",
+            "dailyRate",
+            "costDailyRate",
+            "averageDailyCost",
+            "billingDailyRate",
+            "defaultDailyRate",
+            "unitPrice",
+            "costRate"
         ]
-        for key in candidate_fields:
-            val = attrs.get(key)
-            num = clean_number(val)
-            if num > 0:
-                return num
-        for key, val in attrs.items():
-            k = clean_text(key).lower()
-            if any(x in k for x in ["daily", "rate", "cost", "tj"]):
-                num = clean_number(val)
-                if num > 0:
-                    return num
+
+        for field in candidates:
+
+            value = attrs.get(field)
+
+            if isinstance(value, (int, float)) and value > 0:
+                return float(value)
+
         return None
 
     def _build_resource_rate_index(self) -> Dict[str, Dict[str, Any]]:
         index: Dict[str, Dict[str, Any]] = {}
         for item in self.get_all_boond_resources():
             rid = clean_text(item.get("id"))
-            attrs = item.get("attributes", {}) or {}
             if not rid:
                 continue
-            rate = self.extract_resource_daily_rate(item)
-            index[rid] = {
-                "daily_rate": rate,
-                "cost_rate": clean_number(attrs.get("costRate")) or None,
-                "first_name": clean_text(attrs.get("firstName")),
-                "last_name": clean_text(attrs.get("lastName")),
-                "name": clean_text(attrs.get("name")),
-            }
+            index[rid] = item
         return index
 
     @staticmethod
@@ -815,6 +813,7 @@ class BoondService:
 
         total_days = 0.0
         rated_days = 0.0
+        unrated_days = 0.0
         total_cost = 0.0
         by_month_map: Dict[str, float] = defaultdict(float)
         by_month_cost_map: Dict[str, float] = defaultdict(float)
@@ -842,30 +841,30 @@ class BoondService:
                     ids = report_resource_map.get(tr_id) or []
                     resource_id = ids[0] if ids else ""
 
-            daily_rate = None
-            if resource_id:
-                daily_rate = (resource_index.get(resource_id) or {}).get("daily_rate")
+            resource = resource_index.get(resource_id) if resource_id else None
+            daily_rate = self.extract_resource_daily_rate(resource or {})
 
-            if daily_rate and clean_number(daily_rate) > 0:
-                line_cost = duration * float(daily_rate)
+            if daily_rate:
+                line_cost = duration * daily_rate
                 total_cost += line_cost
                 rated_days += duration
                 if re.match(r"^\d{4}-\d{2}$", month):
                     by_month_cost_map[month] += line_cost
+            else:
+                unrated_days += duration
 
-        unrated_days = max(0.0, total_days - rated_days)
         cost_coverage_ratio = (rated_days / total_days) if total_days > 0 else 0.0
         average_daily_rate = (total_cost / rated_days) if rated_days > 0 else None
 
-        if rated_days <= 0:
-            total_cost_out = None
-            cost_status = "missing_rate"
-        elif unrated_days > 0:
-            total_cost_out = round(total_cost, 2)
-            cost_status = "partial"
-        else:
+        if total_cost > 0:
             total_cost_out = round(total_cost, 2)
             cost_status = "ok"
+        elif rated_days > 0:
+            total_cost_out = None
+            cost_status = "partial"
+        else:
+            total_cost_out = None
+            cost_status = "missing_rate"
 
         by_month = []
         for month, days in sorted((by_month_map or {}).items()):
