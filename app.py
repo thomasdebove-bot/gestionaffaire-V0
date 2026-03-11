@@ -13,6 +13,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode, urljoin
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from fastapi import Body, FastAPI, File, HTTPException, Query, UploadFile
@@ -175,6 +176,21 @@ class BoondService:
         try:
             with urlopen(req, timeout=30) as resp:
                 return json.loads(resp.read().decode("utf-8"))
+        except HTTPError as exc:
+            body = ""
+            try:
+                raw = exc.read()
+                body = raw.decode("utf-8", errors="ignore") if raw else ""
+            except Exception:
+                body = ""
+            logger.error("[BOOND] HTTP %s sur %s | %s", exc.code, url, body[:500])
+            detail = f"HTTP Error {exc.code}: {exc.reason}"
+            if body:
+                detail = f"{detail} | {body[:300]}"
+            raise RuntimeError(f"Erreur BOOND sur {path}: {detail}")
+        except URLError as exc:
+            logger.error("[BOOND] Réseau KO sur %s | %s", url, exc)
+            raise RuntimeError(f"Erreur BOOND sur {path}: {exc}")
         except Exception as exc:
             logger.exception("[BOOND] Erreur GET %s", url)
             raise RuntimeError(f"Erreur BOOND sur {path}: {exc}")
@@ -199,7 +215,7 @@ class BoondService:
                 )
                 conn.commit()
 
-    def get_api_cache(self, cache_key: str) -> Optional[Dict[str, Any]]:
+    def get_api_cache(self, cache_key: str, allow_expired: bool = False) -> Optional[Dict[str, Any]]:
         now_ts = int(datetime.now().timestamp())
         with self._db() as conn:
             row = conn.execute(
@@ -208,7 +224,7 @@ class BoondService:
             ).fetchone()
         if not row:
             return None
-        if int(row["expires_at"]) < now_ts:
+        if (not allow_expired) and int(row["expires_at"]) < now_ts:
             return None
         return json.loads(row["payload"])
 
@@ -297,9 +313,26 @@ class BoondService:
 
     def _fetch_all_workplaces_times(self) -> List[Dict[str, Any]]:
         # Une seule collecte de workplaces-times, puis enrichissement avec times-reports en cache.
-        payload = self.boond_get("/workplaces-times")
-        data = payload.get("data") or []
-        return data if isinstance(data, list) else []
+        attempts: List[Tuple[str, Optional[Dict[str, Any]]]] = [
+            ("/workplaces-times", None),
+            ("/workplaces-times", {"limit": 1000}),
+            ("/workplaces-times", {"perPage": 1000}),
+            ("/workplaces-times", {"page": 1, "limit": 1000}),
+        ]
+        last_error: Optional[Exception] = None
+        for path, params in attempts:
+            try:
+                payload = self.boond_get(path, params=params)
+                data = payload.get("data") or []
+                if isinstance(data, list):
+                    return data
+            except RuntimeError as exc:
+                last_error = exc
+                if "422" not in str(exc):
+                    break
+        if last_error:
+            raise RuntimeError(str(last_error))
+        return []
 
     def build_boond_imputation_index(self, refresh: bool = False) -> Dict[str, Any]:
         cache_key = "boond:index:projects:imputations"
@@ -308,7 +341,17 @@ class BoondService:
             if cached is not None:
                 return cached
 
-        rows = self._fetch_all_workplaces_times()
+        try:
+            rows = self._fetch_all_workplaces_times()
+        except RuntimeError as exc:
+            stale = self.get_api_cache(cache_key, allow_expired=True)
+            if stale is not None:
+                stale_meta = stale.setdefault("meta", {})
+                stale_meta["warning"] = f"Données BOOND indisponibles, cache stale utilisé: {exc}"
+                stale_meta["stale_fallback_used"] = True
+                stale_meta["generated_at"] = stale_meta.get("generated_at") or now_iso()
+                return stale
+            raise
         structured_rows = []
         unique_reports = set()
         for row in rows:
@@ -2494,7 +2537,22 @@ def api_boond_imputation_by_project(project_name: str = Query(...), refresh: boo
     try:
         return boond_service.get_project_imputation_summary(project_name=pname, refresh=bool(refresh))
     except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        return JSONResponse(
+            status_code=200,
+            content={
+                "input_project_name": pname,
+                "matched_project": None,
+                "totals": {
+                    "total_days": 0.0,
+                    "average_daily_rate": None,
+                    "total_cost": None,
+                    "cost_status": "missing_rate",
+                },
+                "by_month": [],
+                "meta": {"error": str(exc), "generated_at": now_iso()},
+                "message": "Impossible de charger BOOND pour le moment.",
+            },
+        )
 
 
 @app.get("/boond-imputations", response_class=HTMLResponse)
