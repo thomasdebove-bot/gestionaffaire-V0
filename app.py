@@ -134,6 +134,7 @@ class BoondService:
     """Service BOOND : appels API, cache SQLite et agrégation imputations."""
 
     IMPORTANT_TOKENS = {"115", "CDG", "MDZ", "PASSY", "KENNEDY", "VALHUBERT", "PICPUS", "CONDORCET"}
+    SENSITIVE_COMPANY_TOKENS = {"BOUYGUES", "EIFFAGE", "VINCI", "FAYAT", "DUMEZ", "SPIE", "ARTELIA", "ENGIE", "LVMH", "COBAT"}
 
     def __init__(self, db_path: Path) -> None:
         self.db_path = Path(db_path)
@@ -237,6 +238,115 @@ class BoondService:
             page += 1
 
         return projects
+
+
+    def get_all_boond_resources(self) -> List[Dict[str, Any]]:
+        cache_key = "boond:resources:all"
+        cached = self.get_api_cache(cache_key)
+        if cached is not None:
+            return cached.get("items", []) or []
+
+        page = 1
+        per_page = 200
+        resources: List[Dict[str, Any]] = []
+
+        while True:
+            payload = self.boond_get(
+                "/resources",
+                params={
+                    "page": page,
+                    "perPage": per_page,
+                }
+            )
+            items = payload.get("data", []) or []
+            if not items:
+                break
+
+            resources.extend(items)
+
+            if len(items) < per_page:
+                break
+
+            page += 1
+
+        self.set_api_cache(cache_key, {"items": resources}, ttl_seconds=86400)
+        return resources
+
+    @staticmethod
+    def extract_resource_daily_rate(resource_payload: Dict[str, Any]) -> Optional[float]:
+        attrs = resource_payload.get("attributes", {}) or {}
+        candidate_fields = [
+            "dailyRate", "costRate", "internalDailyRate", "productionDailyRate",
+            "daily_cost", "daily_rate", "cost_rate", "tj", "rate",
+        ]
+        for key in candidate_fields:
+            val = attrs.get(key)
+            num = clean_number(val)
+            if num > 0:
+                return num
+        for key, val in attrs.items():
+            k = clean_text(key).lower()
+            if any(x in k for x in ["daily", "rate", "cost", "tj"]):
+                num = clean_number(val)
+                if num > 0:
+                    return num
+        return None
+
+    def _build_resource_rate_index(self) -> Dict[str, Dict[str, Any]]:
+        index: Dict[str, Dict[str, Any]] = {}
+        for item in self.get_all_boond_resources():
+            rid = clean_text(item.get("id"))
+            attrs = item.get("attributes", {}) or {}
+            if not rid:
+                continue
+            rate = self.extract_resource_daily_rate(item)
+            index[rid] = {
+                "daily_rate": rate,
+                "cost_rate": clean_number(attrs.get("costRate")) or None,
+                "first_name": clean_text(attrs.get("firstName")),
+                "last_name": clean_text(attrs.get("lastName")),
+                "name": clean_text(attrs.get("name")),
+            }
+        return index
+
+    @staticmethod
+    def _extract_resource_id_from_workplace_time(row: Dict[str, Any]) -> str:
+        rel = row.get("relationships", {}) or {}
+        candidates = [
+            (((rel.get("resource") or {}).get("data") or {}).get("id")),
+            (((rel.get("user") or {}).get("data") or {}).get("id")),
+            (((rel.get("collaborator") or {}).get("data") or {}).get("id")),
+        ]
+        for val in candidates:
+            rid = clean_text(val)
+            if rid:
+                return rid
+        attrs = row.get("attributes", {}) or {}
+        for key in ["resource", "resourceId", "resource_id", "userId", "collaboratorId"]:
+            rid = clean_text(attrs.get(key))
+            if rid:
+                return rid
+        return ""
+
+    @staticmethod
+    def _extract_resource_ids_from_times_report(report: Dict[str, Any]) -> List[str]:
+        ids: set[str] = set()
+        rel_times = ((report.get("data") or {}).get("relationships") or {}).get("times") or {}
+        items = rel_times.get("data") or []
+        for item in items:
+            attrs = item.get("attributes") or {}
+            for key in ["resource", "user", "collaborator"]:
+                node = attrs.get(key) or {}
+                rid = clean_text((node or {}).get("id"))
+                if rid:
+                    ids.add(rid)
+            delivery = attrs.get("delivery") or {}
+            for key in ["resource", "user", "collaborator"]:
+                node = delivery.get(key) or {}
+                rid = clean_text((node or {}).get("id"))
+                if rid:
+                    ids.add(rid)
+        return sorted(ids)
 
     def _db(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
@@ -415,6 +525,7 @@ class BoondService:
         reasons: List[str] = []
         strong_tokens = {"CDG", "MDZ", "PICPUS", "PASSY", "KENNEDY", "CONDORCET", "VALHUBERT", "MONTAIGNE", "ENGIE"}
         strong_hits: set[str] = set()
+        ref_tokens = set(ref.split())
 
         for txt in target_texts:
             n_txt = self.normalize_match_text(txt)
@@ -427,10 +538,8 @@ class BoondService:
                 score += 45
                 reasons.append(f"contains:{n_txt}")
 
-        for kw in target_keywords:
-            n_kw = self.normalize_match_text(kw)
-            if not n_kw:
-                continue
+        target_kw_set = {self.normalize_match_text(k) for k in target_keywords if self.normalize_match_text(k)}
+        for n_kw in sorted(target_kw_set):
             if re.search(rf"\b{re.escape(n_kw)}\b", ref):
                 score += 12
                 reasons.append(f"keyword:{n_kw}")
@@ -443,7 +552,25 @@ class BoondService:
             score += 10
             reasons.append("strong_coherence")
 
-        return min(100, score), reasons
+        target_companies = target_kw_set & self.SENSITIVE_COMPANY_TOKENS
+        ref_companies = ref_tokens & self.SENSITIVE_COMPANY_TOKENS
+        if target_companies and ref_companies and (target_companies & ref_companies):
+            score += 25
+            reasons.append("company_match")
+
+        conflict = False
+        if target_companies and ref_companies and not (target_companies & ref_companies):
+            score -= 35
+            conflict = True
+            reasons.append("client_conflict")
+
+        overlap_non_company = (target_kw_set & ref_tokens) - self.SENSITIVE_COMPANY_TOKENS
+        if conflict and len(overlap_non_company) <= 1:
+            score = min(score, 20)
+            reasons.append("client_conflict_single_site")
+
+        score = max(0, min(100, score))
+        return score, reasons
 
     def find_best_boond_project_match(self, project_name: str, boond_projects: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         context = self._get_metronome_match_context(project_name)
@@ -471,6 +598,7 @@ class BoondService:
                         "match_score": 100,
                         "matched_on": "manual_mapping",
                         "match_reasons": ["manual_mapping"],
+                        "match_warning": None,
                         "metronome_context": context,
                     }
                     self._last_match_debug = {
@@ -486,12 +614,16 @@ class BoondService:
             score, reasons = self.score_project_match(target_texts, target_keywords, pref)
             if score < 35:
                 continue
+            has_conflict = ("client_conflict" in reasons) or ("client_conflict_single_site" in reasons)
+            if has_conflict and score < 80:
+                continue
             candidates.append({
                 "project_id": clean_text(p.get("project_id")),
                 "project_reference": pref,
                 "match_score": int(score),
                 "matched_on": reasons[0] if reasons else "scored",
                 "match_reasons": reasons,
+                "match_warning": "client_conflict" if has_conflict else None,
                 "metronome_context": context,
             })
 
@@ -664,6 +796,9 @@ class BoondService:
                 "matched_project": None,
                 "totals": {
                     "total_days": 0.0,
+                    "rated_days": 0.0,
+                    "unrated_days": 0.0,
+                    "cost_coverage_ratio": 0.0,
                     "average_daily_rate": None,
                     "total_cost": None,
                     "cost_status": "missing_rate",
@@ -676,52 +811,94 @@ class BoondService:
 
         project_id = clean_text(matched.get("project_id"))
         rows = self.get_project_workplaces_times(project_id)
+        resource_index = self._build_resource_rate_index()
 
-        total_days = 0
+        total_days = 0.0
+        rated_days = 0.0
+        total_cost = 0.0
         by_month_map: Dict[str, float] = defaultdict(float)
+        by_month_cost_map: Dict[str, float] = defaultdict(float)
+        report_resource_map: Dict[str, List[str]] = {}
 
         for row in rows:
-
             attrs = row.get("attributes", {}) or {}
-
-            duration = attrs.get("duration")
-
-            if duration:
-                total_days += float(duration)
+            rel = row.get("relationships", {}) or {}
+            duration = clean_number(attrs.get("duration"))
+            if duration <= 0:
+                continue
+            total_days += duration
 
             month = clean_text(attrs.get("startDate"))[:7]
-            if re.match(r"^\d{4}-\d{2}$", month) and duration:
-                by_month_map[month] += float(duration)
+            if re.match(r"^\d{4}-\d{2}$", month):
+                by_month_map[month] += duration
 
-        manual_rate = self.manual_daily_rates_by_project.get(matched["project_id"])
-        total_cost = None
-        cost_status = "missing_rate"
-        if manual_rate is not None:
-            total_cost = round(total_days * manual_rate, 2)
+            resource_id = self._extract_resource_id_from_workplace_time(row)
+            if not resource_id:
+                tr_id = clean_text((((rel.get("timesReport") or {}).get("data") or {}).get("id")))
+                if tr_id:
+                    if tr_id not in report_resource_map:
+                        report_payload, _ = self.get_times_report_cached(tr_id)
+                        report_resource_map[tr_id] = self._extract_resource_ids_from_times_report(report_payload)
+                    ids = report_resource_map.get(tr_id) or []
+                    resource_id = ids[0] if ids else ""
+
+            daily_rate = None
+            if resource_id:
+                daily_rate = (resource_index.get(resource_id) or {}).get("daily_rate")
+
+            if daily_rate and clean_number(daily_rate) > 0:
+                line_cost = duration * float(daily_rate)
+                total_cost += line_cost
+                rated_days += duration
+                if re.match(r"^\d{4}-\d{2}$", month):
+                    by_month_cost_map[month] += line_cost
+
+        unrated_days = max(0.0, total_days - rated_days)
+        cost_coverage_ratio = (rated_days / total_days) if total_days > 0 else 0.0
+        average_daily_rate = (total_cost / rated_days) if rated_days > 0 else None
+
+        if rated_days <= 0:
+            total_cost_out = None
+            cost_status = "missing_rate"
+        elif unrated_days > 0:
+            total_cost_out = round(total_cost, 2)
+            cost_status = "partial"
+        else:
+            total_cost_out = round(total_cost, 2)
             cost_status = "ok"
 
         by_month = []
         for month, days in sorted((by_month_map or {}).items()):
             days_val = clean_number(days)
+            month_cost = by_month_cost_map.get(month)
             by_month.append({
                 "month": month,
                 "days": round(days_val, 2),
-                "cost": round(days_val * manual_rate, 2) if manual_rate is not None else None,
+                "cost": round(month_cost, 2) if month_cost is not None and month_cost > 0 else None,
             })
+
+        message = "OK"
+        if cost_status == "missing_rate":
+            message = "Coût indisponible: aucun taux journalier fiable trouvé."
+        elif cost_status == "partial":
+            message = "Coût partiel: certaines imputations n'ont pas de taux journalier exploitable."
 
         return {
             "input_project_name": project_name,
             "matched_project": matched,
             "totals": {
                 "total_days": round(total_days, 2),
-                "average_daily_rate": manual_rate,
-                "total_cost": total_cost,
+                "rated_days": round(rated_days, 2),
+                "unrated_days": round(unrated_days, 2),
+                "cost_coverage_ratio": round(cost_coverage_ratio, 4),
+                "average_daily_rate": round(average_daily_rate, 2) if average_daily_rate is not None else None,
+                "total_cost": total_cost_out,
                 "cost_status": cost_status,
             },
             "by_month": by_month,
             "meta": {**(index.get("meta", {}) or {}), "project_workplaces_rows": len(rows)},
             "match_debug": self._last_match_debug,
-            "message": "Coût indisponible: aucun taux journalier fiable trouvé." if manual_rate is None else "OK",
+            "message": message,
         }
 
 def now_iso() -> str:
@@ -2755,7 +2932,7 @@ table{width:100%;border-collapse:collapse}th,td{padding:8px;border-bottom:1px so
 <div class='card'><h2>Imputation des temps</h2><div id='state' class='small'>Chargement…</div></div>
 <div id='content' style='display:none'>
 <div class='card'><div class='small'>Projet METRONOME</div><div id='inputName'></div><div class='small' style='margin-top:6px'>Projet BOOND matché</div><div id='matched'></div><div id='matchDetails' class='small' style='margin-top:8px'></div></div>
-<div class='card kpis'><div><div class='small'>Jours imputés cumulés</div><div id='kpiDays' class='value'>-</div></div><div><div class='small'>Coût cumulé</div><div id='kpiCost' class='value'>-</div></div></div>
+<div class='card kpis'><div><div class='small'>Jours imputés cumulés</div><div id='kpiDays' class='value'>-</div></div><div><div class='small'>Coût cumulé</div><div id='kpiCost' class='value'>-</div><div id='costCoverage' class='small'></div></div></div>
 <div id='warning' class='card warn' style='display:none'></div>
 <div class='card'><h3>Répartition mensuelle</h3><div id='chart'></div><div id='table'></div></div>
 </div></div>
@@ -2775,6 +2952,7 @@ function fmt(v){const n=Number(v||0);return n.toLocaleString('fr-FR',{maximumFra
     document.getElementById('matched').textContent=`${d.matched_project.project_reference} (score ${d.matched_project.match_score})`;const reasons=(d.matched_project.match_reasons||[]);document.getElementById('matchDetails').innerHTML=reasons.length?`Raisons: ${reasons.map(esc).join(', ')}`:'';
     document.getElementById('kpiDays').textContent=fmt(d.totals.total_days);
     document.getElementById('kpiCost').textContent=d.totals.total_cost==null?'Indisponible':fmt(d.totals.total_cost)+' €';
+    const coverage=((d.totals||{}).cost_coverage_ratio||0)*100;document.getElementById('costCoverage').textContent=`Couverture coût: ${fmt(coverage)}%`;
     if(d.totals.cost_status!=='ok'){const w=document.getElementById('warning');w.style.display='block';w.textContent=d.message||'Coût indisponible faute de taux journalier.';}
     const rows=d.by_month||[]; const max=Math.max(1,...rows.map(x=>Number(x.days||0)));
     document.getElementById('chart').innerHTML=rows.map(x=>`<div style='margin:8px 0'><div class='small'>${esc(x.month)} — ${fmt(x.days)} j</div><div class='bar'><div class='fill' style='width:${(Number(x.days||0)/max)*100}%'></div></div></div>`).join('')||"<div class='small'>Aucune donnée mensuelle</div>";
@@ -2799,6 +2977,9 @@ def api_boond_imputation_by_project(project_name: str = Query(...), refresh: boo
                 "matched_project": None,
                 "totals": {
                     "total_days": 0.0,
+                    "rated_days": 0.0,
+                    "unrated_days": 0.0,
+                    "cost_coverage_ratio": 0.0,
                     "average_daily_rate": None,
                     "total_cost": None,
                     "cost_status": "missing_rate",
@@ -2857,6 +3038,36 @@ def api_boond_debug_projects_search(q: str):
         "query": q,
         "count": len(matches),
         "matches": matches[:100],
+    }
+
+
+@app.get("/api/boond/debug/resources/search", response_class=JSONResponse)
+def api_boond_debug_resources_search(q: str):
+    items = boond_service.get_all_boond_resources()
+    needle = clean_text(q).lower()
+
+    matches = []
+    for item in items:
+        attrs = item.get("attributes", {}) or {}
+        first_name = str(attrs.get("firstName") or "")
+        last_name = str(attrs.get("lastName") or "")
+        name = str(attrs.get("name") or "")
+        blob = f"{first_name} {last_name} {name}".lower()
+        if needle and needle not in blob:
+            continue
+        matches.append({
+            "id": item.get("id"),
+            "type": item.get("type"),
+            "first_name": first_name,
+            "last_name": last_name,
+            "name": name,
+            "attributes": attrs,
+        })
+
+    return {
+        "query": q,
+        "count": len(matches),
+        "matches": matches[:50],
     }
 
 
