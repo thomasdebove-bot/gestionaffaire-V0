@@ -2655,14 +2655,14 @@ def landing_html() -> str:
         <a id='financeLink' class='btn disabled' href='javascript:void(0)' aria-disabled='true'>Ouvrir Finances</a>
       </article>
       <article class='card'><h3>Gestion de projet</h3><p>Planification, jalons et coordination.</p><a id='pmLink' class='btn disabled' href='javascript:void(0)' aria-disabled='true'>Ouvrir</a></article>
-      <article class='card'><h3>Imputation</h3><p>Suivi des temps et affectations.</p><button class='btn disabled' disabled>Ouvrir</button></article>
+      <article class='card'><h3>Imputation</h3><p>Suivi des temps et affectations.</p><a id='imputationLink' class='btn disabled' href='javascript:void(0)' aria-disabled='true'>Ouvrir</a></article>
     </section>
   </div>
 <script>
 const state={projects:[],selectedId:'',selectedLabel:''};
 function esc(v){return String(v||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
 function setModuleLink(id,base){const el=document.getElementById(id);if(state.selectedId){el.className='btn primary';el.href=`/${base}?affaire_id=${encodeURIComponent(state.selectedId)}`;el.removeAttribute('aria-disabled');}else{el.className='btn disabled';el.href='javascript:void(0)';el.setAttribute('aria-disabled','true');}}
-function updateUi(){document.getElementById('projectBadge').textContent=state.selectedLabel?`Affaire : ${state.selectedLabel}`:'Aucune affaire sélectionnée';document.getElementById('state').textContent=state.selectedLabel?`Vous naviguez sur l'affaire ${state.selectedLabel}.`:'Sélectionnez une affaire pour activer les modules.';setModuleLink('financeLink','finance');setModuleLink('dashboardLink','dashboard');setModuleLink('pmLink','gestion-projet');if(state.selectedId){localStorage.setItem('selectedAffaireId',state.selectedId);} }
+function updateUi(){document.getElementById('projectBadge').textContent=state.selectedLabel?`Affaire : ${state.selectedLabel}`:'Aucune affaire sélectionnée';document.getElementById('state').textContent=state.selectedLabel?`Vous naviguez sur l'affaire ${state.selectedLabel}.`:'Sélectionnez une affaire pour activer les modules.';setModuleLink('financeLink','finance');setModuleLink('dashboardLink','dashboard');setModuleLink('pmLink','gestion-projet');setModuleLink('imputationLink','imputation');if(state.selectedId){localStorage.setItem('selectedAffaireId',state.selectedId);} }
 async function loadProjects(){try{const res=await fetch('/api/finance/affaires');const data=await res.json();state.projects=(data.items||[]).map(x=>({id:x.affaire_id,label:x.display_name})).filter(x=>x.id&&x.label).sort((a,b)=>a.label.localeCompare(b.label,'fr'));}catch(_){state.projects=[];}
 const list=document.getElementById('projectList');list.innerHTML=state.projects.map(p=>`<option value="${esc(p.label)}"></option>`).join('');const savedId=localStorage.getItem('selectedAffaireId')||'';const selected=state.projects.find(x=>x.id===savedId);if(selected){state.selectedId=selected.id;state.selectedLabel=selected.label;document.getElementById('projectSearch').value=selected.label;}updateUi();}
 document.getElementById('projectSearch').addEventListener('input',ev=>{const q=(ev.target.value||'').trim().toLowerCase();const selected=state.projects.find(p=>p.label.toLowerCase()===q)||state.projects.find(p=>p.label.toLowerCase().startsWith(q));state.selectedId=selected?.id||'';state.selectedLabel=selected?.label||'';updateUi();});
@@ -2671,6 +2671,72 @@ loadProjects();
 </body>
 </html>"""
 
+
+
+def imputation_html() -> str:
+    return """<!doctype html>
+<html lang='fr'>
+<head>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Imputation des temps</title>
+<style>
+:root{--bg:#f3f6fb;--ink:#13233b;--muted:#64748b;--card:#fff;--line:#dbe3ef;--accent:#ef8d00}
+*{box-sizing:border-box}body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--ink)}
+.wrap{max-width:1260px;margin:24px auto;padding:0 16px}.card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:18px}
+.row{display:grid;grid-template-columns:1fr 140px 160px 140px;gap:10px;align-items:end}.row2{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:10px}
+label{font-size:12px;color:var(--muted);font-weight:700}.input,button{height:42px;border:1px solid var(--line);border-radius:12px;padding:0 12px;font-size:15px}
+button{background:var(--accent);color:#fff;font-weight:800;cursor:pointer}.ghost{background:#f8fafc;color:#334155}
+pre{background:#0f172a;color:#e2e8f0;padding:12px;border-radius:12px;overflow:auto;min-height:360px}
+.pills{display:flex;gap:8px;margin-bottom:10px}.pill{padding:6px 10px;border:1px solid var(--line);border-radius:999px;background:#fff;cursor:pointer}.pill.active{background:#fff7ed;border-color:#fed7aa;color:#9a3412;font-weight:700}
+</style>
+</head>
+<body>
+<div class='wrap'>
+  <div class='card'>
+    <h2 style='margin:0 0 12px'>Imputation des temps (Boond)</h2>
+    <div class='pills'>
+      <button class='pill active' id='modeResource' type='button'>Ressource / mois</button>
+      <button class='pill' id='modeProject' type='button'>Projet / mois</button>
+      <button class='pill' id='modeDelivery' type='button'>Livraison / mois</button>
+    </div>
+    <div class='row'>
+      <div><label id='idLabel'>ID ressource Boond</label><input class='input' id='entityId' placeholder='94'></div>
+      <div><label>Mois</label><input class='input' id='term' placeholder='2025-03'></div>
+      <div><label>Affaire</label><input class='input' id='affaireId' placeholder='affaire_id auto'></div>
+      <div><button id='runBtn'>Charger</button></div>
+    </div>
+    <div class='row2'>
+      <button id='btnTimes' class='ghost' type='button'>Debug times-reports</button>
+      <button id='btnPos' class='ghost' type='button'>Debug positionings</button>
+      <button id='btnOpenRaw' class='ghost' type='button'>Ouvrir endpoint JSON</button>
+    </div>
+  </div>
+  <div class='card' style='margin-top:14px'>
+    <pre id='out'>En attente...</pre>
+  </div>
+</div>
+<script>
+const qs=new URLSearchParams(location.search);
+const state={mode:'resource'};
+const out=document.getElementById('out');
+function sel(id){return document.getElementById(id)}
+function updateMode(mode){state.mode=mode;sel('modeResource').classList.toggle('active',mode==='resource');sel('modeProject').classList.toggle('active',mode==='project');sel('modeDelivery').classList.toggle('active',mode==='delivery');sel('idLabel').textContent=mode==='resource'?'ID ressource Boond':mode==='project'?'ID projet Boond':'ID livraison Boond';}
+function endpoint(){const id=encodeURIComponent(sel('entityId').value.trim());const term=encodeURIComponent(sel('term').value.trim());if(state.mode==='resource')return `/api/boond/imputation/resource/${id}/month/${term}`;if(state.mode==='project')return `/api/boond/imputation/project/${id}/month/${term}`;return `/api/boond/imputation/delivery/${id}/month/${term}`}
+async function loadJson(url){out.textContent='Chargement...';const r=await fetch(url);const d=await r.json().catch(()=>({detail:'Réponse non JSON'}));if(!r.ok){out.textContent=JSON.stringify({error:d},null,2);throw new Error(d.detail||'Erreur API');}out.textContent=JSON.stringify(d,null,2);}
+sel('modeResource').onclick=()=>updateMode('resource');
+sel('modeProject').onclick=()=>updateMode('project');
+sel('modeDelivery').onclick=()=>updateMode('delivery');
+sel('runBtn').onclick=()=>loadJson(endpoint());
+sel('btnOpenRaw').onclick=()=>window.open(endpoint(),'_blank');
+sel('btnTimes').onclick=()=>{const id=encodeURIComponent(sel('entityId').value.trim());if(state.mode!=='resource')return alert('Debug dispo en mode ressource');loadJson(`/api/boond/resources/${id}/times-reports`)};
+sel('btnPos').onclick=()=>{const id=encodeURIComponent(sel('entityId').value.trim());if(state.mode!=='resource')return alert('Debug dispo en mode ressource');loadJson(`/api/boond/resources/${id}/positionings`)};
+sel('affaireId').value=qs.get('affaire_id')||'';
+sel('term').value=qs.get('term')||new Date().toISOString().slice(0,7);
+updateMode(qs.get('mode')||'resource');
+</script>
+</body>
+</html>"""
 
 
 def finance_html() -> str:
@@ -3087,6 +3153,11 @@ def gestion_projet_page():
     return gestion_projet_html()
 
 
+@app.get("/imputation", response_class=HTMLResponse)
+def imputation_page():
+    return imputation_html()
+
+
 @app.get("/health", response_class=JSONResponse)
 def health():
     return {
@@ -3143,6 +3214,7 @@ def finance_index():
             "finance_ui": "/finance",
             "dashboard_ui": "/dashboard",
             "project_management_ui": "/gestion-projet",
+            "imputation_ui": "/imputation",
             "cache_status": "/api/finance/cache-status",
             "rebuild_cache": "/api/finance/rebuild-cache",
             "affaires": "/api/finance/affaires?search=...",
