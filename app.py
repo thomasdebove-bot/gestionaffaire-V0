@@ -5,11 +5,15 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import unicodedata
+from collections import defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlencode, urljoin
+from urllib.request import Request, urlopen
 
 from fastapi import Body, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
@@ -27,6 +31,7 @@ EXPECTED_SCHEMA_VERSION = "finance_affaires_dataset_v4"
 TEMPO_LOGO_PATH = os.getenv("TEMPO_LOGO_PATH", r"\\192.168.10.100\02 - affaires\02.2 - SYNTHESE\ZZ - METRONOME\Content\T logo.png")
 METRONOME_BASE_PATH = os.getenv("METRONOME_BASE_PATH", r"\\192.168.10.100\02 - affaires\02.2 - SYNTHESE\ZZ - METRONOME")
 POINTAGE_STORE_FILE = Path(os.getenv("POINTAGE_STORE_FILE", "pointage_store.json"))
+BOOND_CACHE_DB_PATH = Path(os.getenv("BOOND_CACHE_DB_PATH", "boond_cache.sqlite3"))
 METRONOME_FILES = {
     "projects": "Projects.csv",
     "entries": "Entries (Tasks & Memos).csv",
@@ -105,6 +110,321 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 
 app = FastAPI(title=APP_TITLE)
 
+
+
+
+def maybe_load_dotenv() -> None:
+    """Charge .env si python-dotenv est disponible (sans dépendance obligatoire)."""
+    dotenv_spec = __import__("importlib.util").util.find_spec("dotenv")
+    if dotenv_spec is None:
+        return
+    dotenv_module = __import__("importlib").import_module("dotenv")
+    load_dotenv = getattr(dotenv_module, "load_dotenv", None)
+    if callable(load_dotenv):
+        load_dotenv()
+
+
+maybe_load_dotenv()
+
+
+class BoondService:
+    """Service BOOND : appels API, cache SQLite et agrégation imputations."""
+
+    IMPORTANT_TOKENS = {"115", "CDG", "MDZ", "PASSY", "KENNEDY", "VALHUBERT", "PICPUS", "CONDORCET"}
+
+    def __init__(self, db_path: Path) -> None:
+        self.db_path = Path(db_path)
+        self._cache_lock = Lock()
+        self.manual_daily_rates_by_project: Dict[str, float] = {}
+
+        self.base_url = clean_text(os.getenv("BOOND_BASE_URL"))
+        self.client_token = clean_text(os.getenv("BOOND_CLIENT_TOKEN"))
+        self.client_key = clean_text(os.getenv("BOOND_CLIENT_KEY"))
+        self.user_token = clean_text(os.getenv("BOOND_USER_TOKEN"))
+        self.ensure_boond_cache_table()
+
+    def _validate_config(self) -> None:
+        missing = [
+            k for k, v in {
+                "BOOND_BASE_URL": self.base_url,
+                "BOOND_CLIENT_TOKEN": self.client_token,
+                "BOOND_CLIENT_KEY": self.client_key,
+                "BOOND_USER_TOKEN": self.user_token,
+            }.items() if not v
+        ]
+        if missing:
+            raise RuntimeError(f"[BOOND] Variables .env manquantes: {', '.join(missing)}")
+
+    def boond_headers(self) -> Dict[str, str]:
+        self._validate_config()
+        auth = f"{self.client_token}:{self.client_key}:{self.user_token}"
+        return {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "X-Jwt-Client-Boondmanager": auth,
+        }
+
+    def boond_get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        self._validate_config()
+        base = self.base_url.rstrip("/") + "/"
+        path_clean = path.lstrip("/")
+        url = urljoin(base, path_clean)
+        if params:
+            url = f"{url}?{urlencode(params, doseq=True)}"
+        req = Request(url, headers=self.boond_headers(), method="GET")
+        try:
+            with urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            logger.exception("[BOOND] Erreur GET %s", url)
+            raise RuntimeError(f"Erreur BOOND sur {path}: {exc}")
+
+    def _db(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def ensure_boond_cache_table(self) -> None:
+        with self._cache_lock:
+            with self._db() as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS boond_api_cache (
+                        cache_key TEXT PRIMARY KEY,
+                        payload TEXT NOT NULL,
+                        expires_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL
+                    )
+                    """
+                )
+                conn.commit()
+
+    def get_api_cache(self, cache_key: str) -> Optional[Dict[str, Any]]:
+        now_ts = int(datetime.now().timestamp())
+        with self._db() as conn:
+            row = conn.execute(
+                "SELECT payload, expires_at FROM boond_api_cache WHERE cache_key = ?",
+                (cache_key,),
+            ).fetchone()
+        if not row:
+            return None
+        if int(row["expires_at"]) < now_ts:
+            return None
+        return json.loads(row["payload"])
+
+    def set_api_cache(self, cache_key: str, payload: Dict[str, Any], ttl_seconds: int) -> None:
+        now_ts = int(datetime.now().timestamp())
+        expires_at = now_ts + int(ttl_seconds)
+        with self._db() as conn:
+            conn.execute(
+                """
+                INSERT INTO boond_api_cache(cache_key, payload, expires_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    payload = excluded.payload,
+                    expires_at = excluded.expires_at,
+                    updated_at = excluded.updated_at
+                """,
+                (cache_key, json.dumps(payload, ensure_ascii=False), expires_at, now_ts),
+            )
+            conn.commit()
+
+    def get_times_report_cached(self, times_report_id: str, ttl_seconds: int = 86400) -> Tuple[Dict[str, Any], str]:
+        cache_key = f"boond:times-report:{times_report_id}"
+        cached = self.get_api_cache(cache_key)
+        if cached is not None:
+            return cached, "cache"
+        payload = self.boond_get(f"/times-reports/{times_report_id}")
+        self.set_api_cache(cache_key, payload, ttl_seconds=ttl_seconds)
+        return payload, "api"
+
+    @staticmethod
+    def extract_projects_from_times_report(report: Dict[str, Any]) -> List[Dict[str, str]]:
+        # Chaîne fiable validée: workplaces-times -> times-report -> times -> delivery.project
+        projects: Dict[str, Dict[str, str]] = {}
+        rel_times = ((report.get("data") or {}).get("relationships") or {}).get("times") or {}
+        items = rel_times.get("data") or []
+        for item in items:
+            attrs = item.get("attributes") or {}
+            delivery = attrs.get("delivery") or {}
+            project = delivery.get("project") or {}
+            pid = clean_text(project.get("id"))
+            pref = clean_text(project.get("reference"))
+            if pid:
+                projects[pid] = {"project_id": pid, "project_reference": pref}
+        return list(projects.values())
+
+    @staticmethod
+    def normalize_text(value: Any) -> str:
+        txt = clean_text(value).upper()
+        txt = txt.replace("_", " ").replace("-", " ")
+        txt = re.sub(r"[^A-Z0-9\s]", " ", txt)
+        return re.sub(r"\s+", " ", txt).strip()
+
+    def score_project_match(self, project_name: str, boond_ref: str) -> Tuple[int, str]:
+        q = self.normalize_text(project_name)
+        r = self.normalize_text(boond_ref)
+        if not q or not r:
+            return 0, "empty"
+        if q == r:
+            return 100, "exact_reference"
+        if q in r or r in q:
+            return 93, "token_contains"
+        q_tokens = set(q.split())
+        r_tokens = set(r.split())
+        if not q_tokens or not r_tokens:
+            return 0, "empty_tokens"
+        overlap = q_tokens & r_tokens
+        base = int((len(overlap) / max(1, len(q_tokens))) * 80)
+        bonus = sum(8 for t in overlap if t in self.IMPORTANT_TOKENS)
+        return min(99, base + bonus), "token_overlap"
+
+    def find_best_boond_project_match(self, project_name: str, boond_projects: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        best: Optional[Dict[str, Any]] = None
+        for p in boond_projects:
+            score, matched_on = self.score_project_match(project_name, p.get("project_reference"))
+            if score < 55:
+                continue
+            candidate = {
+                "project_id": clean_text(p.get("project_id")),
+                "project_reference": clean_text(p.get("project_reference")),
+                "match_score": score,
+                "matched_on": matched_on,
+            }
+            if best is None or int(candidate["match_score"]) > int(best["match_score"]):
+                best = candidate
+        return best
+
+    def _fetch_all_workplaces_times(self) -> List[Dict[str, Any]]:
+        # Une seule collecte de workplaces-times, puis enrichissement avec times-reports en cache.
+        payload = self.boond_get("/workplaces-times")
+        data = payload.get("data") or []
+        return data if isinstance(data, list) else []
+
+    def build_boond_imputation_index(self, refresh: bool = False) -> Dict[str, Any]:
+        cache_key = "boond:index:projects:imputations"
+        if not refresh:
+            cached = self.get_api_cache(cache_key)
+            if cached is not None:
+                return cached
+
+        rows = self._fetch_all_workplaces_times()
+        structured_rows = []
+        unique_reports = set()
+        for row in rows:
+            attrs = row.get("attributes") or {}
+            rel = row.get("relationships") or {}
+            tr_id = clean_text((((rel.get("timesReport") or {}).get("data") or {}).get("id")))
+            duration = clean_number(attrs.get("duration"))
+            start_date = clean_text(attrs.get("startDate"))
+            if tr_id:
+                unique_reports.add(tr_id)
+            structured_rows.append({"times_report_id": tr_id, "duration": duration, "start_date": start_date})
+
+        report_to_projects: Dict[str, List[Dict[str, str]]] = {}
+        loaded_api = 0
+        loaded_cache = 0
+        for tr_id in unique_reports:
+            report_payload, source = self.get_times_report_cached(tr_id)
+            if source == "api":
+                loaded_api += 1
+            else:
+                loaded_cache += 1
+            report_to_projects[tr_id] = self.extract_projects_from_times_report(report_payload)
+
+        projects_index: Dict[str, Dict[str, Any]] = {}
+        for wr in structured_rows:
+            tr_projects = report_to_projects.get(wr["times_report_id"], [])
+            for project in tr_projects:
+                pid = project["project_id"]
+                pref = project.get("project_reference") or ""
+                if pid not in projects_index:
+                    projects_index[pid] = {
+                        "project_id": pid,
+                        "project_reference": pref,
+                        "total_days": 0.0,
+                        "by_month": defaultdict(float),
+                    }
+                projects_index[pid]["total_days"] += wr["duration"]
+                month = clean_text(wr["start_date"])[:7]
+                if re.match(r"^\d{4}-\d{2}$", month):
+                    projects_index[pid]["by_month"][month] += wr["duration"]
+
+        serializable_projects = []
+        for item in projects_index.values():
+            serializable_projects.append({
+                "project_id": item["project_id"],
+                "project_reference": item["project_reference"],
+                "total_days": round(item["total_days"], 2),
+                "by_month": {k: round(v, 2) for k, v in sorted(item["by_month"].items())},
+            })
+
+        result = {
+            "projects": serializable_projects,
+            "meta": {
+                "workplaces_rows": len(structured_rows),
+                "unique_times_reports": len(unique_reports),
+                "times_reports_loaded_from_api": loaded_api,
+                "times_reports_loaded_from_cache": loaded_cache,
+                "generated_at": now_iso(),
+            },
+        }
+        self.set_api_cache(cache_key, result, ttl_seconds=1800)
+        return result
+
+    def get_project_imputation_summary(self, project_name: str, refresh: bool = False) -> Dict[str, Any]:
+        index = self.build_boond_imputation_index(refresh=refresh)
+        projects = index.get("projects") or []
+        matched = self.find_best_boond_project_match(project_name, projects)
+
+        if not matched:
+            return {
+                "input_project_name": project_name,
+                "matched_project": None,
+                "totals": {
+                    "total_days": 0.0,
+                    "average_daily_rate": None,
+                    "total_cost": None,
+                    "cost_status": "missing_rate",
+                },
+                "by_month": [],
+                "meta": index.get("meta", {}),
+                "message": "Aucun projet BOOND correspondant trouvé.",
+            }
+
+        project_data = next((p for p in projects if clean_text(p.get("project_id")) == matched["project_id"]), None) or {}
+        total_days = clean_number(project_data.get("total_days"))
+        by_month_map = project_data.get("by_month") or {}
+
+        manual_rate = self.manual_daily_rates_by_project.get(matched["project_id"])
+        total_cost = None
+        cost_status = "missing_rate"
+        if manual_rate is not None:
+            total_cost = round(total_days * manual_rate, 2)
+            cost_status = "ok"
+
+        by_month = []
+        for month, days in sorted((by_month_map or {}).items()):
+            days_val = clean_number(days)
+            by_month.append({
+                "month": month,
+                "days": round(days_val, 2),
+                "cost": round(days_val * manual_rate, 2) if manual_rate is not None else None,
+            })
+
+        return {
+            "input_project_name": project_name,
+            "matched_project": matched,
+            "totals": {
+                "total_days": round(total_days, 2),
+                "average_daily_rate": manual_rate,
+                "total_cost": total_cost,
+                "cost_status": cost_status,
+            },
+            "by_month": by_month,
+            "meta": index.get("meta", {}),
+            "message": "Coût indisponible: aucun taux journalier fiable trouvé." if manual_rate is None else "OK",
+        }
 
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
@@ -2099,6 +2419,7 @@ class PointageService:
 service = FinanceService(WORKBOOK_PATH, SHEET_NAME, CACHE_FILE)
 metronome_service = MetronomeService(METRONOME_BASE_PATH)
 pointage_service = PointageService(POINTAGE_STORE_FILE)
+boond_service = BoondService(BOOND_CACHE_DB_PATH)
 
 
 def pointage_finance_summary(affaire_id: str, commande_ht: float) -> Dict[str, float]:
@@ -2119,6 +2440,66 @@ def pointage_finance_summary(affaire_id: str, commande_ht: float) -> Dict[str, f
         "pointage_progress_amount": round(progress_amount, 2),
     }
 
+
+
+
+def boond_imputations_html() -> str:
+    return """<!doctype html>
+<html lang='fr'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>Imputation des temps</title>
+<style>
+body{font-family:Inter,Arial,sans-serif;background:#f5f7fb;margin:0;color:#122033}.wrap{max-width:980px;margin:24px auto;padding:0 16px}
+.card{background:#fff;border:1px solid #dfe5ef;border-radius:14px;padding:16px;margin-bottom:12px}.kpis{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.small{color:#6e7a90;font-size:13px}.value{font-size:30px;font-weight:800}.warn{padding:10px;border-radius:10px;background:#fff7ef;border:1px solid #f1d4a4}
+table{width:100%;border-collapse:collapse}th,td{padding:8px;border-bottom:1px solid #eef2f7;text-align:left}
+.bar{height:10px;background:#eef2f7;border-radius:999px;overflow:hidden}.fill{height:100%;background:#ef8d00}
+</style></head><body><div class='wrap'>
+<div class='card'><h2>Imputation des temps</h2><div id='state' class='small'>Chargement…</div></div>
+<div id='content' style='display:none'>
+<div class='card'><div class='small'>Projet METRONOME</div><div id='inputName'></div><div class='small' style='margin-top:6px'>Projet BOOND matché</div><div id='matched'></div></div>
+<div class='card kpis'><div><div class='small'>Jours imputés cumulés</div><div id='kpiDays' class='value'>-</div></div><div><div class='small'>Coût cumulé</div><div id='kpiCost' class='value'>-</div></div></div>
+<div id='warning' class='card warn' style='display:none'></div>
+<div class='card'><h3>Répartition mensuelle</h3><div id='chart'></div><div id='table'></div></div>
+</div></div>
+<script>
+function esc(v){return String(v??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]||c));}
+function fmt(v){const n=Number(v||0);return n.toLocaleString('fr-FR',{maximumFractionDigits:2});}
+(async function(){
+  const params=new URLSearchParams(location.search); const project=params.get('project_name')||'';
+  const state=document.getElementById('state'); const content=document.getElementById('content');
+  if(!project){state.textContent='Paramètre project_name manquant.';return;}
+  try{
+    const r=await fetch('/api/boond/imputations/by-project?project_name='+encodeURIComponent(project));
+    const d=await r.json(); if(!r.ok) throw new Error(d.detail||'Erreur API');
+    state.style.display='none'; content.style.display='block';
+    document.getElementById('inputName').textContent=d.input_project_name||'-';
+    if(!d.matched_project){document.getElementById('matched').textContent='Aucun match BOOND';document.getElementById('kpiDays').textContent='0';document.getElementById('kpiCost').textContent='-';return;}
+    document.getElementById('matched').textContent=`${d.matched_project.project_reference} (score ${d.matched_project.match_score})`;
+    document.getElementById('kpiDays').textContent=fmt(d.totals.total_days);
+    document.getElementById('kpiCost').textContent=d.totals.total_cost==null?'Indisponible':fmt(d.totals.total_cost)+' €';
+    if(d.totals.cost_status!=='ok'){const w=document.getElementById('warning');w.style.display='block';w.textContent=d.message||'Coût indisponible faute de taux journalier.';}
+    const rows=d.by_month||[]; const max=Math.max(1,...rows.map(x=>Number(x.days||0)));
+    document.getElementById('chart').innerHTML=rows.map(x=>`<div style='margin:8px 0'><div class='small'>${esc(x.month)} — ${fmt(x.days)} j</div><div class='bar'><div class='fill' style='width:${(Number(x.days||0)/max)*100}%'></div></div></div>`).join('')||"<div class='small'>Aucune donnée mensuelle</div>";
+    document.getElementById('table').innerHTML=rows.length?`<table><thead><tr><th>Mois</th><th>Jours</th><th>Coût</th></tr></thead><tbody>${rows.map(x=>`<tr><td>${esc(x.month)}</td><td>${fmt(x.days)}</td><td>${x.cost==null?'-':fmt(x.cost)+' €'}</td></tr>`).join('')}</tbody></table>`:"";
+  }catch(e){state.textContent=e.message||'Erreur';}
+})();
+</script></body></html>"""
+
+
+@app.get("/api/boond/imputations/by-project", response_class=JSONResponse)
+def api_boond_imputation_by_project(project_name: str = Query(...), refresh: bool = Query(default=False)):
+    pname = clean_text(project_name)
+    if not pname:
+        raise HTTPException(status_code=400, detail="project_name obligatoire")
+    try:
+        return boond_service.get_project_imputation_summary(project_name=pname, refresh=bool(refresh))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/boond-imputations", response_class=HTMLResponse)
+def boond_imputations_page():
+    return HTMLResponse(boond_imputations_html())
 
 def landing_html() -> str:
     return """<!doctype html>
