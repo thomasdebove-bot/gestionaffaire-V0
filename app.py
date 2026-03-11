@@ -800,43 +800,42 @@ class BoondService:
     def find_active_project_positioning_for_time(
         self,
         work_date: str,
-        project_id: str,
         normalized_positionings: List[Dict[str, Any]]
     ) -> Optional[Dict[str, Any]]:
         wd = clean_text(work_date)[:10]
-        pid = clean_text(project_id)
         candidates: List[Dict[str, Any]] = []
         for pos in normalized_positionings:
-            pos_pid = clean_text(pos.get("related_project_id"))
-            if pid and pos_pid and pos_pid != pid:
-                continue
             start = clean_text(pos.get("start_date"))[:10]
             end = clean_text(pos.get("end_date"))[:10]
+            if not wd:
+                continue
             in_range = True
-            if start and wd and wd < start:
+            if start and wd < start:
                 in_range = False
-            if end and wd and wd > end:
+            if end and wd > end:
                 in_range = False
             if in_range:
                 candidates.append(pos)
 
-        if candidates:
-            candidates.sort(key=lambda x: (clean_text(x.get("start_date")), clean_text(x.get("id"))), reverse=True)
-            return candidates[0]
+        if not candidates:
+            return None
 
-        # fallback: plus récent sur le bon projet
-        fallback = [p for p in normalized_positionings if clean_text(p.get("related_project_id")) == pid]
-        if fallback:
-            fallback.sort(key=lambda x: (clean_text(x.get("start_date")), clean_text(x.get("id"))), reverse=True)
-            return fallback[0]
-        return None
+        # Si plusieurs positionings couvrent la date, prendre celui dont le startDate
+        # est le plus proche mais <= work_date.
+        def sort_key(x: Dict[str, Any]):
+            start = clean_text(x.get("start_date"))[:10]
+            has_start = 1 if start else 0
+            return (has_start, start, clean_text(x.get("id")))
+
+        candidates.sort(key=sort_key, reverse=True)
+        return candidates[0]
 
     def resolve_line_cost_from_positioning(
         self,
         times_report_id: str,
         work_date: str,
         duration: float,
-        project_id: str,
+        project_id: str = "",
     ) -> Dict[str, Any]:
         tr_payload, _ = self.get_times_report_cached(times_report_id, ttl_seconds=86400)
         resource_id = self._extract_resource_id_from_times_report(tr_payload)
@@ -866,10 +865,9 @@ class BoondService:
                 except Exception:
                     continue
             nd = self.normalize_positioning_detail(detail)
-            nd["related_project_id"] = self.extract_project_id_from_positioning_detail(detail)
             normalized_positionings.append(nd)
 
-        active = self.find_active_project_positioning_for_time(work_date, project_id, normalized_positionings)
+        active = self.find_active_project_positioning_for_time(work_date, normalized_positionings)
         if not active:
             return {"resource_id": resource_id, "positioning_id": None, "average_daily_cost": None, "line_cost": None}
 
