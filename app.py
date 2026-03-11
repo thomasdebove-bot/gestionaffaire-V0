@@ -2381,6 +2381,44 @@ class BoondService:
             ttl_seconds=4 * 3600,
         )
 
+
+    def _resources_directory(self) -> Dict[str, str]:
+        payload = self.boond_get_cached(
+            cache_key="boond:resources:index",
+            path="/resources",
+            ttl_seconds=12 * 3600,
+        )
+        out: Dict[str, str] = {}
+        for item in payload.get("data") or []:
+            rid = clean_text(item.get("id"))
+            attrs = item.get("attributes") or {}
+            full_name = clean_text(attrs.get("name") or attrs.get("fullName"))
+            if not full_name:
+                first = clean_text(attrs.get("firstName"))
+                last = clean_text(attrs.get("lastName"))
+                full_name = clean_text(f"{first} {last}")
+            if rid:
+                out[rid] = full_name or f"Ressource {rid}"
+        return out
+
+    @staticmethod
+    def _term_leq(left: str, right: str) -> bool:
+        l = clean_text(left)
+        r = clean_text(right)
+        if not l or not r:
+            return False
+        return l <= r
+
+    def _resource_terms_until(self, resource_id: str, until_term: str) -> List[str]:
+        payload = self._resource_report_list(resource_id)
+        terms: List[str] = []
+        for item in payload.get("data") or []:
+            attrs = item.get("attributes") or {}
+            t = clean_text(attrs.get("term") or attrs.get("month"))
+            if t and self._term_leq(t, until_term):
+                terms.append(t)
+        return sorted(set(terms))
+
     def _times_report_detail(self, report_id: str, validated: bool = False) -> Dict[str, Any]:
         return self.boond_get_cached(
             cache_key=f"boond:times_report_detail:{report_id}",
@@ -2417,6 +2455,10 @@ class BoondService:
         validated = self._is_validated_times_report(report_item)
         report_detail = self._times_report_detail(report_id, validated=validated)
         lines = self.normalize_times_report_lines(report_detail)
+        resource_directory = self._resources_directory()
+        for line in lines:
+            if not clean_text(line.get("resource_name")):
+                line["resource_name"] = resource_directory.get(clean_text(line.get("resource_id")), f"Ressource {resource_id}")
 
         positionings_payload = self._resource_positionings(resource_id)
         positioning_ids = [clean_text(item.get("id")) for item in (positionings_payload.get("data") or []) if clean_text(item.get("id"))]
@@ -2612,7 +2654,7 @@ class BoondService:
         }
 
     def compute_affaire_month_imputation(self, affaire_id: str, term: str) -> Dict[str, Any]:
-        cache_key = f"cost:affaire:{affaire_id}:month:{term}"
+        cache_key = f"cost:affaire:{affaire_id}:month:{term}:cumulative"
         cached = self._get_cache_row("boond_business_cache", cache_key)
         if cached:
             return cached["payload"]
@@ -2620,11 +2662,13 @@ class BoondService:
         debug_match = self.resolve_boond_projects_for_affaire(affaire_id)
         matched_projects = debug_match.get("matched_projects", [])
         project_ids = {clean_text(p.get("project_id")) for p in matched_projects if clean_text(p.get("project_id"))}
+        resource_directory = self._resources_directory()
 
         if not project_ids:
             payload = {
                 "affaire_id": affaire_id,
                 "term": term,
+                "mode": "cumulative_until_term",
                 "matched_boond_projects": matched_projects,
                 "totals": {
                     "total_duration": 0.0,
@@ -2634,7 +2678,9 @@ class BoondService:
                     "matched_lines": 0,
                     "unmatched_lines": 0,
                     "projects_count": 0,
+                    "months_count": 0,
                 },
+                "by_month": [],
                 "by_resource": [],
                 "by_project": [],
                 "by_delivery": [],
@@ -2645,27 +2691,29 @@ class BoondService:
             self._set_cache_row("boond_business_cache", cache_key, payload, ttl_seconds=900)
             return payload
 
-        resources_payload = self.boond_get_cached(
-            cache_key="boond:resources:index",
-            path="/resources",
-            ttl_seconds=12 * 3600,
-        )
-        resource_ids = [clean_text(item.get("id")) for item in (resources_payload.get("data") or []) if clean_text(item.get("id"))]
+        resource_ids = sorted(resource_directory.keys())
 
         lines: List[Dict[str, Any]] = []
         warnings: List[str] = list(debug_match.get("warnings", []))
         for rid in resource_ids:
-            try:
-                resource_month = self.compute_resource_month_costs(rid, term)
-            except HTTPException:
-                continue
-            resource_lines = [line for line in (resource_month.get("lines") or []) if clean_text(line.get("project_id")) in project_ids]
-            lines.extend(resource_lines)
-            warnings.extend(resource_month.get("warnings") or [])
+            for report_term in self._resource_terms_until(rid, term):
+                try:
+                    resource_month = self.compute_resource_month_costs(rid, report_term)
+                except HTTPException:
+                    continue
+                for line in (resource_month.get("lines") or []):
+                    if clean_text(line.get("project_id")) not in project_ids:
+                        continue
+                    line = dict(line)
+                    line["resource_name"] = clean_text(line.get("resource_name")) or resource_directory.get(clean_text(line.get("resource_id")), f"Ressource {rid}")
+                    line["term"] = clean_text(line.get("report_term"))
+                    lines.append(line)
+                warnings.extend(resource_month.get("warnings") or [])
 
         by_resource: Dict[str, Dict[str, Any]] = {}
         by_project: Dict[str, Dict[str, Any]] = {}
         by_delivery: Dict[str, Dict[str, Any]] = {}
+        by_month: Dict[str, Dict[str, Any]] = {}
         total_duration = 0.0
         total_cost = 0.0
         matched_lines = 0
@@ -2681,12 +2729,21 @@ class BoondService:
             else:
                 unmatched_lines += 1
 
+            month_key = clean_text(line.get("term") or (clean_text(line.get("date"))[:7])) or "unknown"
+            month_rec = by_month.setdefault(month_key, {"month": month_key, "total_duration": 0.0, "total_cost": 0.0, "matched_lines": 0, "unmatched_lines": 0})
+            month_rec["total_duration"] += duration
+            month_rec["total_cost"] += line_cost
+            if line.get("match_status") == "matched":
+                month_rec["matched_lines"] += 1
+            else:
+                month_rec["unmatched_lines"] += 1
+
             rkey = clean_text(line.get("resource_id")) or "unknown"
             rrec = by_resource.setdefault(
                 rkey,
                 {
                     "resource_id": line.get("resource_id"),
-                    "resource_name": line.get("resource_name") or line.get("resource_id"),
+                    "resource_name": line.get("resource_name") or resource_directory.get(rkey, f"Ressource {rkey}"),
                     "total_duration": 0.0,
                     "total_cost": 0.0,
                 },
@@ -2725,6 +2782,7 @@ class BoondService:
         payload = {
             "affaire_id": affaire_id,
             "term": term,
+            "mode": "cumulative_until_term",
             "matched_boond_projects": matched_projects,
             "totals": {
                 "total_duration": total_duration,
@@ -2734,11 +2792,13 @@ class BoondService:
                 "matched_lines": matched_lines,
                 "unmatched_lines": unmatched_lines,
                 "projects_count": len(by_project),
+                "months_count": len(by_month),
             },
+            "by_month": sorted(by_month.values(), key=lambda x: x.get("month", "")),
             "by_resource": sorted(by_resource.values(), key=lambda x: x.get("total_cost", 0), reverse=True),
             "by_project": sorted(by_project.values(), key=lambda x: x.get("total_cost", 0), reverse=True),
             "by_delivery": sorted(by_delivery.values(), key=lambda x: x.get("total_cost", 0), reverse=True),
-            "lines": sorted(lines, key=lambda x: (x.get("date", ""), clean_text(x.get("resource_name")))),
+            "lines": sorted(lines, key=lambda x: (x.get("term", ""), x.get("date", ""), clean_text(x.get("resource_name")))),
             "warnings": sorted(set(warnings)),
             "debug_match": debug_match,
         }
@@ -2966,8 +3026,13 @@ details{margin-top:10px}
       <div class='kpi'><div class='t'>Coût total imputé</div><div class='v' id='kCost'>0 €</div></div>
       <div class='kpi'><div class='t'>Nb ressources</div><div class='v' id='kResources'>0</div></div>
       <div class='kpi'><div class='t'>Nb livraisons</div><div class='v' id='kDeliveries'>0</div></div>
-      <div class='kpi'><div class='t'>Nb projets Boond</div><div class='v' id='kProjects'>0</div></div>
+      <div class='kpi'><div class='t'>Nb projets Boond matchés</div><div class='v' id='kProjects'>0</div></div>
     </div>
+  </div>
+
+  <div class='card section'>
+    <h3 style='margin:0 0 8px'>Cumul par mois</h3>
+    <div style='max-height:260px;overflow:auto'><table class='table' id='tblMonth'></table></div>
   </div>
 
   <div class='card section'>
@@ -3017,7 +3082,8 @@ function endpointMatch(){const a=encodeURIComponent(s('affaireId').value.trim())
 async function api(url){const r=await fetch(url);const d=await r.json().catch(()=>({detail:'Réponse non JSON'}));if(!r.ok) throw new Error(d.detail||'Erreur API');return d;}
 function renderTable(elId, headers, rows){const el=s(elId);if(!rows.length){el.innerHTML='<tr><td>Aucune donnée</td></tr>';return;}el.innerHTML='<thead><tr>'+headers.map(h=>`<th>${h}</th>`).join('')+'</tr></thead><tbody>'+rows.join('')+'</tbody>';}
 function render(payload){const t=payload.totals||{};s('kDuration').textContent=fmtNum(t.total_duration);s('kCost').textContent=fmtEur(t.total_cost);s('kResources').textContent=t.resources_count||0;s('kDeliveries').textContent=t.deliveries_count||0;s('kProjects').textContent=t.projects_count||0;
-const warnings=(payload.warnings||[]);s('msg').innerHTML=warnings.length?`<div class='danger'>${warnings.map(w=>`• ${w}`).join('<br>')}</div>`:'<div>Calcul chargé.</div>';
+const warnings=(payload.warnings||[]);s('msg').innerHTML=warnings.length?`<div class='danger'>${warnings.map(w=>`• ${w}`).join('<br>')}</div>`:'<div>Calcul cumulé chargé jusqu'au mois demandé.</div>';
+renderTable('tblMonth',['Mois','Jours cumulés','Coût cumulé','Lignes matchées','Lignes non matchées'],(payload.by_month||[]).map(m=>`<tr><td>${m.month||''}</td><td>${fmtNum(m.total_duration)}</td><td>${fmtEur(m.total_cost)}</td><td>${m.matched_lines||0}</td><td>${m.unmatched_lines||0}</td></tr>`));
 renderTable('tblResource',['Ressource','Jours imputés','Coût total'],(payload.by_resource||[]).map(r=>`<tr><td>${r.resource_name||r.resource_id||''}</td><td>${fmtNum(r.total_duration)}</td><td>${fmtEur(r.total_cost)}</td></tr>`));
 renderTable('tblDelivery',['Livraison','Projet','Jours','Coût'],(payload.by_delivery||[]).map(d=>`<tr><td>${d.delivery_title||d.delivery_id||''}</td><td>${d.project_reference||d.project_id||''}</td><td>${fmtNum(d.total_duration)}</td><td>${fmtEur(d.total_cost)}</td></tr>`));
 renderTable('tblLines',['Date','Ressource','Livraison','Jours','CJM','Coût','Statut'],(payload.lines||[]).map(l=>`<tr><td>${l.date||''}</td><td>${l.resource_name||l.resource_id||''}</td><td>${l.delivery_title||l.delivery_id||''}</td><td>${fmtNum(l.duration)}</td><td>${l.average_daily_cost==null?'':fmtEur(l.average_daily_cost)}</td><td>${l.cost==null?'':fmtEur(l.cost)}</td><td>${l.match_status||''}</td></tr>`));
