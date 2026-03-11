@@ -828,6 +828,7 @@ class BoondService:
         times_report_id: str,
         work_date: str,
         duration: float,
+        force_refresh: bool = False,
     ) -> Dict[str, Any]:
         tr_payload, _ = self.get_times_report_cached(times_report_id)
         tr_data = tr_payload.get("data") or {}
@@ -842,7 +843,7 @@ class BoondService:
                 "line_cost": None,
             }
 
-        pos_items = self.get_all_resource_positionings(resource_id)
+        pos_items = self.get_all_resource_positionings(resource_id, force_refresh=force_refresh)
 
         normalized_positionings: List[Dict[str, Any]] = []
         for item in pos_items:
@@ -954,9 +955,9 @@ class BoondService:
         self.set_api_cache(cache_key, payload, ttl_seconds=86400)
         return payload
 
-    def get_all_resource_positionings(self, resource_id: str) -> List[Dict[str, Any]]:
+    def get_all_resource_positionings(self, resource_id: str, force_refresh: bool = False) -> List[Dict[str, Any]]:
         cache_key = f"boond:resource:{resource_id}:positionings:all"
-        cached = self.get_api_cache(cache_key)
+        cached = None if force_refresh else self.get_api_cache(cache_key)
         if isinstance(cached, list):
             return cached
 
@@ -1340,6 +1341,7 @@ class BoondService:
                 times_report_id=times_report_id,
                 work_date=start_date,
                 duration=duration,
+                force_refresh=bool(refresh),
             )
             line_cost = clean_number(cost_info.get("line_cost"))
 
@@ -3645,11 +3647,12 @@ def api_boond_debug_project_cost_path(project_name: str):
 
 
 @app.get("/api/boond/debug/line-cost", response_class=JSONResponse)
-def api_boond_debug_line_cost(times_report_id: str, work_date: str, duration: float):
+def api_boond_debug_line_cost(times_report_id: str, work_date: str, duration: float, refresh: bool = False):
     return boond_service.resolve_line_cost_from_positioning(
         times_report_id=times_report_id,
         work_date=work_date,
         duration=duration,
+        force_refresh=bool(refresh),
     )
 
 
@@ -3694,8 +3697,8 @@ def api_boond_debug_positioning_match_check(positioning_id: str, project_id: str
 
 
 @app.get("/api/boond/debug/positionings-covering-date", response_class=JSONResponse)
-def api_boond_debug_positionings_covering_date(resource_id: str, work_date: str):
-    items = boond_service.get_all_resource_positionings(resource_id)
+def api_boond_debug_positionings_covering_date(resource_id: str, work_date: str, refresh: bool = False):
+    items = boond_service.get_all_resource_positionings(resource_id, force_refresh=bool(refresh))
 
     results = []
     for item in items:
@@ -3739,7 +3742,7 @@ def api_boond_debug_positionings_covering_date(resource_id: str, work_date: str)
 
 
 @app.get("/api/boond/debug/line-cost-window", response_class=JSONResponse)
-def api_boond_debug_line_cost_window(times_report_id: str, work_date: str):
+def api_boond_debug_line_cost_window(times_report_id: str, work_date: str, refresh: bool = False):
     tr_payload, _ = boond_service.get_times_report_cached(times_report_id)
     tr_data = tr_payload.get("data") or {}
     tr_rel = tr_data.get("relationships") or {}
@@ -3748,7 +3751,7 @@ def api_boond_debug_line_cost_window(times_report_id: str, work_date: str):
     if not resource_id:
         return {"error": "no_resource_id", "times_report_id": times_report_id}
 
-    items = boond_service.get_all_resource_positionings(resource_id)
+    items = boond_service.get_all_resource_positionings(resource_id, force_refresh=bool(refresh))
 
     active = []
     for item in items:
