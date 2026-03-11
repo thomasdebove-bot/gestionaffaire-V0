@@ -383,6 +383,17 @@ class BoondService:
 
 
     @staticmethod
+    def _extract_resource_id_from_times_report(report: Dict[str, Any]) -> str:
+        data = report.get("data") or {}
+        rel = data.get("relationships") or {}
+        rid = clean_text((((rel.get("resource") or {}).get("data") or {}).get("id")))
+        if rid:
+            return rid
+        # Fallback: certaines instances exposent la resource dans les times.
+        ctx = BoondService._extract_times_report_context(report)
+        return clean_text(ctx.get("resource_id"))
+
+    @staticmethod
     def _extract_times_report_context(report: Dict[str, Any]) -> Dict[str, str]:
         resource_id = ""
         delivery_id = ""
@@ -917,15 +928,15 @@ class BoondService:
 
         project_id = clean_text(matched.get("project_id"))
         rows = self.get_project_workplaces_times(project_id)
-        resource_index = self._build_resource_rate_index()
-
         total_days = 0.0
         rated_days = 0.0
         unrated_days = 0.0
         total_cost = 0.0
         by_month_map: Dict[str, float] = defaultdict(float)
         by_month_cost_map: Dict[str, float] = defaultdict(float)
-        report_context_map: Dict[str, Dict[str, str]] = {}
+
+        times_report_cache: Dict[str, Dict[str, Any]] = {}
+        resource_cache: Dict[str, Dict[str, Any]] = {}
         rate_sources_count = {"resource": 0, "resource_rates": 0, "delivery": 0, "missing": 0}
 
         for row in rows:
@@ -940,38 +951,51 @@ class BoondService:
             if re.match(r"^\d{4}-\d{2}$", month):
                 by_month_map[month] += duration
 
-            row_context = {
-                "resource_id": self._extract_resource_id_from_workplace_time(row),
-                "delivery_id": "",
-                "project_id": project_id,
-            }
+            times_report_id = clean_text((((rel.get("timesReport") or {}).get("data") or {}).get("id")))
+            if not times_report_id:
+                unrated_days += duration
+                rate_sources_count["missing"] += 1
+                continue
 
-            tr_id = clean_text((((rel.get("timesReport") or {}).get("data") or {}).get("id")))
-            if tr_id:
-                if tr_id not in report_context_map:
-                    report_payload, _ = self.get_times_report_cached(tr_id)
-                    report_context_map[tr_id] = self._extract_times_report_context(report_payload)
-                tr_ctx = report_context_map.get(tr_id) or {}
-                if not row_context["resource_id"]:
-                    row_context["resource_id"] = clean_text(tr_ctx.get("resource_id"))
-                row_context["delivery_id"] = clean_text(tr_ctx.get("delivery_id"))
-                if clean_text(tr_ctx.get("project_id")):
-                    row_context["project_id"] = clean_text(tr_ctx.get("project_id"))
+            if times_report_id not in times_report_cache:
+                tr_payload, _ = self.get_times_report_cached(times_report_id)
+                times_report_cache[times_report_id] = tr_payload
+            tr = times_report_cache[times_report_id]
 
-            daily_rate, rate_source = self.resolve_row_daily_rate(row_context, resource_index)
-            rate_sources_count[rate_source] = rate_sources_count.get(rate_source, 0) + 1
+            resource_id = self._extract_resource_id_from_times_report(tr)
+            if not resource_id:
+                unrated_days += duration
+                rate_sources_count["missing"] += 1
+                continue
 
-            if daily_rate:
-                line_cost = duration * daily_rate
+            if resource_id not in resource_cache:
+                resource_cache[resource_id] = self.boond_get(f"/resources/{resource_id}")
+            resource = resource_cache[resource_id]
+
+            data = resource.get("data") or resource
+            attrs_res = data.get("attributes", {}) or {}
+            daily_cost = None
+            for key in ["dailyCost", "cost", "daily_rate"]:
+                val = attrs_res.get(key)
+                num = clean_number(val)
+                if num > 0:
+                    daily_cost = float(num)
+                    break
+
+            if daily_cost:
+                line_cost = duration * daily_cost
                 total_cost += line_cost
                 rated_days += duration
+                rate_sources_count["resource"] += 1
                 if re.match(r"^\d{4}-\d{2}$", month):
                     by_month_cost_map[month] += line_cost
+                print(f"[BOOND COST] res={resource_id} rate={daily_cost} days={duration} cost={line_cost}")
             else:
                 unrated_days += duration
+                rate_sources_count["missing"] += 1
 
         cost_coverage_ratio = (rated_days / total_days) if total_days > 0 else 0.0
-        average_daily_rate = (total_cost / rated_days) if rated_days > 0 else None
+        average_daily_rate = (total_cost / total_days) if total_days > 0 and total_cost > 0 else None
 
         if rated_days == total_days and total_cost > 0:
             total_cost_out = round(total_cost, 2)
@@ -3210,8 +3234,8 @@ def api_boond_debug_delivery(delivery_id: str):
 
 @app.get("/api/boond/debug/times-report/{times_report_id}", response_class=JSONResponse)
 def api_boond_debug_times_report(times_report_id: str):
-    payload, source = boond_service.get_times_report_cached(times_report_id, ttl_seconds=300)
-    return {"source": source, "payload": payload}
+    payload, _ = boond_service.get_times_report_cached(times_report_id, ttl_seconds=300)
+    return payload
 
 
 @app.get("/api/boond/debug/project-cost-path", response_class=JSONResponse)
