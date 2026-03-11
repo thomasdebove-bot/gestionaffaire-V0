@@ -842,8 +842,7 @@ class BoondService:
                 "line_cost": None,
             }
 
-        pos_list_payload = self._resource_positionings(resource_id)
-        pos_items = pos_list_payload.get("data", []) or []
+        pos_items = self.get_all_resource_positionings(resource_id)
 
         normalized_positionings: List[Dict[str, Any]] = []
         for item in pos_items:
@@ -955,6 +954,39 @@ class BoondService:
         self.set_api_cache(cache_key, payload, ttl_seconds=86400)
         return payload
 
+    def get_all_resource_positionings(self, resource_id: str) -> List[Dict[str, Any]]:
+        cache_key = f"boond:resource:{resource_id}:positionings:all"
+        cached = self.get_api_cache(cache_key)
+        if isinstance(cached, list):
+            return cached
+
+        page = 1
+        per_page = 200
+        items: List[Dict[str, Any]] = []
+
+        while True:
+            try:
+                payload = self.boond_get(
+                    f"/resources/{resource_id}/positionings",
+                    params={"page": page, "perPage": per_page},
+                )
+            except Exception:
+                break
+
+            batch = payload.get("data", []) or []
+            if not batch:
+                break
+
+            items.extend(batch)
+
+            if len(batch) < per_page:
+                break
+
+            page += 1
+
+        self.set_api_cache(cache_key, items, ttl_seconds=86400)
+        return items
+
     def _positioning_detail(self, pos_id: str) -> Dict[str, Any]:
         cache_key = f"boond:positioning:{pos_id}"
         cached = self.get_api_cache(cache_key)
@@ -1004,7 +1036,7 @@ class BoondService:
         report_list = self._resource_report_list(resource_id)
         report_items = self._extract_report_item(report_list, term)
 
-        raw_pos = self._resource_positionings(resource_id).get("data", []) or []
+        raw_pos = self.get_all_resource_positionings(resource_id)
         normalized_positionings: List[Dict[str, Any]] = []
         for pos in raw_pos:
             pos_id = clean_text(pos.get("id"))
@@ -3658,6 +3690,103 @@ def api_boond_debug_positioning_match_check(positioning_id: str, project_id: str
         "project_rel_id": project_rel_id,
         "opportunity_rel_id": opportunity_rel_id,
         "note": "No project/opportunity equality check is used in cost computation; active positioning is selected by resource + date only.",
+    }
+
+
+@app.get("/api/boond/debug/positionings-covering-date", response_class=JSONResponse)
+def api_boond_debug_positionings_covering_date(resource_id: str, work_date: str):
+    items = boond_service.get_all_resource_positionings(resource_id)
+
+    results = []
+    for item in items:
+        pos_id = str(item.get("id") or "")
+        if not pos_id:
+            continue
+
+        try:
+            detail = boond_service.boond_get(f"/positionings/{pos_id}")
+        except Exception:
+            continue
+
+        data = detail.get("data") or {}
+        attrs = data.get("attributes") or {}
+
+        start = str(attrs.get("startDate") or "")
+        end = str(attrs.get("endDate") or "")
+        avg = attrs.get("averageDailyCost")
+
+        is_active = True
+        if start and work_date < start:
+            is_active = False
+        if end and work_date > end:
+            is_active = False
+
+        results.append({
+            "positioning_id": pos_id,
+            "startDate": start,
+            "endDate": end,
+            "averageDailyCost": avg,
+            "is_active_for_date": is_active,
+        })
+
+    results.sort(key=lambda x: x["startDate"] or "")
+    return {
+        "resource_id": resource_id,
+        "work_date": work_date,
+        "count": len(results),
+        "items": results,
+    }
+
+
+@app.get("/api/boond/debug/line-cost-window", response_class=JSONResponse)
+def api_boond_debug_line_cost_window(times_report_id: str, work_date: str):
+    tr_payload, _ = boond_service.get_times_report_cached(times_report_id)
+    tr_data = tr_payload.get("data") or {}
+    tr_rel = tr_data.get("relationships") or {}
+    resource_id = str((((tr_rel.get("resource") or {}).get("data")) or {}).get("id") or "")
+
+    if not resource_id:
+        return {"error": "no_resource_id", "times_report_id": times_report_id}
+
+    items = boond_service.get_all_resource_positionings(resource_id)
+
+    active = []
+    for item in items:
+        pos_id = str(item.get("id") or "")
+        if not pos_id:
+            continue
+
+        try:
+            detail = boond_service.boond_get(f"/positionings/{pos_id}")
+        except Exception:
+            continue
+
+        data = detail.get("data") or {}
+        attrs = data.get("attributes") or {}
+
+        start = str(attrs.get("startDate") or "")
+        end = str(attrs.get("endDate") or "")
+        avg = attrs.get("averageDailyCost")
+
+        if start and work_date < start:
+            continue
+        if end and work_date > end:
+            continue
+
+        active.append({
+            "positioning_id": pos_id,
+            "startDate": start,
+            "endDate": end,
+            "averageDailyCost": avg,
+        })
+
+    active.sort(key=lambda x: x["startDate"] or "", reverse=True)
+
+    return {
+        "times_report_id": times_report_id,
+        "work_date": work_date,
+        "resource_id": resource_id,
+        "active_positionings": active,
     }
 
 
