@@ -1052,8 +1052,8 @@ class BoondService:
         self.set_api_cache(cache_key, payload, ttl_seconds=ttl_seconds)
 
 
-    def compute_project_cumulative_cost_from_existing_engine(self, project_id: str, end_term: str) -> Dict[str, Any]:
-        cached = self.get_cached_project_cumulative_cost(project_id, end_term)
+    def compute_project_cumulative_cost_from_existing_engine(self, project_id: str, end_term: str, force_refresh: bool = False) -> Dict[str, Any]:
+        cached = None if force_refresh else self.get_cached_project_cumulative_cost(project_id, end_term)
         if cached is not None:
             return cached
 
@@ -1295,7 +1295,7 @@ class BoondService:
 
         # Coût: moteur positioning actif (source fiable)
         end_term = now_iso()[:7]
-        cost_engine = self.compute_project_cumulative_cost_from_existing_engine(project_id, end_term)
+        cost_engine = self.compute_project_cumulative_cost_from_existing_engine(project_id, end_term, force_refresh=bool(refresh))
         total_cost_out = cost_engine.get("total_cost")
         average_daily_rate = cost_engine.get("average_daily_cost")
         cost_status = clean_text(cost_engine.get("cost_status")) or "missing_rate"
@@ -3657,6 +3657,11 @@ def api_boond_project_cumulative_cost(project_id: str, term: str):
 @app.get("/api/boond/debug/project-cumulative-cost", response_class=JSONResponse)
 def api_boond_debug_project_cumulative_cost(project_id: str, term: str):
     return boond_service.compute_project_cumulative_cost_from_existing_engine(project_id, term)
+
+
+@app.get("/api/boond/debug/project-cost-summary", response_class=JSONResponse)
+def api_boond_debug_project_cost_summary(project_name: str, refresh: bool = False):
+    return boond_service.get_project_imputation_summary(project_name, refresh=refresh)
 
 
 @app.get("/boond-imputations", response_class=HTMLResponse)
