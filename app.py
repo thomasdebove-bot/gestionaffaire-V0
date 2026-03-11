@@ -139,6 +139,7 @@ class BoondService:
         self.db_path = Path(db_path)
         self._cache_lock = Lock()
         self.manual_daily_rates_by_project: Dict[str, float] = {}
+        self._last_match_debug: Dict[str, Any] = {}
 
         self.base_url = clean_text(os.getenv("BOOND_BASE_URL"))
         self.client_token = clean_text(os.getenv("BOOND_CLIENT_TOKEN"))
@@ -286,45 +287,197 @@ class BoondService:
         return list(projects.values())
 
     @staticmethod
-    def normalize_text(value: Any) -> str:
-        txt = clean_text(value).upper()
-        txt = txt.replace("_", " ").replace("-", " ")
+    def normalize_match_text(value: Any) -> str:
+        txt = clean_text(value)
+        txt = unicodedata.normalize("NFKD", txt)
+        txt = "".join(ch for ch in txt if not unicodedata.combining(ch))
+        txt = txt.upper().replace("_", " ").replace("-", " ").replace("/", " ")
         txt = re.sub(r"[^A-Z0-9\s]", " ", txt)
         return re.sub(r"\s+", " ", txt).strip()
 
-    def score_project_match(self, project_name: str, boond_ref: str) -> Tuple[int, str]:
-        q = self.normalize_text(project_name)
-        r = self.normalize_text(boond_ref)
-        if not q or not r:
-            return 0, "empty"
-        if q == r:
-            return 100, "exact_reference"
-        if q in r or r in q:
-            return 93, "token_contains"
-        q_tokens = set(q.split())
-        r_tokens = set(r.split())
-        if not q_tokens or not r_tokens:
-            return 0, "empty_tokens"
-        overlap = q_tokens & r_tokens
-        base = int((len(overlap) / max(1, len(q_tokens))) * 80)
-        bonus = sum(8 for t in overlap if t in self.IMPORTANT_TOKENS)
-        return min(99, base + bonus), "token_overlap"
+    def _keywords_from_values(self, values: List[str]) -> List[str]:
+        kws: set[str] = set()
+        for value in values:
+            for tok in self.normalize_match_text(value).split():
+                if tok.isdigit() or len(tok) >= 3:
+                    kws.add(tok)
+        return sorted(kws)
+
+    def _get_metronome_match_context(self, project_name: str) -> Dict[str, Any]:
+        # Réutilise le cache finance METRONOME pour enrichir le matching BOOND.
+        finance_service = globals().get("service")
+        if finance_service is None:
+            return {"keywords": self._keywords_from_values([project_name])}
+
+        try:
+            cache = finance_service.get_finance_cache()
+            items = (cache or {}).get("items", {}) or {}
+        except Exception:
+            items = {}
+
+        target = self.normalize_match_text(project_name)
+        best_score = -1
+        best_item: Dict[str, Any] = {}
+        best_id = ""
+
+        for affaire_id, item in items.items():
+            display_name = clean_text(item.get("display_name"))
+            affaire = clean_text(item.get("affaire"))
+            numero = clean_text(item.get("numero"))
+            local_id = clean_text(affaire_id)
+            candidates = [display_name, affaire, numero, local_id]
+            score = 0
+            for c in candidates:
+                n = self.normalize_match_text(c)
+                if not n:
+                    continue
+                if n == target:
+                    score = max(score, 100)
+                elif target and (target in n or n in target):
+                    score = max(score, 80)
+                else:
+                    overlap = set(target.split()) & set(n.split())
+                    score = max(score, len(overlap) * 10)
+            if score > best_score:
+                best_score = score
+                best_item = item
+                best_id = local_id
+
+        context = {
+            "affaire_id": clean_text(best_id),
+            "display_name": clean_text(best_item.get("display_name")),
+            "affaire": clean_text(best_item.get("affaire")),
+            "numero": clean_text(best_item.get("numero")),
+            "client": clean_text(best_item.get("client")),
+        }
+        context_values = [
+            project_name,
+            context.get("display_name", ""),
+            context.get("affaire", ""),
+            context.get("numero", ""),
+            context.get("client", ""),
+            context.get("affaire_id", ""),
+        ]
+        context["keywords"] = self._keywords_from_values(context_values)
+        return context
+
+    @staticmethod
+    def _load_manual_boond_mapping() -> Dict[str, List[str]]:
+        path = Path("boond_affaire_map.json")
+        if not path.exists():
+            return {}
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return {}
+            out: Dict[str, List[str]] = {}
+            for key, value in raw.items():
+                if isinstance(value, list):
+                    out[clean_text(key)] = [clean_text(v) for v in value if clean_text(v)]
+            return out
+        except Exception:
+            logger.exception("[BOOND] Mapping manuel invalide")
+            return {}
+
+    def score_project_match(self, target_texts: List[str], target_keywords: List[str], boond_ref: str) -> Tuple[int, List[str]]:
+        ref = self.normalize_match_text(boond_ref)
+        if not ref:
+            return 0, ["empty_reference"]
+
+        score = 0
+        reasons: List[str] = []
+        strong_tokens = {"CDG", "MDZ", "PICPUS", "PASSY", "KENNEDY", "CONDORCET", "VALHUBERT", "MONTAIGNE", "ENGIE"}
+        strong_hits: set[str] = set()
+
+        for txt in target_texts:
+            n_txt = self.normalize_match_text(txt)
+            if not n_txt:
+                continue
+            if n_txt == ref:
+                score += 100
+                reasons.append(f"exact:{n_txt}")
+            elif n_txt in ref:
+                score += 45
+                reasons.append(f"contains:{n_txt}")
+
+        for kw in target_keywords:
+            n_kw = self.normalize_match_text(kw)
+            if not n_kw:
+                continue
+            if re.search(rf"\b{re.escape(n_kw)}\b", ref):
+                score += 12
+                reasons.append(f"keyword:{n_kw}")
+                if n_kw in strong_tokens:
+                    score += 10
+                    reasons.append(f"strong:{n_kw}")
+                    strong_hits.add(n_kw)
+
+        if len(strong_hits) >= 2:
+            score += 10
+            reasons.append("strong_coherence")
+
+        return min(100, score), reasons
 
     def find_best_boond_project_match(self, project_name: str, boond_projects: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        best: Optional[Dict[str, Any]] = None
+        context = self._get_metronome_match_context(project_name)
+        target_texts = [
+            project_name,
+            clean_text(context.get("display_name")),
+            clean_text(context.get("affaire")),
+            clean_text(context.get("numero")),
+            clean_text(context.get("client")),
+            clean_text(context.get("affaire_id")),
+        ]
+        target_texts = [t for t in target_texts if t]
+        target_keywords = context.get("keywords") or self._keywords_from_values(target_texts)
+
+        mapping = self._load_manual_boond_mapping()
+        mapped_ids = mapping.get(clean_text(project_name), [])
+        if mapped_ids:
+            mapped_set = set(mapped_ids)
+            for p in boond_projects:
+                pid = clean_text(p.get("project_id"))
+                if pid in mapped_set:
+                    result = {
+                        "project_id": pid,
+                        "project_reference": clean_text(p.get("project_reference")),
+                        "match_score": 100,
+                        "matched_on": "manual_mapping",
+                        "match_reasons": ["manual_mapping"],
+                        "metronome_context": context,
+                    }
+                    self._last_match_debug = {
+                        "input_project_name": project_name,
+                        "metronome_context": context,
+                        "top_candidates": [result],
+                    }
+                    return result
+
+        candidates: List[Dict[str, Any]] = []
         for p in boond_projects:
-            score, matched_on = self.score_project_match(project_name, p.get("project_reference"))
-            if score < 55:
+            pref = clean_text(p.get("project_reference"))
+            score, reasons = self.score_project_match(target_texts, target_keywords, pref)
+            if score < 35:
                 continue
-            candidate = {
+            candidates.append({
                 "project_id": clean_text(p.get("project_id")),
-                "project_reference": clean_text(p.get("project_reference")),
-                "match_score": score,
-                "matched_on": matched_on,
-            }
-            if best is None or int(candidate["match_score"]) > int(best["match_score"]):
-                best = candidate
-        return best
+                "project_reference": pref,
+                "match_score": int(score),
+                "matched_on": reasons[0] if reasons else "scored",
+                "match_reasons": reasons,
+                "metronome_context": context,
+            })
+
+        candidates.sort(key=lambda c: (-int(c.get("match_score", 0)), clean_text(c.get("project_reference"))))
+        self._last_match_debug = {
+            "input_project_name": project_name,
+            "metronome_context": context,
+            "top_candidates": candidates[:5],
+        }
+
+        if candidates and int(candidates[0].get("match_score", 0)) >= 45:
+            return candidates[0]
+        return None
 
     def _fetch_all_workplaces_times(self) -> List[Dict[str, Any]]:
         # Une seule collecte de workplaces-times, puis enrichissement avec times-reports en cache.
@@ -447,6 +600,7 @@ class BoondService:
                 },
                 "by_month": [],
                 "meta": index.get("meta", {}),
+                "match_debug": self._last_match_debug,
                 "message": "Aucun projet BOOND correspondant trouvé.",
             }
 
@@ -481,6 +635,7 @@ class BoondService:
             },
             "by_month": by_month,
             "meta": index.get("meta", {}),
+            "match_debug": self._last_match_debug,
             "message": "Coût indisponible: aucun taux journalier fiable trouvé." if manual_rate is None else "OK",
         }
 
@@ -2514,7 +2669,7 @@ table{width:100%;border-collapse:collapse}th,td{padding:8px;border-bottom:1px so
 </style></head><body><div class='wrap'>
 <div class='card'><h2>Imputation des temps</h2><div id='state' class='small'>Chargement…</div></div>
 <div id='content' style='display:none'>
-<div class='card'><div class='small'>Projet METRONOME</div><div id='inputName'></div><div class='small' style='margin-top:6px'>Projet BOOND matché</div><div id='matched'></div></div>
+<div class='card'><div class='small'>Projet METRONOME</div><div id='inputName'></div><div class='small' style='margin-top:6px'>Projet BOOND matché</div><div id='matched'></div><div id='matchDetails' class='small' style='margin-top:8px'></div></div>
 <div class='card kpis'><div><div class='small'>Jours imputés cumulés</div><div id='kpiDays' class='value'>-</div></div><div><div class='small'>Coût cumulé</div><div id='kpiCost' class='value'>-</div></div></div>
 <div id='warning' class='card warn' style='display:none'></div>
 <div class='card'><h3>Répartition mensuelle</h3><div id='chart'></div><div id='table'></div></div>
@@ -2531,8 +2686,8 @@ function fmt(v){const n=Number(v||0);return n.toLocaleString('fr-FR',{maximumFra
     const d=await r.json(); if(!r.ok) throw new Error(d.detail||'Erreur API');
     state.style.display='none'; content.style.display='block';
     document.getElementById('inputName').textContent=d.input_project_name||'-';
-    if(!d.matched_project){document.getElementById('matched').textContent='Aucun match BOOND';document.getElementById('kpiDays').textContent='0';document.getElementById('kpiCost').textContent='-';return;}
-    document.getElementById('matched').textContent=`${d.matched_project.project_reference} (score ${d.matched_project.match_score})`;
+    if(!d.matched_project){document.getElementById('matched').textContent='Aucun match BOOND';document.getElementById('kpiDays').textContent='0';document.getElementById('kpiCost').textContent='-';const top=((d.match_debug||{}).top_candidates||[]).slice(0,3);document.getElementById('matchDetails').innerHTML=top.length?`Suggestions: <ul>${top.map(c=>`<li>${esc(c.project_reference)} (score ${c.match_score})</li>`).join('')}</ul>`:'Aucun candidat pertinent';return;}
+    document.getElementById('matched').textContent=`${d.matched_project.project_reference} (score ${d.matched_project.match_score})`;const reasons=(d.matched_project.match_reasons||[]);document.getElementById('matchDetails').innerHTML=reasons.length?`Raisons: ${reasons.map(esc).join(', ')}`:'';
     document.getElementById('kpiDays').textContent=fmt(d.totals.total_days);
     document.getElementById('kpiCost').textContent=d.totals.total_cost==null?'Indisponible':fmt(d.totals.total_cost)+' €';
     if(d.totals.cost_status!=='ok'){const w=document.getElementById('warning');w.style.display='block';w.textContent=d.message||'Coût indisponible faute de taux journalier.';}
