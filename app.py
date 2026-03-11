@@ -273,10 +273,8 @@ class BoondService:
         return resources
 
     @staticmethod
-    def extract_resource_daily_rate(resource: Dict[str, Any]) -> Optional[float]:
-
+    def extract_rate_from_resource(resource: Dict[str, Any]) -> Optional[float]:
         attrs = resource.get("attributes", {}) or {}
-
         candidates = [
             "productionDailyRate",
             "internalDailyRate",
@@ -288,15 +286,52 @@ class BoondService:
             "unitPrice",
             "costRate"
         ]
-
         for field in candidates:
-
             value = attrs.get(field)
-
-            if isinstance(value, (int, float)) and value > 0:
-                return float(value)
-
+            num = clean_number(value)
+            if num > 0:
+                return float(num)
         return None
+
+    @staticmethod
+    def extract_rate_from_resource_rates(payload: Dict[str, Any]) -> Optional[float]:
+        data = payload.get("data") or []
+        if isinstance(data, dict):
+            data = [data]
+        for item in data:
+            attrs = (item or {}).get("attributes", {}) or {}
+            for key in ["dailyRate", "costRate", "unitPrice", "price", "amount"]:
+                num = clean_number(attrs.get(key))
+                if num > 0:
+                    return float(num)
+            for key, value in attrs.items():
+                k = clean_text(key).lower()
+                if any(x in k for x in ["daily", "rate", "price", "amount", "cost"]):
+                    num = clean_number(value)
+                    if num > 0:
+                        return float(num)
+        return None
+
+    @staticmethod
+    def extract_rate_from_delivery(delivery: Dict[str, Any]) -> Optional[float]:
+        attrs = delivery.get("attributes", {}) or {}
+        candidates = [
+            "unitPrice",
+            "dailyRate",
+            "price",
+            "productionPrice",
+            "averageDailyCost",
+            "costRate"
+        ]
+        for field in candidates:
+            num = clean_number(attrs.get(field))
+            if num > 0:
+                return float(num)
+        return None
+
+    @staticmethod
+    def extract_resource_daily_rate(resource: Dict[str, Any]) -> Optional[float]:
+        return BoondService.extract_rate_from_resource(resource)
 
     def _build_resource_rate_index(self) -> Dict[str, Dict[str, Any]]:
         index: Dict[str, Dict[str, Any]] = {}
@@ -345,6 +380,79 @@ class BoondService:
                 if rid:
                     ids.add(rid)
         return sorted(ids)
+
+
+    @staticmethod
+    def _extract_times_report_context(report: Dict[str, Any]) -> Dict[str, str]:
+        resource_id = ""
+        delivery_id = ""
+        project_id = ""
+        rel_times = ((report.get("data") or {}).get("relationships") or {}).get("times") or {}
+        items = rel_times.get("data") or []
+        for item in items:
+            attrs = item.get("attributes") or {}
+            for key in ["resource", "user", "collaborator"]:
+                node = attrs.get(key) or {}
+                rid = clean_text((node or {}).get("id"))
+                if rid and not resource_id:
+                    resource_id = rid
+            delivery = attrs.get("delivery") or {}
+            did = clean_text(delivery.get("id"))
+            if did and not delivery_id:
+                delivery_id = did
+            project = delivery.get("project") or {}
+            pid = clean_text(project.get("id"))
+            if pid and not project_id:
+                project_id = pid
+            for key in ["resource", "user", "collaborator"]:
+                node = delivery.get(key) or {}
+                rid = clean_text((node or {}).get("id"))
+                if rid and not resource_id:
+                    resource_id = rid
+        return {
+            "resource_id": resource_id,
+            "delivery_id": delivery_id,
+            "project_id": project_id,
+        }
+
+    def resolve_row_daily_rate(self, row_context: Dict[str, Any], resources_index: Dict[str, Any]) -> Tuple[Optional[float], str]:
+        resource_id = clean_text(row_context.get("resource_id"))
+        if resource_id:
+            resource = resources_index.get(resource_id)
+            if resource:
+                rate = self.extract_rate_from_resource(resource)
+                if rate and rate > 0:
+                    return rate, "resource"
+
+            cache_key = f"boond:resource-rates:{resource_id}"
+            rates_payload = self.get_api_cache(cache_key)
+            if rates_payload is None:
+                try:
+                    rates_payload = self.boond_get(f"/resources/{resource_id}/rates")
+                    self.set_api_cache(cache_key, rates_payload, ttl_seconds=86400)
+                except Exception:
+                    rates_payload = None
+            if isinstance(rates_payload, dict):
+                rate = self.extract_rate_from_resource_rates(rates_payload)
+                if rate and rate > 0:
+                    return rate, "resource_rates"
+
+        delivery_id = clean_text(row_context.get("delivery_id"))
+        if delivery_id:
+            cache_key = f"boond:delivery:{delivery_id}"
+            delivery_payload = self.get_api_cache(cache_key)
+            if delivery_payload is None:
+                try:
+                    delivery_payload = self.boond_get(f"/deliveries/{delivery_id}")
+                    self.set_api_cache(cache_key, delivery_payload, ttl_seconds=86400)
+                except Exception:
+                    delivery_payload = None
+            if isinstance(delivery_payload, dict):
+                rate = self.extract_rate_from_delivery(delivery_payload.get("data") or delivery_payload)
+                if rate and rate > 0:
+                    return rate, "delivery"
+
+        return None, "missing"
 
     def _db(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
@@ -817,7 +925,8 @@ class BoondService:
         total_cost = 0.0
         by_month_map: Dict[str, float] = defaultdict(float)
         by_month_cost_map: Dict[str, float] = defaultdict(float)
-        report_resource_map: Dict[str, List[str]] = {}
+        report_context_map: Dict[str, Dict[str, str]] = {}
+        rate_sources_count = {"resource": 0, "resource_rates": 0, "delivery": 0, "missing": 0}
 
         for row in rows:
             attrs = row.get("attributes", {}) or {}
@@ -831,18 +940,26 @@ class BoondService:
             if re.match(r"^\d{4}-\d{2}$", month):
                 by_month_map[month] += duration
 
-            resource_id = self._extract_resource_id_from_workplace_time(row)
-            if not resource_id:
-                tr_id = clean_text((((rel.get("timesReport") or {}).get("data") or {}).get("id")))
-                if tr_id:
-                    if tr_id not in report_resource_map:
-                        report_payload, _ = self.get_times_report_cached(tr_id)
-                        report_resource_map[tr_id] = self._extract_resource_ids_from_times_report(report_payload)
-                    ids = report_resource_map.get(tr_id) or []
-                    resource_id = ids[0] if ids else ""
+            row_context = {
+                "resource_id": self._extract_resource_id_from_workplace_time(row),
+                "delivery_id": "",
+                "project_id": project_id,
+            }
 
-            resource = resource_index.get(resource_id) if resource_id else None
-            daily_rate = self.extract_resource_daily_rate(resource or {})
+            tr_id = clean_text((((rel.get("timesReport") or {}).get("data") or {}).get("id")))
+            if tr_id:
+                if tr_id not in report_context_map:
+                    report_payload, _ = self.get_times_report_cached(tr_id)
+                    report_context_map[tr_id] = self._extract_times_report_context(report_payload)
+                tr_ctx = report_context_map.get(tr_id) or {}
+                if not row_context["resource_id"]:
+                    row_context["resource_id"] = clean_text(tr_ctx.get("resource_id"))
+                row_context["delivery_id"] = clean_text(tr_ctx.get("delivery_id"))
+                if clean_text(tr_ctx.get("project_id")):
+                    row_context["project_id"] = clean_text(tr_ctx.get("project_id"))
+
+            daily_rate, rate_source = self.resolve_row_daily_rate(row_context, resource_index)
+            rate_sources_count[rate_source] = rate_sources_count.get(rate_source, 0) + 1
 
             if daily_rate:
                 line_cost = duration * daily_rate
@@ -856,11 +973,11 @@ class BoondService:
         cost_coverage_ratio = (rated_days / total_days) if total_days > 0 else 0.0
         average_daily_rate = (total_cost / rated_days) if rated_days > 0 else None
 
-        if total_cost > 0:
+        if rated_days == total_days and total_cost > 0:
             total_cost_out = round(total_cost, 2)
             cost_status = "ok"
-        elif rated_days > 0:
-            total_cost_out = None
+        elif rated_days > 0 and unrated_days > 0:
+            total_cost_out = round(total_cost, 2) if total_cost > 0 else None
             cost_status = "partial"
         else:
             total_cost_out = None
@@ -895,7 +1012,7 @@ class BoondService:
                 "cost_status": cost_status,
             },
             "by_month": by_month,
-            "meta": {**(index.get("meta", {}) or {}), "project_workplaces_rows": len(rows)},
+            "meta": {**(index.get("meta", {}) or {}), "project_workplaces_rows": len(rows), "rate_sources_count": rate_sources_count},
             "match_debug": self._last_match_debug,
             "message": message,
         }
@@ -3067,6 +3184,79 @@ def api_boond_debug_resources_search(q: str):
         "query": q,
         "count": len(matches),
         "matches": matches[:50],
+    }
+
+
+@app.get("/api/boond/debug/resource/{resource_id}", response_class=JSONResponse)
+def api_boond_debug_resource(resource_id: str):
+    resource = boond_service.boond_get(f"/resources/{resource_id}")
+    return resource
+
+
+@app.get("/api/boond/debug/resource/{resource_id}/rates", response_class=JSONResponse)
+def api_boond_debug_resource_rates(resource_id: str):
+    try:
+        rates = boond_service.boond_get(f"/resources/{resource_id}/rates")
+        return rates
+    except Exception as exc:
+        return {"resource_id": resource_id, "error": str(exc)}
+
+
+@app.get("/api/boond/debug/delivery/{delivery_id}", response_class=JSONResponse)
+def api_boond_debug_delivery(delivery_id: str):
+    delivery = boond_service.boond_get(f"/deliveries/{delivery_id}")
+    return delivery
+
+
+@app.get("/api/boond/debug/times-report/{times_report_id}", response_class=JSONResponse)
+def api_boond_debug_times_report(times_report_id: str):
+    payload, source = boond_service.get_times_report_cached(times_report_id, ttl_seconds=300)
+    return {"source": source, "payload": payload}
+
+
+@app.get("/api/boond/debug/project-cost-path", response_class=JSONResponse)
+def api_boond_debug_project_cost_path(project_name: str):
+    catalog = boond_service.get_all_boond_projects()
+    boond_projects_for_match: List[Dict[str, Any]] = []
+    for item in catalog:
+        attrs = item.get("attributes", {}) or {}
+        boond_projects_for_match.append({
+            "project_id": clean_text(item.get("id")),
+            "project_reference": clean_text(attrs.get("reference") or attrs.get("title") or attrs.get("name")),
+        })
+
+    matched = boond_service.find_best_boond_project_match(project_name, boond_projects_for_match)
+    if not matched:
+        return {
+            "input_project_name": project_name,
+            "matched_project": None,
+            "sample_rows": [],
+        }
+
+    rows = boond_service.get_project_workplaces_times(clean_text(matched.get("project_id")))
+    sample_rows = []
+    for row in rows[:5]:
+        attrs = row.get("attributes", {}) or {}
+        rel = row.get("relationships", {}) or {}
+        tr_id = clean_text((((rel.get("timesReport") or {}).get("data") or {}).get("id")))
+        tr_ctx = {"resource_id": "", "delivery_id": "", "project_id": ""}
+        if tr_id:
+            payload, _ = boond_service.get_times_report_cached(tr_id, ttl_seconds=300)
+            tr_ctx = boond_service._extract_times_report_context(payload)
+
+        sample_rows.append({
+            "duration": attrs.get("duration"),
+            "start_date": attrs.get("startDate"),
+            "times_report_id": tr_id,
+            "resource_id": boond_service._extract_resource_id_from_workplace_time(row) or tr_ctx.get("resource_id"),
+            "delivery_id": tr_ctx.get("delivery_id"),
+            "project_id": tr_ctx.get("project_id") or clean_text(matched.get("project_id")),
+        })
+
+    return {
+        "input_project_name": project_name,
+        "matched_project": matched,
+        "sample_rows": sample_rows,
     }
 
 
