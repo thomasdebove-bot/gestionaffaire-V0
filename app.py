@@ -797,35 +797,38 @@ class BoondService:
         oid = clean_text((((rel.get("opportunity") or {}).get("data") or {}).get("id")))
         return oid or None
 
-    def find_active_project_positioning_for_time(
+    def find_active_positioning_by_date(
         self,
         work_date: str,
         normalized_positionings: List[Dict[str, Any]]
     ) -> Optional[Dict[str, Any]]:
-        wd = clean_text(work_date)[:10]
+        work_date = clean_text(work_date)[:10]
+        if not work_date:
+            return None
+
         candidates: List[Dict[str, Any]] = []
         for pos in normalized_positionings:
             start = clean_text(pos.get("start_date"))[:10]
             end = clean_text(pos.get("end_date"))[:10]
-            if not wd:
+            avg = clean_number(pos.get("average_daily_cost"))
+
+            if avg <= 0:
                 continue
-            in_range = True
-            if start and wd < start:
-                in_range = False
-            if end and wd > end:
-                in_range = False
-            if in_range:
-                candidates.append(pos)
+
+            if start and work_date < start:
+                continue
+            if end and work_date > end:
+                continue
+
+            candidates.append(pos)
 
         if not candidates:
             return None
 
-        # Si plusieurs positionings couvrent la date, prendre celui dont le startDate
-        # est le plus proche mais <= work_date.
-        def sort_key(x: Dict[str, Any]):
-            start = clean_text(x.get("start_date"))[:10]
-            has_start = 1 if start else 0
-            return (has_start, start, clean_text(x.get("id")))
+        # prendre celui dont la start_date est la plus proche, mais <= work_date
+        def sort_key(pos: Dict[str, Any]):
+            start = clean_text(pos.get("start_date"))[:10]
+            return start or "0000-00-00"
 
         candidates.sort(key=sort_key, reverse=True)
         return candidates[0]
@@ -835,51 +838,68 @@ class BoondService:
         times_report_id: str,
         work_date: str,
         duration: float,
-        project_id: str = "",
     ) -> Dict[str, Any]:
-        tr_payload, _ = self.get_times_report_cached(times_report_id, ttl_seconds=86400)
-        resource_id = self._extract_resource_id_from_times_report(tr_payload)
-        if not resource_id:
-            return {"resource_id": "", "positioning_id": None, "average_daily_cost": None, "line_cost": None}
+        tr_payload, _ = self.get_times_report_cached(times_report_id)
+        tr_data = tr_payload.get("data") or {}
+        tr_rel = tr_data.get("relationships") or {}
 
-        pos_list_cache_key = f"boond:resource:{resource_id}:positionings"
-        pos_list_payload = self.get_api_cache(pos_list_cache_key)
-        if pos_list_payload is None:
-            try:
-                pos_list_payload = self.boond_get(f"/resources/{resource_id}/positionings", params={"perPage": 200})
-            except Exception:
-                pos_list_payload = {"data": []}
-            self.set_api_cache(pos_list_cache_key, pos_list_payload, ttl_seconds=86400)
+        resource_id = clean_text((((tr_rel.get("resource") or {}).get("data")) or {}).get("id"))
+        if not resource_id:
+            return {
+                "resource_id": None,
+                "positioning_id": None,
+                "average_daily_cost": None,
+                "line_cost": None,
+            }
+
+        pos_list_payload = self._resource_positionings(resource_id)
+        pos_items = pos_list_payload.get("data", []) or []
 
         normalized_positionings: List[Dict[str, Any]] = []
-        for pos in (pos_list_payload.get("data") or []):
-            pos_id = clean_text(pos.get("id"))
+        for item in pos_items:
+            pos_id = clean_text(item.get("id"))
             if not pos_id:
                 continue
-            detail_cache_key = f"boond:positioning:{pos_id}"
-            detail = self.get_api_cache(detail_cache_key)
-            if detail is None:
-                try:
-                    detail = self.boond_get(f"/positionings/{pos_id}")
-                    self.set_api_cache(detail_cache_key, detail, ttl_seconds=86400)
-                except Exception:
-                    continue
-            nd = self.normalize_positioning_detail(detail)
-            normalized_positionings.append(nd)
+            try:
+                detail = self._positioning_detail(pos_id)
+            except Exception:
+                continue
 
-        active = self.find_active_project_positioning_for_time(work_date, normalized_positionings)
+            data = detail.get("data") or {}
+            attrs = data.get("attributes") or {}
+
+            normalized_positionings.append({
+                "id": clean_text(data.get("id")),
+                "start_date": clean_text(attrs.get("startDate")),
+                "end_date": clean_text(attrs.get("endDate")),
+                "average_daily_cost": clean_number(attrs.get("averageDailyCost")),
+            })
+
+        active = self.find_active_positioning_by_date(work_date, normalized_positionings)
         if not active:
-            return {"resource_id": resource_id, "positioning_id": None, "average_daily_cost": None, "line_cost": None}
+            return {
+                "resource_id": resource_id,
+                "positioning_id": None,
+                "average_daily_cost": None,
+                "line_cost": None,
+            }
 
-        rate = clean_number(active.get("average_daily_cost"))
-        if rate <= 0:
-            return {"resource_id": resource_id, "positioning_id": clean_text(active.get("id")), "average_daily_cost": None, "line_cost": None}
+        avg = clean_number(active.get("average_daily_cost"))
+        line_cost = round(clean_number(duration) * avg, 6) if avg > 0 else None
 
-        line_cost = clean_number(duration) * rate
+        logger.info(
+            "[BOOND COST] resource=%s positioning=%s rate=%s days=%s cost=%s",
+            resource_id,
+            active.get("id"),
+            avg,
+            duration,
+            line_cost,
+        )
+
         return {
             "resource_id": resource_id,
-            "positioning_id": clean_text(active.get("id")),
-            "average_daily_cost": rate,
+            "positioning_id": active.get("id"),
+            "average_daily_cost": avg if avg > 0 else None,
             "line_cost": line_cost,
         }
 
@@ -1078,28 +1098,17 @@ class BoondService:
                 tr_payload, _src = self.get_times_report_cached(times_report_id, ttl_seconds=86400)
                 times_report_cache[times_report_id] = tr_payload
 
-            line_cost_info = self.resolve_line_cost_from_positioning(
+            cost_info = self.resolve_line_cost_from_positioning(
                 times_report_id=times_report_id,
                 work_date=work_date,
                 duration=duration,
-                project_id=project_id,
             )
-            line_cost = line_cost_info.get("line_cost")
-            if line_cost is not None:
-                total_cost += clean_number(line_cost)
+            line_cost = clean_number(cost_info.get("line_cost"))
+            if line_cost > 0:
+                total_cost += line_cost
                 rated_days += duration
                 if re.match(r"^\d{4}-\d{2}$", month):
-                    by_month[month]["cost"] += clean_number(line_cost)
-                logger.info(
-                    "[BOOND COST] project=%s times_report=%s resource=%s positioning=%s rate=%s days=%s cost=%s",
-                    project_id,
-                    times_report_id,
-                    line_cost_info.get("resource_id"),
-                    line_cost_info.get("positioning_id"),
-                    line_cost_info.get("average_daily_cost"),
-                    duration,
-                    line_cost,
-                )
+                    by_month[month]["cost"] += line_cost
             else:
                 unrated_days += duration
 
@@ -3588,8 +3597,12 @@ def api_boond_debug_project_cost_path(project_name: str):
 
 
 @app.get("/api/boond/debug/line-cost", response_class=JSONResponse)
-def api_boond_debug_line_cost(times_report_id: str, work_date: str, duration: float, project_id: str):
-    return boond_service.resolve_line_cost_from_positioning(times_report_id, work_date, duration, project_id)
+def api_boond_debug_line_cost(times_report_id: str, work_date: str, duration: float):
+    return boond_service.resolve_line_cost_from_positioning(
+        times_report_id=times_report_id,
+        work_date=work_date,
+        duration=duration,
+    )
 
 
 @app.get("/api/boond/debug/positioning-project-links/{positioning_id}", response_class=JSONResponse)
