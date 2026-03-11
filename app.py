@@ -23,6 +23,28 @@ from fastapi import Body, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from openpyxl import load_workbook
 
+
+
+def load_local_dotenv(dotenv_path: str = ".env") -> None:
+    path = Path(dotenv_path)
+    if not path.exists():
+        return
+    try:
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+    except Exception:
+        logger = logging.getLogger("finance_cockpit")
+        logger.warning("Impossible de charger le fichier .env")
+
+
+load_local_dotenv()
 APP_TITLE = "Gestion Affaire - Finance"
 DEFAULT_WORKBOOK_PATH = r"\\192.168.10.100\03 - finances\10 - TABLEAU DE BORD\01 - TABLEAU ACTIVITEE\TABLEAU ACTIVITEE.xlsx"
 DEFAULT_SHEET_NAME = "AFFAIRES 2026"
@@ -2267,7 +2289,9 @@ class BoondService:
         data = report_payload.get("data") or {}
         attrs = data.get("attributes") or {}
         rel = data.get("relationships") or {}
-        resource_id = clean_text((((rel.get("resource") or {}).get("data") or {}).get("id")))
+        resource_data = ((rel.get("resource") or {}).get("data") or {})
+        resource_id = clean_text(resource_data.get("id"))
+        resource_name = clean_text(resource_data.get("name") or attrs.get("resourceName") or attrs.get("resource_name"))
         report_id = clean_text(data.get("id"))
         report_term = clean_text(attrs.get("term") or attrs.get("month"))
         regular_times = attrs.get("regularTimes") or []
@@ -2285,6 +2309,7 @@ class BoondService:
                 {
                     "report_id": report_id,
                     "resource_id": resource_id,
+                    "resource_name": resource_name,
                     "report_term": report_term,
                     "date": clean_text(line.get("startDate")),
                     "duration": clean_number(line.get("duration")),
@@ -2488,6 +2513,238 @@ class BoondService:
         self._set_cache_row("boond_business_cache", f"cost:project_index:month:{term}", {"ok": True}, ttl_seconds=3600)
         return payload
 
+    @staticmethod
+    def _normalize_match_text(value: str) -> str:
+        text = clean_text(value).lower()
+        text = unicodedata.normalize("NFKD", text)
+        text = "".join(ch for ch in text if not unicodedata.combining(ch))
+        text = re.sub(r"[_\-/]+", " ", text)
+        text = re.sub(r"[^a-z0-9 ]+", " ", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    def _keywords_from_affaire(self, affaire_id: str) -> List[str]:
+        cache = service.get_finance_cache()
+        item = (cache.get("items") or {}).get(affaire_id, {})
+        raw_parts = [
+            affaire_id,
+            item.get("display_name", ""),
+            item.get("affaire", ""),
+            item.get("numero", ""),
+            item.get("client", ""),
+        ]
+        keywords: List[str] = []
+        for part in raw_parts:
+            for token in self._normalize_match_text(str(part)).split(" "):
+                if len(token) >= 3 or token.isdigit():
+                    keywords.append(token)
+        return sorted(set(keywords))
+
+    def _read_affaire_mapping(self) -> Dict[str, List[str]]:
+        mapping_file = Path(os.getenv("BOOND_AFFAIRE_MAP_FILE", "boond_affaire_map.json"))
+        if not mapping_file.exists():
+            return {}
+        try:
+            payload = json.loads(mapping_file.read_text(encoding="utf-8"))
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
+
+    def _boond_projects_index(self) -> Dict[str, Any]:
+        return self.boond_get_cached(
+            cache_key="boond:projects:index",
+            path="/projects",
+            ttl_seconds=12 * 3600,
+        )
+
+    def resolve_boond_projects_for_affaire(self, affaire_id: str) -> Dict[str, Any]:
+        mapping = self._read_affaire_mapping()
+        explicit = mapping.get(affaire_id) or mapping.get(clean_text(affaire_id))
+        projects_payload = self._boond_projects_index()
+        rows = projects_payload.get("data") or []
+        keywords = self._keywords_from_affaire(affaire_id)
+        affaire_norm = self._normalize_match_text(affaire_id)
+
+        candidates: List[Dict[str, Any]] = []
+        for row in rows:
+            attrs = row.get("attributes") or {}
+            project_id = clean_text(row.get("id"))
+            project_reference = clean_text(attrs.get("reference") or attrs.get("name") or attrs.get("title"))
+            project_text = self._normalize_match_text(project_reference)
+            score = 0
+            reasons: List[str] = []
+
+            if explicit and project_id in {str(x) for x in explicit}:
+                score = 100
+                reasons.append("manual_mapping")
+
+            if affaire_norm and affaire_norm in project_text:
+                score += 40
+                reasons.append(f"affaire_text:{affaire_norm}")
+
+            for kw in keywords:
+                if kw and kw in project_text:
+                    score += 12
+                    reasons.append(f"keyword:{kw}")
+
+            if score > 0:
+                candidates.append(
+                    {
+                        "project_id": project_id,
+                        "project_reference": project_reference,
+                        "match_score": min(score, 100),
+                        "match_reasons": reasons,
+                    }
+                )
+
+        candidates.sort(key=lambda x: (x["match_score"], x["project_reference"]), reverse=True)
+        matched = [c for c in candidates if c["match_score"] >= 50]
+        warnings: List[str] = []
+        if not matched:
+            warnings.append(f"Aucun projet Boond fiable trouvé pour l'affaire {affaire_id}")
+            matched = candidates[:5]
+
+        return {
+            "affaire_id": affaire_id,
+            "keywords": keywords,
+            "matched_projects": matched,
+            "candidates": candidates[:20],
+            "warnings": warnings,
+        }
+
+    def compute_affaire_month_imputation(self, affaire_id: str, term: str) -> Dict[str, Any]:
+        cache_key = f"cost:affaire:{affaire_id}:month:{term}"
+        cached = self._get_cache_row("boond_business_cache", cache_key)
+        if cached:
+            return cached["payload"]
+
+        debug_match = self.resolve_boond_projects_for_affaire(affaire_id)
+        matched_projects = debug_match.get("matched_projects", [])
+        project_ids = {clean_text(p.get("project_id")) for p in matched_projects if clean_text(p.get("project_id"))}
+
+        if not project_ids:
+            payload = {
+                "affaire_id": affaire_id,
+                "term": term,
+                "matched_boond_projects": matched_projects,
+                "totals": {
+                    "total_duration": 0.0,
+                    "total_cost": 0.0,
+                    "resources_count": 0,
+                    "deliveries_count": 0,
+                    "matched_lines": 0,
+                    "unmatched_lines": 0,
+                    "projects_count": 0,
+                },
+                "by_resource": [],
+                "by_project": [],
+                "by_delivery": [],
+                "lines": [],
+                "warnings": debug_match.get("warnings", []),
+                "debug_match": debug_match,
+            }
+            self._set_cache_row("boond_business_cache", cache_key, payload, ttl_seconds=900)
+            return payload
+
+        resources_payload = self.boond_get_cached(
+            cache_key="boond:resources:index",
+            path="/resources",
+            ttl_seconds=12 * 3600,
+        )
+        resource_ids = [clean_text(item.get("id")) for item in (resources_payload.get("data") or []) if clean_text(item.get("id"))]
+
+        lines: List[Dict[str, Any]] = []
+        warnings: List[str] = list(debug_match.get("warnings", []))
+        for rid in resource_ids:
+            try:
+                resource_month = self.compute_resource_month_costs(rid, term)
+            except HTTPException:
+                continue
+            resource_lines = [line for line in (resource_month.get("lines") or []) if clean_text(line.get("project_id")) in project_ids]
+            lines.extend(resource_lines)
+            warnings.extend(resource_month.get("warnings") or [])
+
+        by_resource: Dict[str, Dict[str, Any]] = {}
+        by_project: Dict[str, Dict[str, Any]] = {}
+        by_delivery: Dict[str, Dict[str, Any]] = {}
+        total_duration = 0.0
+        total_cost = 0.0
+        matched_lines = 0
+        unmatched_lines = 0
+
+        for line in lines:
+            duration = clean_number(line.get("duration"))
+            line_cost = clean_number(line.get("cost")) if line.get("cost") is not None else 0.0
+            total_duration += duration
+            total_cost += line_cost
+            if line.get("match_status") == "matched":
+                matched_lines += 1
+            else:
+                unmatched_lines += 1
+
+            rkey = clean_text(line.get("resource_id")) or "unknown"
+            rrec = by_resource.setdefault(
+                rkey,
+                {
+                    "resource_id": line.get("resource_id"),
+                    "resource_name": line.get("resource_name") or line.get("resource_id"),
+                    "total_duration": 0.0,
+                    "total_cost": 0.0,
+                },
+            )
+            rrec["total_duration"] += duration
+            rrec["total_cost"] += line_cost
+
+            pkey = clean_text(line.get("project_id")) or "unknown"
+            prec = by_project.setdefault(
+                pkey,
+                {
+                    "project_id": line.get("project_id"),
+                    "project_reference": line.get("project_reference"),
+                    "total_duration": 0.0,
+                    "total_cost": 0.0,
+                },
+            )
+            prec["total_duration"] += duration
+            prec["total_cost"] += line_cost
+
+            dkey = clean_text(line.get("delivery_id")) or f"{pkey}:no_delivery"
+            drec = by_delivery.setdefault(
+                dkey,
+                {
+                    "delivery_id": line.get("delivery_id"),
+                    "delivery_title": line.get("delivery_title"),
+                    "project_id": line.get("project_id"),
+                    "project_reference": line.get("project_reference"),
+                    "total_duration": 0.0,
+                    "total_cost": 0.0,
+                },
+            )
+            drec["total_duration"] += duration
+            drec["total_cost"] += line_cost
+
+        payload = {
+            "affaire_id": affaire_id,
+            "term": term,
+            "matched_boond_projects": matched_projects,
+            "totals": {
+                "total_duration": total_duration,
+                "total_cost": total_cost,
+                "resources_count": len(by_resource),
+                "deliveries_count": len(by_delivery),
+                "matched_lines": matched_lines,
+                "unmatched_lines": unmatched_lines,
+                "projects_count": len(by_project),
+            },
+            "by_resource": sorted(by_resource.values(), key=lambda x: x.get("total_cost", 0), reverse=True),
+            "by_project": sorted(by_project.values(), key=lambda x: x.get("total_cost", 0), reverse=True),
+            "by_delivery": sorted(by_delivery.values(), key=lambda x: x.get("total_cost", 0), reverse=True),
+            "lines": sorted(lines, key=lambda x: (x.get("date", ""), clean_text(x.get("resource_name")))),
+            "warnings": sorted(set(warnings)),
+            "debug_match": debug_match,
+        }
+        self._set_cache_row("boond_business_cache", cache_key, payload, ttl_seconds=1800)
+        return payload
+
     def compute_project_month_costs(self, project_id: str, term: str) -> Dict[str, Any]:
         month_key = f"cost:project:{project_id}:month:{term}"
         cached = self._get_cache_row("boond_business_cache", month_key)
@@ -2679,61 +2936,100 @@ def imputation_html() -> str:
 <head>
 <meta charset='utf-8'>
 <meta name='viewport' content='width=device-width, initial-scale=1'>
-<title>Imputation des temps</title>
+<title>Imputation des temps (Boond)</title>
 <style>
-:root{--bg:#f3f6fb;--ink:#13233b;--muted:#64748b;--card:#fff;--line:#dbe3ef;--accent:#ef8d00}
+:root{--bg:#f3f6fb;--ink:#13233b;--muted:#64748b;--card:#fff;--line:#dbe3ef;--accent:#ef8d00;--danger:#b91c1c}
 *{box-sizing:border-box}body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--ink)}
-.wrap{max-width:1260px;margin:24px auto;padding:0 16px}.card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:18px}
-.row{display:grid;grid-template-columns:1fr 140px 160px 140px;gap:10px;align-items:end}.row2{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:10px}
+.wrap{max-width:1360px;margin:24px auto;padding:0 16px}.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px}
+.controls{display:grid;grid-template-columns:1fr 160px 140px;gap:10px;align-items:end}
 label{font-size:12px;color:var(--muted);font-weight:700}.input,button{height:42px;border:1px solid var(--line);border-radius:12px;padding:0 12px;font-size:15px}
 button{background:var(--accent);color:#fff;font-weight:800;cursor:pointer}.ghost{background:#f8fafc;color:#334155}
-pre{background:#0f172a;color:#e2e8f0;padding:12px;border-radius:12px;overflow:auto;min-height:360px}
-.pills{display:flex;gap:8px;margin-bottom:10px}.pill{padding:6px 10px;border:1px solid var(--line);border-radius:999px;background:#fff;cursor:pointer}.pill.active{background:#fff7ed;border-color:#fed7aa;color:#9a3412;font-weight:700}
+.kpis{margin-top:12px;display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}.kpi{border:1px solid var(--line);border-radius:12px;padding:10px;background:#fff}.kpi .t{font-size:12px;color:var(--muted)}.kpi .v{font-size:22px;font-weight:800;margin-top:4px}
+.table{width:100%;border-collapse:collapse;font-size:13px}.table th,.table td{border-bottom:1px solid #e9eef6;padding:8px;text-align:left}.table th{background:#f8fafc;color:#334155;position:sticky;top:0}
+.section{margin-top:12px}.danger{color:var(--danger);font-weight:700}
+pre{background:#0f172a;color:#e2e8f0;padding:12px;border-radius:12px;overflow:auto;max-height:420px}
+details{margin-top:10px}
 </style>
 </head>
 <body>
 <div class='wrap'>
   <div class='card'>
     <h2 style='margin:0 0 12px'>Imputation des temps (Boond)</h2>
-    <div class='pills'>
-      <button class='pill active' id='modeResource' type='button'>Ressource / mois</button>
-      <button class='pill' id='modeProject' type='button'>Projet / mois</button>
-      <button class='pill' id='modeDelivery' type='button'>Livraison / mois</button>
-    </div>
-    <div class='row'>
-      <div><label id='idLabel'>ID ressource Boond</label><input class='input' id='entityId' placeholder='94'></div>
-      <div><label>Mois</label><input class='input' id='term' placeholder='2025-03'></div>
-      <div><label>Affaire</label><input class='input' id='affaireId' placeholder='affaire_id auto'></div>
+    <div class='controls'>
+      <div><label>Affaire ID</label><input class='input' id='affaireId' placeholder='dumez-115-cdg'></div>
+      <div><label>Mois</label><input class='input' id='term' placeholder='2026-02'></div>
       <div><button id='runBtn'>Charger</button></div>
     </div>
-    <div class='row2'>
-      <button id='btnTimes' class='ghost' type='button'>Debug times-reports</button>
-      <button id='btnPos' class='ghost' type='button'>Debug positionings</button>
-      <button id='btnOpenRaw' class='ghost' type='button'>Ouvrir endpoint JSON</button>
+    <div id='msg' class='section'></div>
+    <div class='kpis'>
+      <div class='kpi'><div class='t'>Total jours imputés</div><div class='v' id='kDuration'>0</div></div>
+      <div class='kpi'><div class='t'>Coût total imputé</div><div class='v' id='kCost'>0 €</div></div>
+      <div class='kpi'><div class='t'>Nb ressources</div><div class='v' id='kResources'>0</div></div>
+      <div class='kpi'><div class='t'>Nb livraisons</div><div class='v' id='kDeliveries'>0</div></div>
+      <div class='kpi'><div class='t'>Nb projets Boond</div><div class='v' id='kProjects'>0</div></div>
     </div>
   </div>
-  <div class='card' style='margin-top:14px'>
-    <pre id='out'>En attente...</pre>
+
+  <div class='card section'>
+    <h3 style='margin:0 0 8px'>Par ressource</h3>
+    <div style='max-height:260px;overflow:auto'><table class='table' id='tblResource'></table></div>
+  </div>
+
+  <div class='card section'>
+    <h3 style='margin:0 0 8px'>Par livraison</h3>
+    <div style='max-height:260px;overflow:auto'><table class='table' id='tblDelivery'></table></div>
+  </div>
+
+  <div class='card section'>
+    <h3 style='margin:0 0 8px'>Détail</h3>
+    <div style='max-height:420px;overflow:auto'><table class='table' id='tblLines'></table></div>
+  </div>
+
+  <div class='card section'>
+    <details>
+      <summary><strong>Debug</strong> (JSON complet + matching affaire -> projets)</summary>
+      <div style='margin-top:10px;display:grid;grid-template-columns:1fr 1fr;gap:10px'>
+        <div>
+          <button id='btnDebugMatch' class='ghost' type='button'>Rafraîchir debug match</button>
+          <pre id='debugMatch'>{}</pre>
+        </div>
+        <div>
+          <pre id='debugJson'>{}</pre>
+        </div>
+      </div>
+      <div style='margin-top:10px;display:grid;grid-template-columns:1fr 1fr;gap:10px'>
+        <div><label>Debug resource_id</label><input class='input' id='debugResourceId' placeholder='94'></div>
+        <div style='display:flex;gap:10px;align-items:end'>
+          <button id='btnDebugResource' class='ghost' type='button'>Debug ressource/mois</button>
+          <button id='btnOpenApi' class='ghost' type='button'>Ouvrir endpoint affaire</button>
+        </div>
+      </div>
+    </details>
   </div>
 </div>
 <script>
 const qs=new URLSearchParams(location.search);
-const state={mode:'resource'};
-const out=document.getElementById('out');
-function sel(id){return document.getElementById(id)}
-function updateMode(mode){state.mode=mode;sel('modeResource').classList.toggle('active',mode==='resource');sel('modeProject').classList.toggle('active',mode==='project');sel('modeDelivery').classList.toggle('active',mode==='delivery');sel('idLabel').textContent=mode==='resource'?'ID ressource Boond':mode==='project'?'ID projet Boond':'ID livraison Boond';}
-function endpoint(){const id=encodeURIComponent(sel('entityId').value.trim());const term=encodeURIComponent(sel('term').value.trim());if(state.mode==='resource')return `/api/boond/imputation/resource/${id}/month/${term}`;if(state.mode==='project')return `/api/boond/imputation/project/${id}/month/${term}`;return `/api/boond/imputation/delivery/${id}/month/${term}`}
-async function loadJson(url){out.textContent='Chargement...';const r=await fetch(url);const d=await r.json().catch(()=>({detail:'Réponse non JSON'}));if(!r.ok){out.textContent=JSON.stringify({error:d},null,2);throw new Error(d.detail||'Erreur API');}out.textContent=JSON.stringify(d,null,2);}
-sel('modeResource').onclick=()=>updateMode('resource');
-sel('modeProject').onclick=()=>updateMode('project');
-sel('modeDelivery').onclick=()=>updateMode('delivery');
-sel('runBtn').onclick=()=>loadJson(endpoint());
-sel('btnOpenRaw').onclick=()=>window.open(endpoint(),'_blank');
-sel('btnTimes').onclick=()=>{const id=encodeURIComponent(sel('entityId').value.trim());if(state.mode!=='resource')return alert('Debug dispo en mode ressource');loadJson(`/api/boond/resources/${id}/times-reports`)};
-sel('btnPos').onclick=()=>{const id=encodeURIComponent(sel('entityId').value.trim());if(state.mode!=='resource')return alert('Debug dispo en mode ressource');loadJson(`/api/boond/resources/${id}/positionings`)};
-sel('affaireId').value=qs.get('affaire_id')||'';
-sel('term').value=qs.get('term')||new Date().toISOString().slice(0,7);
-updateMode(qs.get('mode')||'resource');
+const fmtEur=v=>new Intl.NumberFormat('fr-FR',{style:'currency',currency:'EUR',maximumFractionDigits:2}).format(Number(v||0));
+const fmtNum=v=>new Intl.NumberFormat('fr-FR',{maximumFractionDigits:2}).format(Number(v||0));
+const s=id=>document.getElementById(id);
+function endpointAffaire(){const a=encodeURIComponent(s('affaireId').value.trim());const t=encodeURIComponent(s('term').value.trim());return `/api/boond/imputation/affaire/${a}/month/${t}`}
+function endpointMatch(){const a=encodeURIComponent(s('affaireId').value.trim());const t=encodeURIComponent(s('term').value.trim());return `/api/boond/imputation/affaire/${a}/month/${t}/debug-match`}
+async function api(url){const r=await fetch(url);const d=await r.json().catch(()=>({detail:'Réponse non JSON'}));if(!r.ok) throw new Error(d.detail||'Erreur API');return d;}
+function renderTable(elId, headers, rows){const el=s(elId);if(!rows.length){el.innerHTML='<tr><td>Aucune donnée</td></tr>';return;}el.innerHTML='<thead><tr>'+headers.map(h=>`<th>${h}</th>`).join('')+'</tr></thead><tbody>'+rows.join('')+'</tbody>';}
+function render(payload){const t=payload.totals||{};s('kDuration').textContent=fmtNum(t.total_duration);s('kCost').textContent=fmtEur(t.total_cost);s('kResources').textContent=t.resources_count||0;s('kDeliveries').textContent=t.deliveries_count||0;s('kProjects').textContent=t.projects_count||0;
+const warnings=(payload.warnings||[]);s('msg').innerHTML=warnings.length?`<div class='danger'>${warnings.map(w=>`• ${w}`).join('<br>')}</div>`:'<div>Calcul chargé.</div>';
+renderTable('tblResource',['Ressource','Jours imputés','Coût total'],(payload.by_resource||[]).map(r=>`<tr><td>${r.resource_name||r.resource_id||''}</td><td>${fmtNum(r.total_duration)}</td><td>${fmtEur(r.total_cost)}</td></tr>`));
+renderTable('tblDelivery',['Livraison','Projet','Jours','Coût'],(payload.by_delivery||[]).map(d=>`<tr><td>${d.delivery_title||d.delivery_id||''}</td><td>${d.project_reference||d.project_id||''}</td><td>${fmtNum(d.total_duration)}</td><td>${fmtEur(d.total_cost)}</td></tr>`));
+renderTable('tblLines',['Date','Ressource','Livraison','Jours','CJM','Coût','Statut'],(payload.lines||[]).map(l=>`<tr><td>${l.date||''}</td><td>${l.resource_name||l.resource_id||''}</td><td>${l.delivery_title||l.delivery_id||''}</td><td>${fmtNum(l.duration)}</td><td>${l.average_daily_cost==null?'':fmtEur(l.average_daily_cost)}</td><td>${l.cost==null?'':fmtEur(l.cost)}</td><td>${l.match_status||''}</td></tr>`));
+s('debugJson').textContent=JSON.stringify(payload,null,2);
+s('debugMatch').textContent=JSON.stringify(payload.debug_match||{},null,2);
+}
+async function loadAffaire(){try{const data=await api(endpointAffaire());render(data);}catch(e){s('msg').innerHTML=`<div class='danger'>${e.message}</div>`;}}
+async function loadMatch(){try{const data=await api(endpointMatch());s('debugMatch').textContent=JSON.stringify(data,null,2);}catch(e){s('debugMatch').textContent=JSON.stringify({error:e.message},null,2);}}
+async function loadResourceDebug(){const id=encodeURIComponent(s('debugResourceId').value.trim());if(!id)return;const t=encodeURIComponent(s('term').value.trim());try{const data=await api(`/api/boond/imputation/resource/${id}/month/${t}`);s('debugJson').textContent=JSON.stringify(data,null,2);}catch(e){s('debugJson').textContent=JSON.stringify({error:e.message},null,2);}}
+s('runBtn').onclick=loadAffaire;s('btnDebugMatch').onclick=loadMatch;s('btnDebugResource').onclick=loadResourceDebug;s('btnOpenApi').onclick=()=>window.open(endpointAffaire(),'_blank');
+s('affaireId').value=qs.get('affaire_id')||'';s('term').value=qs.get('term')||new Date().toISOString().slice(0,7);
+if(s('affaireId').value)loadAffaire();
 </script>
 </body>
 </html>"""
@@ -3192,6 +3488,16 @@ def api_boond_positioning_detail(positioning_id: str):
 @app.get("/api/boond/imputation/resource/{resource_id}/month/{term}", response_class=JSONResponse)
 def api_boond_imputation_resource_month(resource_id: str, term: str):
     return boond_service.compute_resource_month_costs(resource_id, term)
+
+
+@app.get("/api/boond/imputation/affaire/{affaire_id}/month/{term}", response_class=JSONResponse)
+def api_boond_imputation_affaire_month(affaire_id: str, term: str):
+    return boond_service.compute_affaire_month_imputation(affaire_id, term)
+
+
+@app.get("/api/boond/imputation/affaire/{affaire_id}/month/{term}/debug-match", response_class=JSONResponse)
+def api_boond_imputation_affaire_debug_match(affaire_id: str, term: str):
+    return boond_service.resolve_boond_projects_for_affaire(affaire_id)
 
 
 @app.get("/api/boond/imputation/project/{project_id}/month/{term}", response_class=JSONResponse)
