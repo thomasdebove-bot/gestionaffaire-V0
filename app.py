@@ -506,6 +506,38 @@ class BoondService:
             return candidates[0]
         return None
 
+
+    def get_project_workplaces_times(self, project_id: str):
+
+        page = 1
+        per_page = 500
+        rows = []
+
+        while True:
+
+            payload = self.boond_get(
+                "/workplaces-times",
+                params={
+                    "project": project_id,
+                    "page": page,
+                    "perPage": per_page
+                }
+            )
+
+            items = payload.get("data", []) or []
+
+            if not items:
+                break
+
+            rows.extend(items)
+
+            if len(items) < per_page:
+                break
+
+            page += 1
+
+        return rows
+
     def _fetch_all_workplaces_times(self) -> List[Dict[str, Any]]:
         # Une seule collecte de workplaces-times, puis enrichissement avec times-reports en cache.
         attempts: List[Tuple[str, Optional[Dict[str, Any]]]] = [
@@ -642,9 +674,24 @@ class BoondService:
                 "message": "Aucun projet BOOND correspondant trouvé.",
             }
 
-        project_data = next((p for p in projects if clean_text(p.get("project_id")) == matched["project_id"]), None) or {}
-        total_days = clean_number(project_data.get("total_days"))
-        by_month_map = project_data.get("by_month") or {}
+        project_id = clean_text(matched.get("project_id"))
+        rows = self.get_project_workplaces_times(project_id)
+
+        total_days = 0
+        by_month_map: Dict[str, float] = defaultdict(float)
+
+        for row in rows:
+
+            attrs = row.get("attributes", {}) or {}
+
+            duration = attrs.get("duration")
+
+            if duration:
+                total_days += float(duration)
+
+            month = clean_text(attrs.get("startDate"))[:7]
+            if re.match(r"^\d{4}-\d{2}$", month) and duration:
+                by_month_map[month] += float(duration)
 
         manual_rate = self.manual_daily_rates_by_project.get(matched["project_id"])
         total_cost = None
@@ -672,7 +719,7 @@ class BoondService:
                 "cost_status": cost_status,
             },
             "by_month": by_month,
-            "meta": index.get("meta", {}),
+            "meta": {**(index.get("meta", {}) or {}), "project_workplaces_rows": len(rows)},
             "match_debug": self._last_match_debug,
             "message": "Coût indisponible: aucun taux journalier fiable trouvé." if manual_rate is None else "OK",
         }
