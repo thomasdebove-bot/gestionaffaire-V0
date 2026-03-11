@@ -1280,39 +1280,65 @@ class BoondService:
         project_id = clean_text(matched.get("project_id"))
         rows = self.get_project_workplaces_times(project_id)
 
-        # Jours: on conserve la source workplaces-times validée.
         total_days = 0.0
-        by_month_map: Dict[str, float] = defaultdict(float)
+        total_cost = 0.0
+        rated_days = 0.0
+        unrated_days = 0.0
+        by_month_map: Dict[str, Dict[str, float]] = defaultdict(lambda: {"days": 0.0, "cost": 0.0})
+
         for row in rows:
             attrs = row.get("attributes", {}) or {}
+            rel = row.get("relationships", {}) or {}
             duration = clean_number(attrs.get("duration"))
             if duration <= 0:
                 continue
+
+            start_date = clean_text(attrs.get("startDate"))
+            month = start_date[:7]
             total_days += duration
-            month = clean_text(attrs.get("startDate"))[:7]
             if re.match(r"^\d{4}-\d{2}$", month):
-                by_month_map[month] += duration
+                by_month_map[month]["days"] += duration
 
-        # Coût: moteur positioning actif (source fiable)
-        end_term = now_iso()[:7]
-        cost_engine = self.compute_project_cumulative_cost_from_existing_engine(project_id, end_term, force_refresh=bool(refresh))
-        total_cost_out = cost_engine.get("total_cost")
-        average_daily_rate = cost_engine.get("average_daily_cost")
-        cost_status = clean_text(cost_engine.get("cost_status")) or "missing_rate"
-        rated_days = clean_number(cost_engine.get("rated_days"))
-        unrated_days = clean_number(cost_engine.get("unrated_days"))
-        cost_coverage_ratio = clean_number(cost_engine.get("cost_coverage_ratio"))
-        month_cost_map = {clean_text(x.get("month")): clean_number(x.get("cost")) for x in (cost_engine.get("by_month") or [])}
+            times_report_id = clean_text((((rel.get("timesReport") or {}).get("data") or {}).get("id")))
+            if not times_report_id:
+                unrated_days += duration
+                continue
 
-        by_month = []
-        for month, days in sorted((by_month_map or {}).items()):
-            days_val = clean_number(days)
-            month_cost = month_cost_map.get(month)
-            by_month.append({
+            cost_info = self.resolve_line_cost_from_positioning(
+                times_report_id=times_report_id,
+                work_date=start_date,
+                duration=duration,
+            )
+            line_cost = clean_number(cost_info.get("line_cost"))
+
+            if line_cost > 0:
+                total_cost += line_cost
+                rated_days += duration
+                if re.match(r"^\d{4}-\d{2}$", month):
+                    by_month_map[month]["cost"] += line_cost
+            else:
+                unrated_days += duration
+
+        cost_coverage_ratio = (rated_days / total_days) if total_days > 0 else 0.0
+        average_daily_rate = (total_cost / rated_days) if rated_days > 0 else None
+        if rated_days == total_days and total_cost > 0:
+            cost_status = "ok"
+            total_cost_out = round(total_cost, 2)
+        elif rated_days > 0 and unrated_days > 0:
+            cost_status = "partial"
+            total_cost_out = round(total_cost, 2)
+        else:
+            cost_status = "missing_rate"
+            total_cost_out = None
+
+        by_month = [
+            {
                 "month": month,
-                "days": round(days_val, 2),
-                "cost": round(month_cost, 2) if month_cost and month_cost > 0 else None,
-            })
+                "days": round(vals["days"], 2),
+                "cost": round(vals["cost"], 2) if vals["cost"] > 0 else None,
+            }
+            for month, vals in sorted(by_month_map.items())
+        ]
 
         message = "OK"
         if cost_status == "missing_rate":
@@ -1333,7 +1359,7 @@ class BoondService:
                 "cost_status": cost_status,
             },
             "by_month": by_month,
-            "meta": {**(index.get("meta", {}) or {}), "project_workplaces_rows": len(rows), "rate_sources_count": ((cost_engine or {}).get("rate_sources_count") or {})},
+            "meta": {**(index.get("meta", {}) or {}), "project_workplaces_rows": len(rows)},
             "match_debug": self._last_match_debug,
             "message": message,
         }
