@@ -787,6 +787,203 @@ class BoondService:
 
         return rows
 
+    def _resources_directory(self) -> List[Dict[str, Any]]:
+        return self.get_all_boond_resources()
+
+    def _resource_report_list(self, resource_id: str) -> Dict[str, Any]:
+        cache_key = f"boond:resource:{resource_id}:times-reports"
+        cached = self.get_api_cache(cache_key)
+        if cached is not None:
+            return cached
+        try:
+            payload = self.boond_get(f"/resources/{resource_id}/times-reports", params={"perPage": 500})
+        except Exception:
+            payload = {"data": []}
+        self.set_api_cache(cache_key, payload, ttl_seconds=86400)
+        return payload
+
+    @staticmethod
+    def _extract_report_item(report_list_payload: Dict[str, Any], term: str) -> List[Dict[str, Any]]:
+        # Garde les reports jusqu'au mois demandé (YYYY-MM)
+        items = report_list_payload.get("data", []) or []
+        out: List[Dict[str, Any]] = []
+        for item in items:
+            attrs = item.get("attributes", {}) or {}
+            dt = clean_text(attrs.get("startDate") or attrs.get("date") or attrs.get("endDate"))[:7]
+            if not term or (dt and dt <= term):
+                out.append(item)
+            elif not dt:
+                out.append(item)
+        return out
+
+    def _times_report_detail(self, report_id: str) -> Dict[str, Any]:
+        payload, _ = self.get_times_report_cached(report_id)
+        return payload
+
+    @staticmethod
+    def normalize_times_report_lines(report_detail: Dict[str, Any]) -> List[Dict[str, Any]]:
+        lines: List[Dict[str, Any]] = []
+        rel_times = ((report_detail.get("data") or {}).get("relationships") or {}).get("times") or {}
+        items = rel_times.get("data") or []
+        for item in items:
+            attrs = item.get("attributes", {}) or {}
+            delivery = attrs.get("delivery") or {}
+            project = delivery.get("project") or {}
+            lines.append({
+                "duration": clean_number(attrs.get("duration")),
+                "date": clean_text(attrs.get("startDate") or attrs.get("date")),
+                "project_id": clean_text(project.get("id")),
+                "delivery_id": clean_text(delivery.get("id")),
+            })
+        return lines
+
+    def _resource_positionings(self, resource_id: str) -> Dict[str, Any]:
+        cache_key = f"boond:resource:{resource_id}:positionings"
+        cached = self.get_api_cache(cache_key)
+        if cached is not None:
+            return cached
+        try:
+            payload = self.boond_get(f"/resources/{resource_id}/positionings", params={"perPage": 200})
+        except Exception:
+            payload = {"data": []}
+        self.set_api_cache(cache_key, payload, ttl_seconds=86400)
+        return payload
+
+    def _positioning_detail(self, pos_id: str) -> Dict[str, Any]:
+        cache_key = f"boond:positioning:{pos_id}"
+        cached = self.get_api_cache(cache_key)
+        if cached is not None:
+            return cached
+        payload = self.boond_get(f"/positionings/{pos_id}")
+        self.set_api_cache(cache_key, payload, ttl_seconds=86400)
+        return payload
+
+    @staticmethod
+    def normalize_positioning_detail(detail: Dict[str, Any]) -> Dict[str, Any]:
+        data = detail.get("data") or detail
+        attrs = data.get("attributes", {}) or {}
+        avg = None
+        for key in ["average_daily_cost", "averageDailyCost", "dailyCost", "cost", "costRate", "dailyRate"]:
+            num = clean_number(attrs.get(key))
+            if num > 0:
+                avg = float(num)
+                break
+        return {
+            "id": clean_text(data.get("id")),
+            "start_date": clean_text(attrs.get("startDate") or attrs.get("start")),
+            "end_date": clean_text(attrs.get("endDate") or attrs.get("end")),
+            "average_daily_cost": avg,
+        }
+
+    @staticmethod
+    def find_active_positioning_for_time(line: Dict[str, Any], normalized_positionings: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        # Version robuste simple: premier positioning avec coût > 0 (ou actif par date si dispo).
+        line_month = clean_text(line.get("date"))[:10]
+        for pos in normalized_positionings:
+            if not pos.get("average_daily_cost"):
+                continue
+            start = clean_text(pos.get("start_date"))[:10]
+            end = clean_text(pos.get("end_date"))[:10]
+            if start and line_month and line_month < start:
+                continue
+            if end and line_month and line_month > end:
+                continue
+            return pos
+        for pos in normalized_positionings:
+            if pos.get("average_daily_cost"):
+                return pos
+        return None
+
+    def compute_resource_month_costs(self, resource_id: str, term: str) -> Dict[str, Any]:
+        report_list = self._resource_report_list(resource_id)
+        report_items = self._extract_report_item(report_list, term)
+
+        raw_pos = self._resource_positionings(resource_id).get("data", []) or []
+        normalized_positionings: List[Dict[str, Any]] = []
+        for pos in raw_pos:
+            pos_id = clean_text(pos.get("id"))
+            if not pos_id:
+                continue
+            try:
+                det = self._positioning_detail(pos_id)
+                normalized_positionings.append(self.normalize_positioning_detail(det))
+            except Exception:
+                continue
+
+        lines_out: List[Dict[str, Any]] = []
+        for rep in report_items:
+            rep_id = clean_text(rep.get("id"))
+            if not rep_id:
+                continue
+            try:
+                detail = self._times_report_detail(rep_id)
+            except Exception:
+                continue
+            lines = self.normalize_times_report_lines(detail)
+            for line in lines:
+                active = self.find_active_positioning_for_time(line, normalized_positionings)
+                avg = clean_number((active or {}).get("average_daily_cost"))
+                duration = clean_number(line.get("duration"))
+                cost = duration * avg if avg > 0 else 0.0
+                lines_out.append({
+                    "resource_id": resource_id,
+                    "project_id": clean_text(line.get("project_id")),
+                    "date": clean_text(line.get("date")),
+                    "duration": duration,
+                    "average_daily_cost": avg if avg > 0 else None,
+                    "cost": cost if cost > 0 else None,
+                })
+
+        return {"resource_id": resource_id, "term": term, "lines": lines_out}
+
+    def compute_project_cumulative_cost_from_existing_engine(self, project_id: str, end_term: str) -> Dict[str, Any]:
+        cache_key = f"cost:cumulative:project:{project_id}:term:{end_term}"
+        cached = self.get_api_cache(cache_key)
+        if cached is not None:
+            return cached
+
+        total_cost = 0.0
+        total_duration = 0.0
+        by_month: Dict[str, Dict[str, float]] = defaultdict(lambda: {"days": 0.0, "cost": 0.0})
+
+        resources = self._resources_directory()
+        for res in resources:
+            rid = clean_text(res.get("id"))
+            if not rid:
+                continue
+            rec = self.compute_resource_month_costs(rid, end_term)
+            for line in rec.get("lines", []):
+                if clean_text(line.get("project_id")) != clean_text(project_id):
+                    continue
+                duration = clean_number(line.get("duration"))
+                line_cost = clean_number(line.get("cost"))
+                month = clean_text(line.get("date"))[:7]
+                total_duration += duration
+                total_cost += line_cost
+                if re.match(r"^\d{4}-\d{2}$", month):
+                    by_month[month]["days"] += duration
+                    by_month[month]["cost"] += line_cost
+
+        total_days = round(total_duration, 2)
+        total_cost_out = round(total_cost, 2) if total_cost > 0 else None
+        average_daily_cost = round(total_cost / total_duration, 2) if total_duration > 0 and total_cost > 0 else None
+        cost_status = "ok" if total_cost_out is not None else "missing_rate"
+
+        result = {
+            "project_id": clean_text(project_id),
+            "total_days": total_days,
+            "total_cost": total_cost_out,
+            "average_daily_cost": average_daily_cost,
+            "rate_sources_count": {"resource": 0, "resource_rates": 0, "delivery": 0, "missing": 0},
+            "by_month": [
+                {"month": m, "days": round(v["days"], 2), "cost": round(v["cost"], 2) if v["cost"] > 0 else None}
+                for m, v in sorted(by_month.items())
+            ],
+            "cost_status": cost_status,
+        }
+        self.set_api_cache(cache_key, result, ttl_seconds=3600)
+        return result
+
     def _fetch_all_workplaces_times(self) -> List[Dict[str, Any]]:
         # Une seule collecte de workplaces-times, puis enrichissement avec times-reports en cache.
         attempts: List[Tuple[str, Optional[Dict[str, Any]]]] = [
@@ -928,93 +1125,42 @@ class BoondService:
 
         project_id = clean_text(matched.get("project_id"))
         rows = self.get_project_workplaces_times(project_id)
+
+        # Jours: on conserve la source workplaces-times validée.
         total_days = 0.0
-        rated_days = 0.0
-        unrated_days = 0.0
-        total_cost = 0.0
         by_month_map: Dict[str, float] = defaultdict(float)
-        by_month_cost_map: Dict[str, float] = defaultdict(float)
-
-        times_report_cache: Dict[str, Dict[str, Any]] = {}
-        resource_cache: Dict[str, Dict[str, Any]] = {}
-        rate_sources_count = {"resource": 0, "resource_rates": 0, "delivery": 0, "missing": 0}
-
         for row in rows:
             attrs = row.get("attributes", {}) or {}
-            rel = row.get("relationships", {}) or {}
             duration = clean_number(attrs.get("duration"))
             if duration <= 0:
                 continue
             total_days += duration
-
             month = clean_text(attrs.get("startDate"))[:7]
             if re.match(r"^\d{4}-\d{2}$", month):
                 by_month_map[month] += duration
 
-            times_report_id = clean_text((((rel.get("timesReport") or {}).get("data") or {}).get("id")))
-            if not times_report_id:
-                unrated_days += duration
-                rate_sources_count["missing"] += 1
-                continue
+        # Coût: moteur fiable existant (positioning actif via compute_resource_month_costs).
+        end_term = now_iso()[:7]
+        cost_engine = self.compute_project_cumulative_cost_from_existing_engine(project_id, end_term)
+        cost_total_days = clean_number(cost_engine.get("total_days"))
+        total_cost_out = cost_engine.get("total_cost")
+        average_daily_rate = cost_engine.get("average_daily_cost")
+        cost_status = clean_text(cost_engine.get("cost_status")) or "missing_rate"
 
-            if times_report_id not in times_report_cache:
-                tr_payload, _ = self.get_times_report_cached(times_report_id)
-                times_report_cache[times_report_id] = tr_payload
-            tr = times_report_cache[times_report_id]
-
-            resource_id = self._extract_resource_id_from_times_report(tr)
-            if not resource_id:
-                unrated_days += duration
-                rate_sources_count["missing"] += 1
-                continue
-
-            if resource_id not in resource_cache:
-                resource_cache[resource_id] = self.boond_get(f"/resources/{resource_id}")
-            resource = resource_cache[resource_id]
-
-            data = resource.get("data") or resource
-            attrs_res = data.get("attributes", {}) or {}
-            daily_cost = None
-            for key in ["dailyCost", "cost", "daily_rate"]:
-                val = attrs_res.get(key)
-                num = clean_number(val)
-                if num > 0:
-                    daily_cost = float(num)
-                    break
-
-            if daily_cost:
-                line_cost = duration * daily_cost
-                total_cost += line_cost
-                rated_days += duration
-                rate_sources_count["resource"] += 1
-                if re.match(r"^\d{4}-\d{2}$", month):
-                    by_month_cost_map[month] += line_cost
-                print(f"[BOOND COST] res={resource_id} rate={daily_cost} days={duration} cost={line_cost}")
-            else:
-                unrated_days += duration
-                rate_sources_count["missing"] += 1
-
+        rated_days = min(total_days, cost_total_days) if cost_total_days > 0 else 0.0
+        unrated_days = max(0.0, total_days - rated_days)
         cost_coverage_ratio = (rated_days / total_days) if total_days > 0 else 0.0
-        average_daily_rate = (total_cost / total_days) if total_days > 0 and total_cost > 0 else None
 
-        if rated_days == total_days and total_cost > 0:
-            total_cost_out = round(total_cost, 2)
-            cost_status = "ok"
-        elif rated_days > 0 and unrated_days > 0:
-            total_cost_out = round(total_cost, 2) if total_cost > 0 else None
-            cost_status = "partial"
-        else:
-            total_cost_out = None
-            cost_status = "missing_rate"
+        month_cost_map = {clean_text(x.get("month")): clean_number(x.get("cost")) for x in (cost_engine.get("by_month") or [])}
 
         by_month = []
         for month, days in sorted((by_month_map or {}).items()):
             days_val = clean_number(days)
-            month_cost = by_month_cost_map.get(month)
+            month_cost = month_cost_map.get(month)
             by_month.append({
                 "month": month,
                 "days": round(days_val, 2),
-                "cost": round(month_cost, 2) if month_cost is not None and month_cost > 0 else None,
+                "cost": round(month_cost, 2) if month_cost and month_cost > 0 else None,
             })
 
         message = "OK"
@@ -1036,7 +1182,7 @@ class BoondService:
                 "cost_status": cost_status,
             },
             "by_month": by_month,
-            "meta": {**(index.get("meta", {}) or {}), "project_workplaces_rows": len(rows), "rate_sources_count": rate_sources_count},
+            "meta": {**(index.get("meta", {}) or {}), "project_workplaces_rows": len(rows), "rate_sources_count": (cost_engine.get("rate_sources_count") or {})},
             "match_debug": self._last_match_debug,
             "message": message,
         }
@@ -3282,6 +3428,11 @@ def api_boond_debug_project_cost_path(project_name: str):
         "matched_project": matched,
         "sample_rows": sample_rows,
     }
+
+
+@app.get("/api/boond/debug/project-cumulative-cost", response_class=JSONResponse)
+def api_boond_debug_project_cumulative_cost(project_id: str, term: str):
+    return boond_service.compute_project_cumulative_cost_from_existing_engine(project_id, term)
 
 
 @app.get("/boond-imputations", response_class=HTMLResponse)
