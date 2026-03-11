@@ -211,6 +211,33 @@ class BoondService:
             logger.exception("[BOOND] Erreur GET %s", url)
             raise RuntimeError(f"Erreur BOOND sur {path}: {exc}")
 
+
+    def get_all_boond_projects(self) -> List[Dict[str, Any]]:
+        page = 1
+        per_page = 200
+        projects: List[Dict[str, Any]] = []
+
+        while True:
+            payload = self.boond_get(
+                "/projects",
+                params={
+                    "page": page,
+                    "perPage": per_page,
+                }
+            )
+            items = payload.get("data", []) or []
+            if not items:
+                break
+
+            projects.extend(items)
+
+            if len(items) < per_page:
+                break
+
+            page += 1
+
+        return projects
+
     def _db(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
@@ -586,7 +613,18 @@ class BoondService:
     def get_project_imputation_summary(self, project_name: str, refresh: bool = False) -> Dict[str, Any]:
         index = self.build_boond_imputation_index(refresh=refresh)
         projects = index.get("projects") or []
-        matched = self.find_best_boond_project_match(project_name, projects)
+
+        # Matching sur l'ensemble des projets BOOND paginés, pas uniquement sur l'index d'imputation.
+        catalog = self.get_all_boond_projects()
+        boond_projects_for_match: List[Dict[str, Any]] = []
+        for item in catalog:
+            attrs = item.get("attributes", {}) or {}
+            boond_projects_for_match.append({
+                "project_id": clean_text(item.get("id")),
+                "project_reference": clean_text(attrs.get("reference") or attrs.get("title") or attrs.get("name")),
+            })
+
+        matched = self.find_best_boond_project_match(project_name, boond_projects_for_match)
 
         if not matched:
             return {
@@ -2723,6 +2761,56 @@ def api_boond_imputation_by_project(project_name: str = Query(...), refresh: boo
                 "message": "Impossible de charger BOOND pour le moment.",
             },
         )
+
+
+@app.get("/api/boond/debug/projects", response_class=JSONResponse)
+def api_boond_debug_projects():
+    items = boond_service.get_all_boond_projects()
+
+    simplified = []
+    for item in items[:300]:
+        attrs = item.get("attributes", {}) or {}
+        simplified.append({
+            "id": item.get("id"),
+            "type": item.get("type"),
+            "reference": attrs.get("reference"),
+            "title": attrs.get("title"),
+            "name": attrs.get("name"),
+        })
+
+    return {
+        "count": len(items),
+        "projects": simplified,
+    }
+
+
+@app.get("/api/boond/debug/projects/search", response_class=JSONResponse)
+def api_boond_debug_projects_search(q: str):
+    items = boond_service.get_all_boond_projects()
+    needle = q.strip().lower()
+
+    matches = []
+    for item in items:
+        attrs = item.get("attributes", {}) or {}
+        reference = str(attrs.get("reference") or "")
+        title = str(attrs.get("title") or "")
+        name = str(attrs.get("name") or "")
+        blob = f"{reference} {title} {name}".lower()
+
+        if needle in blob:
+            matches.append({
+                "id": item.get("id"),
+                "type": item.get("type"),
+                "reference": reference,
+                "title": title,
+                "name": name,
+            })
+
+    return {
+        "query": q,
+        "count": len(matches),
+        "matches": matches[:100],
+    }
 
 
 @app.get("/boond-imputations", response_class=HTMLResponse)
