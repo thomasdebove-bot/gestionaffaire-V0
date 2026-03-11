@@ -936,11 +936,28 @@ class BoondService:
 
         return {"resource_id": resource_id, "term": term, "lines": lines_out}
 
+
+    def get_cached_project_cumulative_cost(self, project_id: str, end_term: str):
+        cache_key = f"boond:project:cumulative_cost:{project_id}:{end_term}"
+        return self.get_api_cache(cache_key)
+
+    def set_cached_project_cumulative_cost(self, project_id: str, end_term: str, payload: dict, ttl_seconds: int = 21600):
+        cache_key = f"boond:project:cumulative_cost:{project_id}:{end_term}"
+        self.set_api_cache(cache_key, payload, ttl_seconds=ttl_seconds)
+
+
     def compute_project_cumulative_cost_from_existing_engine(self, project_id: str, end_term: str) -> Dict[str, Any]:
-        cache_key = f"cost:cumulative:project:{project_id}:term:{end_term}"
-        cached = self.get_api_cache(cache_key)
+        cached = self.get_cached_project_cumulative_cost(project_id, end_term)
         if cached is not None:
             return cached
+
+        # Optimisation: ne traiter que les mois réellement présents dans les jours du projet.
+        rows = self.get_project_workplaces_times(project_id)
+        useful_months = {
+            clean_text((row.get("attributes") or {}).get("startDate"))[:7]
+            for row in rows
+            if re.match(r"^\d{4}-\d{2}$", clean_text((row.get("attributes") or {}).get("startDate"))[:7])
+        }
 
         total_cost = 0.0
         total_duration = 0.0
@@ -955,9 +972,11 @@ class BoondService:
             for line in rec.get("lines", []):
                 if clean_text(line.get("project_id")) != clean_text(project_id):
                     continue
+                month = clean_text(line.get("date"))[:7]
+                if useful_months and month not in useful_months:
+                    continue
                 duration = clean_number(line.get("duration"))
                 line_cost = clean_number(line.get("cost"))
-                month = clean_text(line.get("date"))[:7]
                 total_duration += duration
                 total_cost += line_cost
                 if re.match(r"^\d{4}-\d{2}$", month):
@@ -981,8 +1000,9 @@ class BoondService:
             ],
             "cost_status": cost_status,
         }
-        self.set_api_cache(cache_key, result, ttl_seconds=3600)
+        self.set_cached_project_cumulative_cost(project_id, end_term, result, ttl_seconds=21600)
         return result
+
 
     def _fetch_all_workplaces_times(self) -> List[Dict[str, Any]]:
         # Une seule collecte de workplaces-times, puis enrichissement avec times-reports en cache.
@@ -1139,19 +1159,27 @@ class BoondService:
             if re.match(r"^\d{4}-\d{2}$", month):
                 by_month_map[month] += duration
 
-        # Coût: moteur fiable existant (positioning actif via compute_resource_month_costs).
+        # Coût: lecture cache agrégé uniquement (calcul lourd déporté sur route dédiée).
         end_term = now_iso()[:7]
-        cost_engine = self.compute_project_cumulative_cost_from_existing_engine(project_id, end_term)
-        cost_total_days = clean_number(cost_engine.get("total_days"))
-        total_cost_out = cost_engine.get("total_cost")
-        average_daily_rate = cost_engine.get("average_daily_cost")
-        cost_status = clean_text(cost_engine.get("cost_status")) or "missing_rate"
+        cost_engine = self.get_cached_project_cumulative_cost(project_id, end_term)
 
-        rated_days = min(total_days, cost_total_days) if cost_total_days > 0 else 0.0
-        unrated_days = max(0.0, total_days - rated_days)
-        cost_coverage_ratio = (rated_days / total_days) if total_days > 0 else 0.0
-
-        month_cost_map = {clean_text(x.get("month")): clean_number(x.get("cost")) for x in (cost_engine.get("by_month") or [])}
+        if cost_engine:
+            cost_total_days = clean_number(cost_engine.get("total_days"))
+            total_cost_out = cost_engine.get("total_cost")
+            average_daily_rate = cost_engine.get("average_daily_cost")
+            cost_status = clean_text(cost_engine.get("cost_status")) or "missing_rate"
+            rated_days = min(total_days, cost_total_days) if cost_total_days > 0 else 0.0
+            unrated_days = max(0.0, total_days - rated_days)
+            cost_coverage_ratio = (rated_days / total_days) if total_days > 0 else 0.0
+            month_cost_map = {clean_text(x.get("month")): clean_number(x.get("cost")) for x in (cost_engine.get("by_month") or [])}
+        else:
+            total_cost_out = None
+            average_daily_rate = None
+            cost_status = "pending"
+            rated_days = 0.0
+            unrated_days = total_days
+            cost_coverage_ratio = 0.0
+            month_cost_map = {}
 
         by_month = []
         for month, days in sorted((by_month_map or {}).items()):
@@ -1164,7 +1192,9 @@ class BoondService:
             })
 
         message = "OK"
-        if cost_status == "missing_rate":
+        if cost_status == "pending":
+            message = "Coût en cours de calcul"
+        elif cost_status == "missing_rate":
             message = "Coût indisponible: aucun taux journalier fiable trouvé."
         elif cost_status == "partial":
             message = "Coût partiel: certaines imputations n'ont pas de taux journalier exploitable."
@@ -1182,7 +1212,7 @@ class BoondService:
                 "cost_status": cost_status,
             },
             "by_month": by_month,
-            "meta": {**(index.get("meta", {}) or {}), "project_workplaces_rows": len(rows), "rate_sources_count": (cost_engine.get("rate_sources_count") or {})},
+            "meta": {**(index.get("meta", {}) or {}), "project_workplaces_rows": len(rows), "rate_sources_count": ((cost_engine or {}).get("rate_sources_count") or {})},
             "match_debug": self._last_match_debug,
             "message": message,
         }
@@ -3239,7 +3269,27 @@ function fmt(v){const n=Number(v||0);return n.toLocaleString('fr-FR',{maximumFra
     document.getElementById('kpiDays').textContent=fmt(d.totals.total_days);
     document.getElementById('kpiCost').textContent=d.totals.total_cost==null?'Indisponible':fmt(d.totals.total_cost)+' €';
     const coverage=((d.totals||{}).cost_coverage_ratio||0)*100;document.getElementById('costCoverage').textContent=`Couverture coût: ${fmt(coverage)}%`;
-    if(d.totals.cost_status!=='ok'){const w=document.getElementById('warning');w.style.display='block';w.textContent=d.message||'Coût indisponible faute de taux journalier.';}
+    const term=new Date().toISOString().slice(0,7);
+    const projectId=((d.matched_project||{}).project_id||'');
+    const warning=document.getElementById('warning');
+
+    if(d.totals.cost_status==='pending' && projectId){
+      warning.style.display='block';
+      warning.innerHTML=`Coût en cours de calcul. <button id="btnRebuildCost" style="margin-left:8px">Calculer / rafraîchir le coût</button>`;
+      const rr=await fetch(`/api/boond/project-cumulative-cost?project_id=${encodeURIComponent(projectId)}&term=${encodeURIComponent(term)}`);
+      const cd=await rr.json();
+      if(cd && cd.cost_status!=='pending'){
+        document.getElementById('kpiCost').textContent=cd.total_cost==null?'Indisponible':fmt(cd.total_cost)+' €';
+        const cov=((Number(cd.total_days||0)>0)?(Number(cd.total_days||0)/Number(d.totals.total_days||1))*100:0);
+        document.getElementById('costCoverage').textContent=`Couverture coût: ${fmt(cov)}%`;
+      }
+      const btn=document.getElementById('btnRebuildCost');
+      if(btn){btn.onclick=async()=>{btn.disabled=true;btn.textContent='Calcul…';const br=await fetch(`/api/boond/project-cumulative-cost/rebuild?project_id=${encodeURIComponent(projectId)}&term=${encodeURIComponent(term)}`);const bd=await br.json();document.getElementById('kpiCost').textContent=bd.total_cost==null?'Indisponible':fmt(bd.total_cost)+' €';warning.style.display='none';};}
+    }else if(d.totals.cost_status!=='ok'){
+      warning.style.display='block';
+      warning.textContent=d.message||'Coût indisponible faute de taux journalier.';
+    }
+
     const rows=d.by_month||[]; const max=Math.max(1,...rows.map(x=>Number(x.days||0)));
     document.getElementById('chart').innerHTML=rows.map(x=>`<div style='margin:8px 0'><div class='small'>${esc(x.month)} — ${fmt(x.days)} j</div><div class='bar'><div class='fill' style='width:${(Number(x.days||0)/max)*100}%'></div></div></div>`).join('')||"<div class='small'>Aucune donnée mensuelle</div>";
     document.getElementById('table').innerHTML=rows.length?`<table><thead><tr><th>Mois</th><th>Jours</th><th>Coût</th></tr></thead><tbody>${rows.map(x=>`<tr><td>${esc(x.month)}</td><td>${fmt(x.days)}</td><td>${x.cost==null?'-':fmt(x.cost)+' €'}</td></tr>`).join('')}</tbody></table>`:"";
@@ -3428,6 +3478,25 @@ def api_boond_debug_project_cost_path(project_name: str):
         "matched_project": matched,
         "sample_rows": sample_rows,
     }
+
+
+@app.get("/api/boond/project-cumulative-cost/rebuild", response_class=JSONResponse)
+def api_boond_project_cumulative_cost_rebuild(project_id: str, term: str):
+    payload = boond_service.compute_project_cumulative_cost_from_existing_engine(project_id, term)
+    boond_service.set_cached_project_cumulative_cost(project_id, term, payload, ttl_seconds=21600)
+    return payload
+
+
+@app.get("/api/boond/project-cumulative-cost", response_class=JSONResponse)
+def api_boond_project_cumulative_cost(project_id: str, term: str):
+    cached = boond_service.get_cached_project_cumulative_cost(project_id, term)
+    if cached is None:
+        return {
+            "project_id": project_id,
+            "cost_status": "pending",
+            "total_cost": None,
+        }
+    return cached
 
 
 @app.get("/api/boond/debug/project-cumulative-cost", response_class=JSONResponse)
