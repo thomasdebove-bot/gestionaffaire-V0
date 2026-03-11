@@ -2,6 +2,7 @@
 import csv
 import io
 import json
+import jwt
 import logging
 import os
 import re
@@ -159,11 +160,17 @@ class BoondService:
 
     def build_boond_jwt(self) -> str:
         self._validate_config()
-        return f"{self.client_token}:{self.client_key}:{self.user_token}"
+        payload = {
+            "clientToken": self.client_token,
+            "userToken": self.user_token,
+        }
+        token = jwt.encode(payload, self.client_key, algorithm="HS256")
+        if isinstance(token, bytes):
+            token = token.decode("utf-8")
+        return token
 
     def boond_headers(self) -> Dict[str, str]:
         jwt_value = self.build_boond_jwt()
-
         return {
             "Accept": "application/json",
             "Content-Type": "application/json",
