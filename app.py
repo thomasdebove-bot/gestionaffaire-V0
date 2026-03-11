@@ -3594,6 +3594,47 @@ def api_boond_debug_line_cost(times_report_id: str, work_date: str, duration: fl
     return boond_service.resolve_line_cost_from_positioning(times_report_id, work_date, duration, project_id)
 
 
+@app.get("/api/boond/debug/positioning-project-links/{positioning_id}", response_class=JSONResponse)
+def api_boond_debug_positioning_project_links(positioning_id: str):
+    payload = boond_service.boond_get(f"/positionings/{positioning_id}")
+    data = payload.get("data") or {}
+    rel = data.get("relationships") or {}
+    attrs = data.get("attributes") or {}
+
+    return {
+        "positioning_id": positioning_id,
+        "startDate": attrs.get("startDate"),
+        "endDate": attrs.get("endDate"),
+        "averageDailyCost": attrs.get("averageDailyCost"),
+        "project_rel": ((rel.get("project") or {}).get("data")),
+        "opportunity_rel": ((rel.get("opportunity") or {}).get("data")),
+        "dependsOn_rel": ((rel.get("dependsOn") or {}).get("data")),
+        "all_relationship_keys": list(rel.keys()),
+    }
+
+
+@app.get("/api/boond/debug/positioning-match-check", response_class=JSONResponse)
+def api_boond_debug_positioning_match_check(positioning_id: str, project_id: str):
+    payload = boond_service.boond_get(f"/positionings/{positioning_id}")
+    data = payload.get("data") or {}
+    rel = data.get("relationships") or {}
+
+    project_rel = ((rel.get("project") or {}).get("data")) or {}
+    opportunity_rel = ((rel.get("opportunity") or {}).get("data")) or {}
+
+    project_rel_id = str(project_rel.get("id") or "")
+    opportunity_rel_id = str(opportunity_rel.get("id") or "")
+
+    return {
+        "positioning_id": positioning_id,
+        "input_project_id": str(project_id),
+        "project_rel_id": project_rel_id,
+        "opportunity_rel_id": opportunity_rel_id,
+        "match_on_project": project_rel_id == str(project_id),
+        "match_on_opportunity": opportunity_rel_id == str(project_id),
+    }
+
+
 @app.get("/api/boond/project-cumulative-cost/rebuild", response_class=JSONResponse)
 def api_boond_project_cumulative_cost_rebuild(project_id: str, term: str):
     payload = boond_service.compute_project_cumulative_cost_from_existing_engine(project_id, term)
