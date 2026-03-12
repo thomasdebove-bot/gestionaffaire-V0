@@ -4064,7 +4064,7 @@ def landing_html() -> str:
 :root{--panel:#fff;--line:#dfe5ef;--ink:#122033;--muted:#6e7a90;--accent:#ef8d00;--shadow:0 16px 48px rgba(18,32,51,.09)}
 *{box-sizing:border-box}body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:linear-gradient(180deg,#f5f7fb 0%,#eef2f7 100%);color:var(--ink)}
 .wrap{max-width:1260px;margin:30px auto 52px;padding:0 20px}.hero,.card{background:var(--panel);border:1px solid rgba(20,32,51,.05);border-radius:24px;box-shadow:var(--shadow)}
-.hero{padding:28px}.hero-top{display:flex;align-items:center;gap:16px}.logo{width:56px;height:56px;object-fit:contain;border-radius:10px;background:#fff7ef;border:1px solid #f8ddb4;padding:6px}
+.hero{padding:28px}.hero-top{display:flex;align-items:center;justify-content:space-between;gap:16px}.logo{width:96px;height:96px;object-fit:contain;border-radius:18px;background:#fff;border:1px solid var(--line);padding:14px;box-shadow:0 8px 20px rgba(18,32,51,.08)}
 .eyebrow{font-size:12px;font-weight:800;color:var(--accent);text-transform:uppercase;letter-spacing:.14em}h1{margin:8px 0 12px;font-size:44px;line-height:1.05}.sub{font-size:20px;color:var(--muted);max-width:930px}
 .selector{margin-top:22px;display:grid;grid-template-columns:2fr 1fr;gap:12px}.search{height:52px;border:1px solid var(--line);border-radius:14px;padding:0 14px;font-size:16px;width:100%}
 .badge{display:inline-flex;align-items:center;justify-content:center;padding:0 14px;height:52px;border-radius:14px;background:#f9fbff;color:#41547b;font-weight:700;border:1px solid var(--line)}
@@ -4079,8 +4079,8 @@ def landing_html() -> str:
   <div class='wrap'>
     <section class='hero'>
       <div class='hero-top'>
-        <img class='logo' src='/assets/logo-tempo' alt='Logo Tempo'>
         <div><div class='eyebrow'>Gestion affaire</div><h1>Gestion d'affaires</h1></div>
+        <img class='logo' src='/assets/logo-tempo' alt='Logo Tempo'>
       </div>
       <div class='sub'>Choisissez une affaire en saisissant ses premières lettres, puis accédez directement aux modules disponibles.</div>
       <div class='selector'>
@@ -4130,11 +4130,11 @@ def finance_html() -> str:
 :root{--bg:#eef2f7;--panel:#fff;--panel2:#f7f9fc;--line:#dfe5ef;--ink:#122033;--muted:#6e7a90;--blue:#ef8d00;--green:#1d9a5b;--amber:#c48716;--red:#c84c4c;--shadow:0 14px 40px rgba(19,31,53,.08)}
 *{box-sizing:border-box}body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:linear-gradient(180deg,#f5f7fb 0%,#eef2f7 100%);color:var(--ink)}
 .container{max-width:1440px;margin:22px auto 36px;padding:0 18px}.topbar,.hero,.section,.kpis{background:var(--panel);border:1px solid rgba(22,34,51,.04);box-shadow:var(--shadow);border-radius:24px}
-.topbar{display:flex;gap:10px;align-items:center;padding:14px 18px;background:rgba(255,255,255,.96);backdrop-filter:blur(6px)}.brand-mini{display:inline-flex;align-items:center;justify-content:center;width:44px;height:44px;border:1px solid var(--line);border-radius:12px;background:#fff7ef}.brand-mini img{width:22px;height:22px;object-fit:contain}
-.controls{display:flex;gap:12px;align-items:center;flex:1;flex-wrap:wrap}.search,.select{height:48px;border-radius:14px;border:1px solid var(--line);background:#fff;padding:0 14px;color:var(--ink);font-size:15px}.search{min-width:280px;flex:1}.select{min-width:340px;flex:1}
+.topbar{display:grid;grid-template-columns:auto 1fr;gap:14px;align-items:start;padding:16px 18px;background:rgba(255,255,255,.96);backdrop-filter:blur(6px)}.brand-mini{display:inline-flex;align-items:center;justify-content:center;width:78px;height:78px;border:1px solid var(--line);border-radius:16px;background:#fff;box-shadow:0 8px 20px rgba(18,32,51,.08)}.brand-mini img{width:48px;height:48px;object-fit:contain}
+.controls{display:flex;flex-direction:column;gap:10px;flex:1}.menu-row,.project-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.search,.select{height:48px;border-radius:14px;border:1px solid var(--line);background:#fff;padding:0 14px;color:var(--ink);font-size:15px}.search{min-width:260px;flex:1}.select{min-width:300px;flex:1}
 .btn{height:48px;border:none;border-radius:14px;padding:0 16px;font-weight:700;cursor:pointer}.btn.primary{background:var(--blue);color:#fff}.btn.dark{background:#ef8d00;color:#fff;box-shadow:inset 0 -2px 0 rgba(0,0,0,.08)}
 .badge{display:inline-flex;align-items:center;gap:8px;padding:10px 12px;border-radius:999px;background:var(--panel2);color:var(--muted);font-size:13px;font-weight:700}.dot{width:10px;height:10px;border-radius:50%}.dot.ready{background:var(--green)}.dot.building{background:var(--amber)}.dot.error{background:var(--red)}.dot.idle{background:#9aa6b8}
-.hero{margin-top:18px;padding:26px 28px}.hero-top{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap}.hero h2{margin:8px 0 4px;font-size:42px;line-height:1.02}.eyebrow{font-size:12px;font-weight:800;color:var(--blue);letter-spacing:.14em;text-transform:uppercase}
+.hero{margin-top:18px;padding:26px 28px}.hero-top{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap}.hero h2{margin:8px 0 4px;font-size:42px;line-height:1.02}.eyebrow{font-size:12px;font-weight:800;color:var(--blue);letter-spacing:.14em;text-transform:uppercase}.hero-side{display:flex;align-items:center;gap:12px}.hero-logo{width:88px;height:88px;border-radius:16px;background:#fff;border:1px solid var(--line);padding:14px;box-shadow:0 8px 20px rgba(18,32,51,.08);object-fit:contain}
 .meta-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:18px}.meta-pill{background:var(--panel2);border:1px solid var(--line);border-radius:18px;padding:14px 16px}.meta-pill .label{font-size:12px;color:var(--muted);text-transform:uppercase;font-weight:800;letter-spacing:.08em}.meta-pill .value{margin-top:6px;font-size:16px;font-weight:700}
 .health{padding:10px 14px;border-radius:999px;font-size:13px;font-weight:800}.health.ok{background:#eaf8f0;color:var(--green)}.health.warn{background:#fff6e6;color:var(--amber)}.health.bad{background:#fff0f0;color:var(--red)}
 .kpis{margin-top:18px;padding:16px}.kpi-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.kpi{background:linear-gradient(180deg,#fff,#f8faff);border:1px solid var(--line);border-radius:20px;padding:18px;min-height:132px}.kpi .label{font-size:13px;color:var(--muted);font-weight:800;text-transform:uppercase;letter-spacing:.06em}.kpi .value{margin-top:10px;font-size:34px;font-weight:800;line-height:1}.kpi .sub{margin-top:10px;font-size:13px;color:var(--muted)}
@@ -4145,7 +4145,7 @@ def finance_html() -> str:
 .table-wrap{overflow:auto;border:1px solid var(--line);border-radius:18px}table{width:100%;border-collapse:collapse}th,td{padding:14px;border-bottom:1px solid var(--line);border-right:1px solid #e8edf5;font-size:14px;text-align:left}th:last-child,td:last-child{border-right:none}th{background:#f7f9fc;color:#536079;font-size:12px;text-transform:uppercase;letter-spacing:.08em}tr:last-child td{border-bottom:none}td.num{text-align:right;font-variant-numeric:tabular-nums}
 .delta.pos{color:var(--green);font-weight:800}.delta.neg{color:var(--red);font-weight:800}.insights{display:flex;flex-wrap:wrap;gap:10px}.insight{padding:12px 14px;border-radius:16px;font-size:14px;font-weight:700;border:1px solid var(--line);background:var(--panel2)}
 .notice{padding:14px 16px;border-radius:16px;background:#fff7e7;color:#8c6211;border:1px solid #f0dcab}.error{padding:14px 16px;border-radius:16px;background:#fff0f0;color:#992f2f;border:1px solid #f1c6c6}.empty{padding:28px;border:1px dashed var(--line);border-radius:18px;color:var(--muted);text-align:center;background:#fafbfd}.small{font-size:13px;color:var(--muted)}.footer-row{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-top:12px}
-@media (max-width:1200px){.kpi-grid{grid-template-columns:repeat(2,1fr)}.prod-grid{grid-template-columns:repeat(2,1fr)}.layout{grid-template-columns:1fr}.meta-grid{grid-template-columns:repeat(2,1fr)}}@media (max-width:720px){.topbar{position:static}.kpi-grid{grid-template-columns:1fr}.prod-grid{grid-template-columns:1fr}.meta-grid{grid-template-columns:1fr}.hero h2{font-size:30px}.select,.search{min-width:100%}}
+@media (max-width:1200px){.kpi-grid{grid-template-columns:repeat(2,1fr)}.prod-grid{grid-template-columns:repeat(2,1fr)}.layout{grid-template-columns:1fr}.meta-grid{grid-template-columns:repeat(2,1fr)}}@media (max-width:720px){.topbar{grid-template-columns:1fr}.menu-row,.project-row{flex-direction:column;align-items:stretch}.kpi-grid{grid-template-columns:1fr}.prod-grid{grid-template-columns:1fr}.meta-grid{grid-template-columns:1fr}.hero h2{font-size:30px}.select,.search{min-width:100%}}
 </style>
 </head>
 <body>
@@ -4153,14 +4153,18 @@ def finance_html() -> str:
   <div class='topbar'>
     <div class='brand-mini'><img src='/assets/logo-tempo' alt='Logo Tempo'></div>
     <div class='controls'>
-      <input id='searchInput' class='search locked' type='search' placeholder='Projet verrouillé (changer depuis Accueil)' readonly>
-      <select id='affaireSelect' class='select locked' disabled><option value=''>Projet verrouillé</option></select>
-      <a class='btn dark' href='/'>Accueil</a>
-      <a id='dashboardBtn' class='btn dark' href='/dashboard'>Tableau de bord</a>
-      <a id='pmBtn' class='btn dark' href='/gestion-projet'>Gestion de projet</a>
-      <button id='reloadBtn' class='btn primary'>Reconstruire le cache</button>
-      <button id='exportBtn' class='btn dark' disabled>Exporter CSV</button>
-      <div id='cacheBadge' class='badge'><span class='dot idle'></span><span>Cache : attente</span></div>
+      <div class='menu-row'>
+        <a class='btn dark' href='/'>Accueil</a>
+        <a id='dashboardBtn' class='btn dark' href='/dashboard'>Tableau de bord</a>
+        <a id='pmBtn' class='btn dark' href='/gestion-projet'>Gestion de projet</a>
+        <button id='reloadBtn' class='btn primary'>Reconstruire le cache</button>
+        <button id='exportBtn' class='btn dark' disabled>Exporter CSV</button>
+        <div id='cacheBadge' class='badge'><span class='dot idle'></span><span>Cache : attente</span></div>
+      </div>
+      <div class='project-row'>
+        <input id='searchInput' class='search locked' type='search' placeholder='Projet verrouillé (changer depuis Accueil)' readonly>
+        <select id='affaireSelect' class='select locked' disabled><option value=''>Projet verrouillé</option></select>
+      </div>
     </div>
   </div>
 
@@ -4174,7 +4178,7 @@ def finance_html() -> str:
         <h2 id='heroTitle'>Sélectionnez une affaire</h2>
         <div id='heroSubtitle' class='small'>Le cockpit se remplit à partir du cache du tableau activité.</div>
       </div>
-      <div id='heroHealth' class='health warn'>En attente</div>
+      <div class='hero-side'><div id='heroHealth' class='health warn'>En attente</div><img class='hero-logo' src='/assets/logo-tempo' alt='Logo Tempo'></div>
     </div>
     <div class='meta-grid'>
       <div class='meta-pill'><div class='label'>CLIENT</div><div class='value' id='metaClient'>-</div></div>
@@ -4274,27 +4278,34 @@ def gestion_projet_html() -> str:
 :root{--line:#dfe5ef;--ink:#122033;--muted:#6e7a90;--accent:#ef8d00;--panel:#fff;--shadow:0 12px 34px rgba(18,32,51,.07)}
 *{box-sizing:border-box}body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:#f3f6fb;color:var(--ink)}
 .wrap{max-width:1480px;margin:20px auto;padding:0 16px}.top,.kpis,.section{background:var(--panel);border:1px solid var(--line);border-radius:22px;box-shadow:var(--shadow)}
-.top{padding:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}.brand-mini{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border:1px solid var(--line);border-radius:12px;background:#fff}.brand-mini img{width:24px;height:24px;object-fit:contain}.search,.select{height:44px;border:1px solid var(--line);border-radius:12px;padding:0 12px;min-width:280px}.search.locked,.select.locked{background:#eef2f8;color:#6e7a90;pointer-events:none}
+.top{padding:14px;display:grid;grid-template-columns:auto 1fr;gap:12px;align-items:start}.brand-mini{display:inline-flex;align-items:center;justify-content:center;width:78px;height:78px;border:1px solid var(--line);border-radius:16px;background:#fff;box-shadow:0 8px 20px rgba(18,32,51,.08)}.brand-mini img{width:48px;height:48px;object-fit:contain}.top-main{display:flex;flex-direction:column;gap:10px}.menu-row,.project-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.search,.select{height:44px;border:1px solid var(--line);border-radius:12px;padding:0 12px;min-width:260px}.search.locked,.select.locked{background:#eef2f8;color:#6e7a90;pointer-events:none}
 .btn{height:44px;border-radius:12px;border:none;padding:0 14px;background:var(--accent);color:#fff;text-decoration:none;display:inline-flex;align-items:center;font-weight:800;cursor:pointer}
 .kpis{margin-top:12px;padding:14px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.k{border:1px solid var(--line);border-radius:14px;padding:14px;background:#fbfdff}.k .v{font-size:34px;font-weight:900;margin-top:6px}
 .section{margin-top:12px;padding:14px}.subgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:14px}table{width:100%;border-collapse:collapse}th,td{padding:10px 12px;border-bottom:1px solid var(--line);border-right:1px solid #e8edf5;font-size:13px;text-align:left}th:last-child,td:last-child{border-right:none}th{background:#f7f9fc;font-size:12px;color:#5b6880;text-transform:uppercase}.small{color:var(--muted);font-size:13px}
 .bar{height:10px;background:#edf1f8;border-radius:999px;overflow:hidden}.fill{height:100%;background:#ef8d00}
-.loading-wrap{margin-top:8px;padding:8px 10px;border:1px solid #d8e0ee;border-radius:12px;background:#fff}.loading-label{font-size:12px;color:#5b6880;margin-bottom:6px;font-weight:700}.loading-track{height:8px;border-radius:999px;background:#eef2f8;overflow:hidden}.loading-bar{height:100%;width:35%;background:linear-gradient(90deg,#ef8d00,#ffd08a);animation:loadmove 1.2s infinite ease-in-out}@keyframes loadmove{0%{margin-left:-35%}100%{margin-left:100%}}.match-box{margin-top:10px;border:1px solid var(--line);border-radius:10px;padding:8px;background:#fffaf2}.match-box.ok{border-color:#49a66a;background:#f4fcf6}.match-box.warn{border-color:#ef8d00;background:#fff7ec}.match-title{font-weight:700;margin-bottom:4px;font-size:13px}.conf-badge{display:inline-block;margin-left:8px;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:800;background:#eef2f8;color:#3b4f6f}.match-grid{display:none;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.match-box:hover .match-grid,.match-box:focus-within .match-grid{display:grid}.match-item{font-size:12px;color:#30425f}.match-item b{display:block;color:#6e7a90;font-size:11px;margin-bottom:2px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-word}.pilot-box{margin-top:12px;border:1px solid #cfd8e8;border-radius:18px;padding:16px;background:#f8fbff}.pilot-title{font-size:34px;font-weight:900;margin:4px 0 10px}.pilot-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.pilot-card{background:#fff;border:1px solid #d8e0ee;border-radius:18px;padding:14px}.pilot-card .t{font-size:15px;color:#4b5d7a;font-weight:800}.pilot-card .v{font-size:44px;font-weight:900;margin-top:8px}.pilot-list{margin-top:12px;border:1px solid #d8e0ee;border-radius:18px;background:#fff;padding:10px}.pilot-row{display:flex;justify-content:space-between;gap:12px;padding:12px;border:1px solid #e6ecf6;border-radius:12px;margin:8px 0;background:linear-gradient(180deg,#ffffff 0%,#f8fbff 100%)}.pilot-row:last-child{border-bottom:1px solid #e6ecf6}.pilot-row .name{font-weight:800}.pilot-row-btn{appearance:none;-webkit-appearance:none;width:100%;text-align:left;background:none;cursor:pointer;color:inherit;font:inherit}.company-cell{display:flex;align-items:center;gap:10px}.company-logo{width:28px;height:28px;border-radius:50%;border:1px solid #d8e0ee;background:#fff;object-fit:cover;display:inline-flex;align-items:center;justify-content:center;font-size:11px;color:#6e7a90;font-weight:800}.proj-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.progress-card{border:1px solid #d8e0ee;border-radius:14px;padding:12px;background:#fff}.progress-title{font-weight:800;margin-bottom:8px}.progress-row{display:grid;grid-template-columns:180px 1fr 70px;gap:10px;align-items:center;padding:6px 0}.progress-track{height:10px;border-radius:999px;background:#edf1f8;overflow:hidden}.progress-fill{height:100%;background:#1b6ef3}.curve-wrap{border:1px solid #d8e0ee;border-radius:14px;padding:12px;background:#fff}.project-head{display:flex;align-items:flex-start;gap:16px}.project-cover{width:220px;height:132px;border-radius:14px;border:1px solid #d8e0ee;object-fit:cover;background:#fff;box-shadow:0 10px 24px rgba(16,32,56,.12)}.project-title{font-size:30px;font-weight:900;margin:4px 0 2px}.project-desc{color:#6e7a90;margin:2px 0 0}.timeline-box{margin:10px 0;border:1px solid #d8e0ee;border-radius:14px;background:#fff;padding:10px}.timeline-row{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px}.timeline-track{height:12px;border-radius:999px;background:#edf1f8;overflow:hidden}.timeline-fill{height:100%;background:#1b6ef3}.timeline-fill.over{background:#d64545}.chart-controls{display:flex;gap:8px;align-items:center;margin-bottom:8px}.chart-select{height:36px;border:1px solid var(--line);border-radius:10px;padding:0 10px}.react-row{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px dashed #d8e0ee}.react-row:last-child{border-bottom:none}.pm-modal{position:fixed;inset:0;background:rgba(11,20,33,.45);display:flex;align-items:center;justify-content:center;padding:20px;z-index:50}.pm-modal-box{background:#fff;border-radius:14px;max-width:1100px;width:100%;max-height:82vh;overflow:auto;padding:14px;border:1px solid #d8e0ee}.lvl-row{background:#f7f9fd;font-weight:800}.task-late{background:#fff1f1}.task-soon{background:#fffaf0}
-@media (max-width:980px){.grid{grid-template-columns:repeat(2,1fr)}.subgrid{grid-template-columns:1fr}}@media (max-width:640px){.grid{grid-template-columns:1fr}}
+.loading-wrap{margin-top:8px;padding:8px 10px;border:1px solid #d8e0ee;border-radius:12px;background:#fff}.loading-label{font-size:12px;color:#5b6880;margin-bottom:6px;font-weight:700}.loading-track{height:8px;border-radius:999px;background:#eef2f8;overflow:hidden}.loading-bar{height:100%;width:35%;background:linear-gradient(90deg,#ef8d00,#ffd08a);animation:loadmove 1.2s infinite ease-in-out}@keyframes loadmove{0%{margin-left:-35%}100%{margin-left:100%}}.match-box{margin-top:10px;border:1px solid var(--line);border-radius:10px;padding:8px;background:#fffaf2}.match-box.ok{border-color:#49a66a;background:#f4fcf6}.match-box.warn{border-color:#ef8d00;background:#fff7ec}.match-title{font-weight:700;margin-bottom:4px;font-size:13px}.conf-badge{display:inline-block;margin-left:8px;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:800;background:#eef2f8;color:#3b4f6f}.match-grid{display:none;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.match-box:hover .match-grid,.match-box:focus-within .match-grid{display:grid}.match-item{font-size:12px;color:#30425f}.match-item b{display:block;color:#6e7a90;font-size:11px;margin-bottom:2px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-word}.pilot-box{margin-top:12px;border:1px solid #cfd8e8;border-radius:18px;padding:16px;background:#f8fbff}.pilot-title{font-size:34px;font-weight:900;margin:4px 0 10px}.pilot-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.pilot-card{background:#fff;border:1px solid #d8e0ee;border-radius:18px;padding:14px}.pilot-card .t{font-size:15px;color:#4b5d7a;font-weight:800}.pilot-card .v{font-size:44px;font-weight:900;margin-top:8px}.pilot-list{margin-top:12px;border:1px solid #d8e0ee;border-radius:18px;background:#fff;padding:10px}.pilot-row{display:flex;justify-content:space-between;gap:12px;padding:12px;border:1px solid #e6ecf6;border-radius:12px;margin:8px 0;background:linear-gradient(180deg,#ffffff 0%,#f8fbff 100%)}.pilot-row:last-child{border-bottom:1px solid #e6ecf6}.pilot-row .name{font-weight:800}.pilot-row-btn{appearance:none;-webkit-appearance:none;width:100%;text-align:left;background:none;cursor:pointer;color:inherit;font:inherit}.company-cell{display:flex;align-items:center;gap:10px}.company-logo{width:28px;height:28px;border-radius:50%;border:1px solid #d8e0ee;background:#fff;object-fit:cover;display:inline-flex;align-items:center;justify-content:center;font-size:11px;color:#6e7a90;font-weight:800}.proj-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.progress-card{border:1px solid #d8e0ee;border-radius:14px;padding:12px;background:#fff}.progress-title{font-weight:800;margin-bottom:8px}.progress-row{display:grid;grid-template-columns:180px 1fr 70px;gap:10px;align-items:center;padding:6px 0}.progress-track{height:10px;border-radius:999px;background:#edf1f8;overflow:hidden}.progress-fill{height:100%;background:#1b6ef3}.curve-wrap{border:1px solid #d8e0ee;border-radius:14px;padding:12px;background:#fff}.project-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.project-cover{width:220px;height:132px;border-radius:14px;border:1px solid #d8e0ee;object-fit:cover;background:#fff;box-shadow:0 10px 24px rgba(16,32,56,.12)}.project-logo{width:88px;height:88px;border-radius:16px;background:#fff;border:1px solid var(--line);padding:14px;box-shadow:0 8px 20px rgba(18,32,51,.08);object-fit:contain}.project-title{font-size:30px;font-weight:900;margin:4px 0 2px}.project-desc{color:#6e7a90;margin:2px 0 0}.timeline-box{margin:10px 0;border:1px solid #d8e0ee;border-radius:14px;background:#fff;padding:10px}.timeline-row{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px}.timeline-track{height:12px;border-radius:999px;background:#edf1f8;overflow:hidden}.timeline-fill{height:100%;background:#1b6ef3}.timeline-fill.over{background:#d64545}.chart-controls{display:flex;gap:8px;align-items:center;margin-bottom:8px}.chart-select{height:36px;border:1px solid var(--line);border-radius:10px;padding:0 10px}.react-row{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px dashed #d8e0ee}.react-row:last-child{border-bottom:none}.pm-modal{position:fixed;inset:0;background:rgba(11,20,33,.45);display:flex;align-items:center;justify-content:center;padding:20px;z-index:50}.pm-modal-box{background:#fff;border-radius:14px;max-width:1100px;width:100%;max-height:82vh;overflow:auto;padding:14px;border:1px solid #d8e0ee}.lvl-row{background:#f7f9fd;font-weight:800}.task-late{background:#fff1f1}.task-soon{background:#fffaf0}
+@media (max-width:980px){.top{grid-template-columns:1fr}.menu-row,.project-row{flex-direction:column;align-items:stretch}.grid{grid-template-columns:repeat(2,1fr)}.subgrid{grid-template-columns:1fr}}@media (max-width:640px){.grid{grid-template-columns:1fr}}
 </style></head>
 <body><div class='wrap'>
   <div class='top'>
-    <div class='brand-mini'><img src='/assets/logo-tempo' alt='Tempo'></div><a class='btn' href='/'>Accueil</a>
-    <input id='searchInput' class='search locked' type='search' placeholder='Projet verrouillé (changer depuis Accueil)' readonly>
-    <select id='affaireSelect' class='select locked' disabled><option value=''>Projet verrouillé</option></select>
-    <a id='financeBtn' class='btn' href='/finance'>Finances</a>
-    <a id='dashboardBtn' class='btn' href='/dashboard'>Tableau de bord</a>
-    <a class='btn' href='/'>Changer de projet</a>
+    <div class='brand-mini'><img src='/assets/logo-tempo' alt='Tempo'></div>
+    <div class='top-main'>
+      <div class='menu-row'>
+        <a class='btn' href='/'>Accueil</a>
+        <a id='financeBtn' class='btn' href='/finance'>Finances</a>
+        <a id='dashboardBtn' class='btn' href='/dashboard'>Tableau de bord</a>
+        <a class='btn' href='/'>Changer de projet</a>
+      </div>
+      <div class='project-row'>
+        <input id='searchInput' class='search locked' type='search' placeholder='Projet verrouillé (changer depuis Accueil)' readonly>
+        <select id='affaireSelect' class='select locked' disabled><option value=''>Projet verrouillé</option></select>
+      </div>
+    </div>
   </div>
   <div id='loadingWrap' class='loading-wrap' style='display:none'><div id='loadingLabel' class='loading-label'>Chargement des indicateurs projet…</div><div class='loading-track'><div class='loading-bar'></div></div></div>
 
   <div class='kpis'>
-    <div class='project-head'><img id='projectImage' class='project-cover' alt='Projet' src=''><div><div id='projectTitle' class='project-title'>-</div><div id='projectDesc' class='project-desc'>-</div></div></div>
+    <div class='project-head'><img id='projectImage' class='project-cover' alt='Projet' src=''><div style='flex:1'><div id='projectTitle' class='project-title'>-</div><div id='projectDesc' class='project-desc'>-</div></div><img class='project-logo' src='/assets/logo-tempo' alt='Logo Tempo'></div>
     <div id='timelineBox' class='timeline-box'><div class='small'>Période projet indisponible</div></div>
     <div class='grid'>
       <div class='k'><div class='small'>Sujets ouverts</div><div id='kOpen' class='v'>0</div></div>
@@ -4458,26 +4469,32 @@ def dashboard_html() -> str:
 :root{--line:#dfe5ef;--ink:#122033;--muted:#6e7a90;--accent:#ef8d00;--panel:#fff;--shadow:0 12px 34px rgba(18,32,51,.07)}
 *{box-sizing:border-box}body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:#f3f6fb;color:var(--ink)}
 .wrap{max-width:1320px;margin:22px auto;padding:0 16px}.top,.hero,.kpis,.chart{background:var(--panel);border:1px solid var(--line);border-radius:22px;box-shadow:var(--shadow)}
-.top{padding:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}.brand-mini{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border:1px solid var(--line);border-radius:12px;background:#fff}.brand-mini img{width:24px;height:24px;object-fit:contain}.search,.select{height:44px;border:1px solid var(--line);border-radius:12px;padding:0 12px;min-width:280px}
+.top{padding:14px;display:grid;grid-template-columns:auto 1fr;gap:12px;align-items:start}.brand-mini{display:inline-flex;align-items:center;justify-content:center;width:78px;height:78px;border:1px solid var(--line);border-radius:16px;background:#fff;box-shadow:0 8px 20px rgba(18,32,51,.08)}.brand-mini img{width:48px;height:48px;object-fit:contain}.top-main{display:flex;flex-direction:column;gap:10px}.menu-row,.project-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.search,.select{height:44px;border:1px solid var(--line);border-radius:12px;padding:0 12px;min-width:260px}
 .btn{height:44px;border-radius:12px;border:none;padding:0 14px;background:var(--accent);color:#fff;text-decoration:none;display:inline-flex;align-items:center;font-weight:800;cursor:pointer}
-.hero{padding:18px;margin-top:14px}.hero-row{display:flex;justify-content:space-between;gap:18px;align-items:flex-start}.hero-media{display:none}.hero-media.show{display:block}.hero-media img{width:280px;max-width:32vw;height:170px;object-fit:cover;border-radius:16px;border:1px solid #d6dfed;box-shadow:0 10px 24px rgba(16,32,56,.12)}.eyeb{font-size:12px;font-weight:800;letter-spacing:.12em;color:var(--accent);text-transform:uppercase}.title{font-size:36px;font-weight:900;margin:6px 0}.muted{color:var(--muted)}
+.hero{padding:18px;margin-top:14px}.hero-row{display:flex;justify-content:space-between;gap:18px;align-items:flex-start}.hero-media{display:none}.hero-media.show{display:block}.hero-media img{width:280px;max-width:32vw;height:170px;object-fit:cover;border-radius:16px;border:1px solid #d6dfed;box-shadow:0 10px 24px rgba(16,32,56,.12)}.hero-logo{width:88px;height:88px;border-radius:16px;background:#fff;border:1px solid var(--line);padding:14px;box-shadow:0 8px 20px rgba(18,32,51,.08);object-fit:contain}.hero-aside{display:flex;gap:12px;align-items:flex-start}.eyeb{font-size:12px;font-weight:800;letter-spacing:.12em;color:var(--accent);text-transform:uppercase}.title{font-size:36px;font-weight:900;margin:6px 0}.muted{color:var(--muted)}
 .kpis{padding:14px;margin-top:14px}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.k{border:1px solid var(--line);border-radius:14px;padding:14px;background:#fbfdff}.k .v{font-size:36px;font-weight:900;margin-top:6px}
 .chart{padding:16px;margin-top:14px}.chart h3{margin:0 0 12px;font-size:28px}.chart-wrap{height:360px;border:1px solid #d5deec;border-radius:16px;padding:12px;background:linear-gradient(180deg,#fbfcff 0%,#f4f7fd 100%)}
-@media (max-width:900px){.grid{grid-template-columns:1fr}.title{font-size:28px}}
+@media (max-width:900px){.top{grid-template-columns:1fr}.menu-row,.project-row{flex-direction:column;align-items:stretch}.grid{grid-template-columns:1fr}.title{font-size:28px}}
 </style></head>
 <body>
 <div class='wrap'>
   <div class='top'>
     <div class='brand-mini'><img src='/assets/logo-tempo' alt='Tempo'></div>
-    <a class='btn' href='/'>Accueil</a>
-    <input id='searchInput' class='search' type='search' placeholder='Rechercher une affaire'>
-    <select id='affaireSelect' class='select locked' disabled><option value=''>Projet verrouillé</option></select>
-    <a id='financeBtn' class='btn' href='/finance'>Finances</a>
-    <a id='pmBtn' class='btn' href='/gestion-projet'>Gestion de projet</a>
-    <button id='exportBtn' class='btn' disabled>Exporter CSV</button>
+    <div class='top-main'>
+      <div class='menu-row'>
+        <a class='btn' href='/'>Accueil</a>
+        <a id='financeBtn' class='btn' href='/finance'>Finances</a>
+        <a id='pmBtn' class='btn' href='/gestion-projet'>Gestion de projet</a>
+        <button id='exportBtn' class='btn' disabled>Exporter CSV</button>
+      </div>
+      <div class='project-row'>
+        <input id='searchInput' class='search' type='search' placeholder='Rechercher une affaire'>
+        <select id='affaireSelect' class='select locked' disabled><option value=''>Projet verrouillé</option></select>
+      </div>
+    </div>
   </div>
   <div class='hero'>
-    <div class='hero-row'><div><div class='eyeb'>Tableau de bord</div><div id='title' class='title'>Sélectionnez une affaire</div><div id='subtitle' class='muted'>Synthèse principale : client, commande, antériorité, facturé 2026, facturation totale et reste à facturer.</div></div><div id='projectImageBox' class='hero-media'><img id='projectImage' alt='Projet'></div></div>
+    <div class='hero-row'><div><div class='eyeb'>Tableau de bord</div><div id='title' class='title'>Sélectionnez une affaire</div><div id='subtitle' class='muted'>Synthèse principale : client, commande, antériorité, facturé 2026, facturation totale et reste à facturer.</div></div><div class='hero-aside'><div id='projectImageBox' class='hero-media'><img id='projectImage' alt='Projet'></div><img class='hero-logo' src='/assets/logo-tempo' alt='Logo Tempo'></div></div>
   </div>
   <div class='kpis'><div class='grid'>
     <div class='k'><div class='muted'>💰 Commandes achetées</div><div id='kCommande' class='v'>0 €</div></div>
