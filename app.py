@@ -706,8 +706,12 @@ class BoondService:
         score = max(0, min(100, score))
         return score, reasons
 
-    def find_best_boond_project_match(self, project_name: str, boond_projects: List[Dict[str, Any]], affaire_id: str = "") -> Optional[Dict[str, Any]]:
+    def find_best_boond_project_match(self, project_name: str, boond_projects: List[Dict[str, Any]], affaire_id: str = "", context_hint: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         context = self._get_metronome_match_context(project_name, affaire_id=affaire_id)
+        hint = context_hint or {}
+        for key in ["display_name", "affaire", "numero", "client"]:
+            if clean_text(hint.get(key)):
+                context[key] = clean_text(hint.get(key))
         target_texts = [
             project_name,
             clean_text(context.get("display_name")),
@@ -1408,7 +1412,7 @@ class BoondService:
         return result
 
 
-    def get_project_imputation_summary(self, project_name: str, refresh: bool = False, affaire_id: str = "") -> Dict[str, Any]:
+    def get_project_imputation_summary(self, project_name: str, refresh: bool = False, affaire_id: str = "", context_hint: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         index = self.build_boond_imputation_index(refresh=refresh)
 
         # Matching sur l'ensemble des projets BOOND paginés, pas uniquement sur l'index d'imputation.
@@ -1421,7 +1425,7 @@ class BoondService:
                 "project_reference": clean_text(attrs.get("reference") or attrs.get("title") or attrs.get("name")),
             })
 
-        matched = self.find_best_boond_project_match(project_name, boond_projects_for_match, affaire_id=affaire_id)
+        matched = self.find_best_boond_project_match(project_name, boond_projects_for_match, affaire_id=affaire_id, context_hint=context_hint)
 
         if not matched:
             return {
@@ -3581,12 +3585,12 @@ function fmt(v){const n=Number(v||0);return n.toLocaleString('fr-FR',{maximumFra
 
 
 @app.get("/api/boond/imputations/by-project", response_class=JSONResponse)
-def api_boond_imputation_by_project(project_name: str = Query(...), refresh: bool = Query(default=False), affaire_id: str = Query(default="")):
+def api_boond_imputation_by_project(project_name: str = Query(...), refresh: bool = Query(default=False), affaire_id: str = Query(default=""), affaire: str = Query(default=""), numero: str = Query(default=""), client: str = Query(default=""), display_name: str = Query(default="")):
     pname = clean_text(project_name)
     if not pname:
         raise HTTPException(status_code=400, detail="project_name obligatoire")
     try:
-        return boond_service.get_project_imputation_summary(project_name=pname, refresh=bool(refresh), affaire_id=clean_text(affaire_id))
+        return boond_service.get_project_imputation_summary(project_name=pname, refresh=bool(refresh), affaire_id=clean_text(affaire_id), context_hint={"affaire": clean_text(affaire), "numero": clean_text(numero), "client": clean_text(client), "display_name": clean_text(display_name)})
     except RuntimeError as exc:
         return JSONResponse(
             status_code=200,
@@ -3736,7 +3740,7 @@ def api_boond_debug_project_resource_table(project_id: str, refresh: bool = Fals
 
 
 @app.get("/api/boond/debug/project-cost-path", response_class=JSONResponse)
-def api_boond_debug_project_cost_path(project_name: str, affaire_id: str = ""):
+def api_boond_debug_project_cost_path(project_name: str, affaire_id: str = "", affaire: str = "", numero: str = "", client: str = "", display_name: str = ""):
     catalog = boond_service.get_all_boond_projects()
     boond_projects_for_match: List[Dict[str, Any]] = []
     for item in catalog:
@@ -3746,7 +3750,7 @@ def api_boond_debug_project_cost_path(project_name: str, affaire_id: str = ""):
             "project_reference": clean_text(attrs.get("reference") or attrs.get("title") or attrs.get("name")),
         })
 
-    matched = boond_service.find_best_boond_project_match(project_name, boond_projects_for_match, affaire_id=clean_text(affaire_id))
+    matched = boond_service.find_best_boond_project_match(project_name, boond_projects_for_match, affaire_id=clean_text(affaire_id), context_hint={"affaire": clean_text(affaire), "numero": clean_text(numero), "client": clean_text(client), "display_name": clean_text(display_name)})
     if not matched:
         return {
             "input_project_name": project_name,
@@ -4140,7 +4144,7 @@ async function api(url,options){const r=await fetch(url,options||{});const data=
 function healthClass(a){const reste=Number(a.reste_a_facturer||0),taux=Number(a.taux_avancement_financier||0);if(taux>=0.9)return{label:'Presque soldée',cls:'ok'};if(reste>0&&taux<0.35)return{label:'À surveiller',cls:'warn'};if(reste<0)return{label:'Incohérence à vérifier',cls:'bad'};return{label:'Stable',cls:'ok'};}
 async function loadCacheStatus(){const d=await api('/api/finance/cache-status');state.cacheStatus=d;const label=d.status==='ready'?`Cache prêt · ${d.affaires_count} affaires`:d.status==='building'?'Cache en reconstruction…':`Cache : ${d.status}`;setCacheBadge(d.status,label);document.getElementById('statusMeta').textContent=`${d.affaires_count||0} affaires · ${d.rows_kept||0} lignes utiles · ${d.generated_at||'pas encore généré'}`;}
 async function loadAffairesList(search=''){const d=await api(`/api/finance/affaires?search=${encodeURIComponent(search)}`);state.affaires=d.items||[];const sel=document.getElementById('affaireSelect');const prev=state.selectedAffaireId;sel.innerHTML=`<option value=''>Sélectionnez une affaire</option>`+state.affaires.map(x=>`<option value="${esc(x.affaire_id)}">${esc(x.display_name)}</option>`).join('');if(prev&&state.affaires.some(x=>x.affaire_id===prev)){sel.value=prev;}else{state.selectedAffaireId='';state.selectedAffaire=null;}showNotice(state.affaires.length?`${state.affaires.length} affaire(s) disponible(s)`:'Aucune affaire trouvée pour ce filtre.');}
-async function loadSelectedAffaire(id){if(!id){state.selectedAffaireId='';state.selectedAffaire=null;state.boondImputation=null;renderAll();return;}const d=await api(`/api/finance/affaire/${encodeURIComponent(id)}`);state.selectedAffaireId=id;state.selectedAffaire=d.affaire||null;state.boondImputation=null;renderAll();try{const boondName=(state.selectedAffaire&&(state.selectedAffaire.affaire||state.selectedAffaire.display_name))||'';if(boondName){state.boondImputation=await api(`/api/boond/imputations/by-project?project_name=${encodeURIComponent(boondName)}&affaire_id=${encodeURIComponent(id)}`);}else{state.boondImputation={matched_project:null,totals:{}};}}catch(_){state.boondImputation={matched_project:null,totals:{}};}renderAll();localStorage.setItem('selectedAffaireId',id);}
+async function loadSelectedAffaire(id){if(!id){state.selectedAffaireId='';state.selectedAffaire=null;state.boondImputation=null;renderAll();return;}const d=await api(`/api/finance/affaire/${encodeURIComponent(id)}`);state.selectedAffaireId=id;state.selectedAffaire=d.affaire||null;state.boondImputation=null;renderAll();try{const boondName=(state.selectedAffaire&&(state.selectedAffaire.affaire||state.selectedAffaire.display_name))||'';if(boondName){state.boondImputation=await api(`/api/boond/imputations/by-project?project_name=${encodeURIComponent(boondName)}&affaire_id=${encodeURIComponent(id)}&affaire=${encodeURIComponent((state.selectedAffaire&&state.selectedAffaire.affaire)||'')}&numero=${encodeURIComponent((state.selectedAffaire&&state.selectedAffaire.numero)||'')}&client=${encodeURIComponent((state.selectedAffaire&&state.selectedAffaire.client)||'')}&display_name=${encodeURIComponent((state.selectedAffaire&&state.selectedAffaire.display_name)||'')}`);}else{state.boondImputation={matched_project:null,totals:{}};}}catch(_){state.boondImputation={matched_project:null,totals:{}};}renderAll();localStorage.setItem('selectedAffaireId',id);}
 function setHeroEmpty(){document.getElementById('heroTitle').textContent='Sélectionnez une affaire';document.getElementById('heroSubtitle').textContent='Le cockpit se remplit à partir du cache du tableau activité.';document.getElementById('metaClient').textContent='-';document.getElementById('metaProject').textContent='-';document.getElementById('metaMissions').textContent='-';document.getElementById('metaStatus').textContent='🟠 Attention';const h=document.getElementById('heroHealth');h.textContent='En attente';h.className='health warn';}
 function cardTone(id,tone){const el=document.getElementById(id);el.classList.remove('good','warn','bad');if(tone)el.classList.add(tone);}
 function renderHero(){const a=state.selectedAffaire;if(!a){setHeroEmpty();return;}document.getElementById('heroTitle').textContent=a.display_name||'-';document.getElementById('heroSubtitle').textContent=`Client ${a.client||'-'} · ${(a.missions||[]).length} mission(s)`;document.getElementById('metaClient').textContent=a.client||'-';document.getElementById('metaProject').textContent=a.affaire||'-';document.getElementById('metaMissions').textContent=String((a.missions||[]).length||0);const hh=healthClass(a),el=document.getElementById('heroHealth');el.textContent=hh.label;el.className=`health ${hh.cls}`;const reste=euro(a.reste_a_facturer||0);document.getElementById('metaStatus').textContent=hh.cls==='ok'?`🟢 Stable · Reste ${reste}`:(hh.cls==='warn'?`🟠 Attention · Reste ${reste}`:`🔴 Risque · Reste ${reste}`);}
