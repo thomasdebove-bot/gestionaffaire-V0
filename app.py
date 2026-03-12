@@ -272,6 +272,18 @@ class BoondService:
         self.set_api_cache(cache_key, {"items": resources}, ttl_seconds=86400)
         return resources
 
+    def get_boond_resource_name_map(self) -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        for item in self.get_all_boond_resources():
+            rid = clean_text(item.get("id"))
+            attrs = item.get("attributes", {}) or {}
+            name = clean_text(attrs.get("name"))
+            if not name:
+                name = clean_text((attrs.get("firstName") or "") + " " + (attrs.get("lastName") or ""))
+            if rid:
+                out[rid] = name or rid
+        return out
+
     @staticmethod
     def extract_rate_from_resource(resource: Dict[str, Any]) -> Optional[float]:
         attrs = resource.get("attributes", {}) or {}
@@ -753,6 +765,35 @@ class BoondService:
 
         if candidates and int(candidates[0].get("match_score", 0)) >= 45:
             return candidates[0]
+
+        # Fallback robuste: si aucun candidat fort, conserver le meilleur score faible
+        # pour éviter les absences de match sur des libellés dégradés.
+        if candidates:
+            best = candidates[0]
+            best["matched_on"] = (best.get("matched_on") or "scored") + ":fallback"
+            return best
+
+        # Dernier recours: overlap de tokens sur la référence brute BOOND.
+        target_tokens = set(self.normalize_match_text(" ".join(target_texts)).split())
+        raw_best = None
+        raw_best_score = -1
+        for p in boond_projects:
+            pref = clean_text(p.get("project_reference"))
+            ref_tokens = set(self.normalize_match_text(pref).split())
+            overlap = len((target_tokens & ref_tokens) - self.SENSITIVE_COMPANY_TOKENS)
+            if overlap > raw_best_score:
+                raw_best_score = overlap
+                raw_best = p
+        if raw_best and raw_best_score >= 1:
+            return {
+                "project_id": clean_text(raw_best.get("project_id")),
+                "project_reference": clean_text(raw_best.get("project_reference")),
+                "match_score": 30,
+                "matched_on": "token_overlap_fallback",
+                "match_reasons": [f"token_overlap:{raw_best_score}"],
+                "match_warning": "low_confidence",
+                "metronome_context": context,
+            }
         return None
 
 
@@ -1332,6 +1373,7 @@ class BoondService:
                     "turnover_production_ht": None,
                 },
                 "by_month": [],
+                "resources_imputation": [],
                 "meta": index.get("meta", {}),
                 "match_debug": self._last_match_debug,
                 "message": "Aucun projet BOOND correspondant trouvé.",
@@ -1343,8 +1385,12 @@ class BoondService:
         # Jours imputés: source validée workplaces-times
         total_days = 0.0
         by_month_map: Dict[str, Dict[str, float]] = defaultdict(lambda: {"days": 0.0, "cost": 0.0})
+        by_resource: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"resource_id": "", "resource_name": "", "days": 0.0, "cost": 0.0})
+        resource_name_map = self.get_boond_resource_name_map()
+
         for row in rows:
             attrs = row.get("attributes", {}) or {}
+            rel = row.get("relationships", {}) or {}
             duration = clean_number(attrs.get("duration"))
             if duration <= 0:
                 continue
@@ -1354,6 +1400,27 @@ class BoondService:
             if re.match(r"^\d{4}-\d{2}$", month):
                 by_month_map[month]["days"] += duration
 
+            # Détail secondaire par ressource (jours + coût ligne)
+            times_report_id = clean_text((((rel.get("timesReport") or {}).get("data") or {}).get("id")))
+            if not times_report_id:
+                continue
+            try:
+                line_info = self.resolve_line_cost_from_positioning(
+                    times_report_id=times_report_id,
+                    work_date=start_date,
+                    duration=duration,
+                    force_refresh=False,
+                )
+            except Exception:
+                line_info = {}
+            resource_id = clean_text(line_info.get("resource_id"))
+            if resource_id:
+                by_resource[resource_id]["resource_id"] = resource_id
+                by_resource[resource_id]["resource_name"] = resource_name_map.get(resource_id) or resource_id
+                by_resource[resource_id]["days"] += duration
+                line_cost = clean_number(line_info.get("line_cost"))
+                if line_cost > 0:
+                    by_resource[resource_id]["cost"] += line_cost
         # Coût global: source de vérité BOOND /projects/{id}/productivity
         productivity_payload = {}
         productivity_totals = {
@@ -1408,6 +1475,15 @@ class BoondService:
                 "rows": round(clean_number(productivity_totals.get("rows")), 2) if clean_number(productivity_totals.get("rows")) != 0 else None,
             },
             "by_month": by_month,
+            "resources_imputation": [
+                {
+                    "resource_id": v.get("resource_id"),
+                    "resource_name": v.get("resource_name"),
+                    "days": round(clean_number(v.get("days")), 2),
+                    "cost": round(clean_number(v.get("cost")), 2) if clean_number(v.get("cost")) > 0 else None,
+                }
+                for _rid, v in sorted(by_resource.items(), key=lambda kv: (-clean_number((kv[1] or {}).get("days")), clean_text((kv[1] or {}).get("resource_name"))))
+            ],
             "meta": {**(index.get("meta", {}) or {}), "project_workplaces_rows": len(rows)},
             "match_debug": self._last_match_debug,
             "message": message,
@@ -3940,9 +4016,9 @@ def finance_html() -> str:
 .btn{height:48px;border:none;border-radius:14px;padding:0 16px;font-weight:700;cursor:pointer}.btn.primary{background:var(--blue);color:#fff}.btn.dark{background:#ef8d00;color:#fff;box-shadow:inset 0 -2px 0 rgba(0,0,0,.08)}
 .badge{display:inline-flex;align-items:center;gap:8px;padding:10px 12px;border-radius:999px;background:var(--panel2);color:var(--muted);font-size:13px;font-weight:700}.dot{width:10px;height:10px;border-radius:50%}.dot.ready{background:var(--green)}.dot.building{background:var(--amber)}.dot.error{background:var(--red)}.dot.idle{background:#9aa6b8}
 .hero{margin-top:18px;padding:26px 28px}.hero-top{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap}.hero h2{margin:8px 0 4px;font-size:42px;line-height:1.02}.eyebrow{font-size:12px;font-weight:800;color:var(--blue);letter-spacing:.14em;text-transform:uppercase}
-.meta-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin-top:18px}.meta-pill{background:var(--panel2);border:1px solid var(--line);border-radius:18px;padding:14px 16px}.meta-pill .label{font-size:12px;color:var(--muted);text-transform:uppercase;font-weight:800;letter-spacing:.08em}.meta-pill .value{margin-top:6px;font-size:16px;font-weight:700}
+.meta-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:18px}.meta-pill{background:var(--panel2);border:1px solid var(--line);border-radius:18px;padding:14px 16px}.meta-pill .label{font-size:12px;color:var(--muted);text-transform:uppercase;font-weight:800;letter-spacing:.08em}.meta-pill .value{margin-top:6px;font-size:16px;font-weight:700}
 .health{padding:10px 14px;border-radius:999px;font-size:13px;font-weight:800}.health.ok{background:#eaf8f0;color:var(--green)}.health.warn{background:#fff6e6;color:var(--amber)}.health.bad{background:#fff0f0;color:var(--red)}
-.kpis{margin-top:18px;padding:16px}.kpi-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:14px}.kpi{background:linear-gradient(180deg,#fff,#f8faff);border:1px solid var(--line);border-radius:20px;padding:18px;min-height:132px}.kpi .label{font-size:13px;color:var(--muted);font-weight:800;text-transform:uppercase;letter-spacing:.06em}.kpi .value{margin-top:10px;font-size:34px;font-weight:800;line-height:1}.kpi .sub{margin-top:10px;font-size:13px;color:var(--muted)}
+.kpis{margin-top:18px;padding:16px}.kpi-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.kpi{background:linear-gradient(180deg,#fff,#f8faff);border:1px solid var(--line);border-radius:20px;padding:18px;min-height:132px}.kpi .label{font-size:13px;color:var(--muted);font-weight:800;text-transform:uppercase;letter-spacing:.06em}.kpi .value{margin-top:10px;font-size:34px;font-weight:800;line-height:1}.kpi .sub{margin-top:10px;font-size:13px;color:var(--muted)}
 .kpi.good{background:linear-gradient(180deg,#ffffff,#ebf9f1);border-color:#8fd5b0}.kpi.warn{background:linear-gradient(180deg,#ffffff,#fff4e1);border-color:#f1c171}.kpi.bad{background:linear-gradient(180deg,#ffffff,#ffe9e9);border-color:#ee9a9a}.prod-pilot{margin-top:14px;border:1px solid #d7e1ef;border-radius:18px;padding:16px;background:linear-gradient(180deg,#ffffff,#f7faff)}.prod-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.prod-card{border:1px solid #dbe4f2;border-radius:14px;padding:14px;background:#fff}.prod-card .t{font-size:12px;color:#5f6f88;font-weight:800;text-transform:uppercase;letter-spacing:.06em}.prod-card .v{margin-top:8px;font-size:30px;font-weight:900}.prod-card .s{margin-top:6px;font-size:13px;color:#6e7a90}.prod-card.future{background:linear-gradient(180deg,#fff,#f3f7ff)}
 .layout{display:grid;grid-template-columns:1fr;gap:18px;margin-top:18px}.section{padding:18px 18px 22px}.section h3{margin:0 0 14px;font-size:24px}
 .chart-card{min-height:560px}.chart-wrap{height:340px;border-radius:18px;background:linear-gradient(180deg,#fbfcff 0%,#f4f7fd 100%);border:1px solid #d5deec;padding:16px}.cum-wrap{margin-top:14px;padding:16px;border:1px solid #d5deec;border-radius:16px;background:linear-gradient(180deg,#ffffff 0%,#f8fbff 100%)}.cum-title{margin:0 0 10px;font-size:16px;font-weight:900}.cum-row{display:grid;grid-template-columns:200px 1fr 130px;gap:12px;align-items:center;margin:10px 0}.cum-track{height:12px;background:#e7edf7;border-radius:999px;overflow:hidden}.cum-fill{height:100%}.cum-pre{background:#a6bbe6}.cum-fac{background:#ef8d00}
@@ -4056,7 +4132,7 @@ function renderCumulativeChart(){const root=document.getElementById('cumulativeC
 function renderMonthlyTable(){const root=document.getElementById('monthlyTableWrap');const a=state.selectedAffaire;if(!a){root.innerHTML=`<div class='empty'>Sélectionnez une affaire pour afficher le détail mensuel.</div>`;return;}const ordered=[...MONTHS];const showAll=(state.monthlyExpanded===true);const visible=showAll?ordered:ordered.slice(0,6);let rows='';visible.forEach(m=>{const pre=Number((((a.mensuel||{})[m]||{}).previsionnel)||0),fac=Number((((a.mensuel||{})[m]||{}).facture)||0),ec=fac-pre;rows+=`<tr><td>${MONTH_LABELS[m]}</td><td class='num'>${euro(pre)}</td><td class='num'>${euro(fac)}</td><td class='num delta ${ec>=0?'pos':'neg'}'>${euro(ec)}</td></tr>`;});rows+=`<tr><td><strong>Total</strong></td><td class='num'><strong>${euro(a.total_previsionnel||0)}</strong></td><td class='num'><strong>${euro(a.total_facture||0)}</strong></td><td class='num delta ${Number(a.ecart_previsionnel_vs_facture||0)>=0?'pos':'neg'}'><strong>${euro(a.ecart_previsionnel_vs_facture||0)}</strong></td></tr>`;const btn=ordered.length>6?`<div style='padding:8px'><button id='btnToggleMonths' class='btn' type='button'>${showAll?'Voir moins':"Voir toute l'année"}</button></div>`:'';root.innerHTML=`<table><thead><tr><th>Mois</th><th class='num'>Prévisionnel</th><th class='num'>Facturé</th><th class='num'>Écart</th></tr></thead><tbody>${rows}</tbody></table>${btn}`;const t=document.getElementById('btnToggleMonths');if(t)t.addEventListener('click',()=>{state.monthlyExpanded=!state.monthlyExpanded;renderMonthlyTable();});}
 function renderMissions(){const root=document.getElementById('missionsTableWrap');const meta=document.getElementById('missionsMeta');if(!root||!meta)return;const a=state.selectedAffaire;if(!a){meta.textContent='0 mission';root.innerHTML=`<div class='empty'>Sélectionnez une affaire pour afficher les missions.</div>`;return;}const missions=a.missions||[];meta.textContent=`${missions.length} mission(s)`;if(!missions.length){root.innerHTML=`<div class='empty'>Aucune mission détaillée sur cette affaire.</div>`;return;}root.innerHTML=`<table><thead><tr><th>Tag</th><th>Mission</th><th>N°</th><th class='num'>Commande</th><th class='num'>🧾 Facturation totale</th><th class='num'>Reste</th><th class='num'>Prévisionnel</th><th class='num'>Facturé</th></tr></thead><tbody>${missions.map(m=>`<tr><td>${esc(m.tag||'')}</td><td>${esc(m.label||'')}</td><td>${esc(m.numero||'')}</td><td class='num'>${euro(m.commande_ht)}</td><td class='num'>${euro(m.facturation_totale||((m.anteriorite||0)+(m.facture_2026||m.facturation_cumulee_2026||0)))}</td><td class='num'>${euro(m.reste_a_facturer)}</td><td class='num'>${euro(m.total_previsionnel)}</td><td class='num'>${euro(m.total_facture)}</td></tr>`).join('')}</tbody></table>`;}
 function renderInsights(){const root=document.getElementById('insightsBox');const a=state.selectedAffaire;if(!a){root.innerHTML=`<div class='empty' style='width:100%'>Sélectionnez une affaire.</div>`;return;}const items=a.insights||[];root.innerHTML=items.map(x=>`<div class='insight'>${esc(x)}</div>`).join('');}
-function renderBoondImputation(){const root=document.getElementById('boondImputationBox');if(!root)return;const b=state.boondImputation;const a=state.selectedAffaire;if(!a){root.className='empty';root.textContent='Sélectionnez une affaire pour charger le coût cumulé BOOND.';return;}if(!b){root.className='empty';root.textContent='Chargement des données BOOND…';return;}if(!b.matched_project){root.className='empty';root.textContent='Aucun projet BOOND matché pour cette affaire.';return;}const t=b.totals||{};const cost=(t.total_cost==null)?'-':euro(t.total_cost);const rate=(t.average_daily_rate==null)?'-':`${fmt(t.average_daily_rate)} €/j`;const margin=(t.margin_production_ht==null)?'-':euro(t.margin_production_ht);const prof=(t.profitability_production==null)?'-':`${fmt(t.profitability_production)}%`;root.className='table-wrap';root.innerHTML=`<table><thead><tr><th>Source</th><th class='num'>Coût cumulé</th><th class='num'>Rentabilité</th></tr></thead><tbody><tr><td>${esc(t.cost_source||'projects_productivity')}</td><td class='num'><strong>${cost}</strong></td><td class='num'>${prof}</td></tr></tbody></table><div style='padding:10px 12px' class='small'>Coût global issu de la productivité projet BOOND.</div>`;}
+function renderBoondImputation(){const root=document.getElementById('boondImputationBox');if(!root)return;const b=state.boondImputation;const a=state.selectedAffaire;if(!a){root.className='empty';root.textContent='Sélectionnez une affaire pour charger le coût cumulé BOOND.';return;}if(!b){root.className='empty';root.textContent='Chargement des données BOOND…';return;}if(!b.matched_project){root.className='empty';root.textContent='Aucun projet BOOND matché pour cette affaire.';return;}const t=b.totals||{};const cost=(t.total_cost==null)?'-':euro(t.total_cost);const margin=(t.margin_production_ht==null)?'-':euro(t.margin_production_ht);const prof=(t.profitability_production==null)?'-':`${fmt(t.profitability_production)}%`;const resources=(b.resources_imputation||[]);const detail=resources.length?`<table style='margin-top:10px'><thead><tr><th>Ressource</th><th class='num'>Jours</th><th class='num'>Coût imputé</th></tr></thead><tbody>${resources.map(r=>`<tr><td>${esc(r.resource_name||r.resource_id||'-')}</td><td class='num'>${fmt(r.days)}</td><td class='num'>${r.cost==null?'-':euro(r.cost)}</td></tr>`).join('')}</tbody></table>`:`<div style='padding:8px 12px' class='small'>Détail ressource indisponible.</div>`;root.className='table-wrap';root.innerHTML=`<table><thead><tr><th>Source</th><th class='num'>Coût cumulé</th><th class='num'>Marge</th><th class='num'>Rentabilité</th></tr></thead><tbody><tr><td>${esc(t.cost_source||'projects_productivity')}</td><td class='num'><strong>${cost}</strong></td><td class='num'>${margin}</td><td class='num'>${prof}</td></tr></tbody></table><div style='padding:10px 12px' class='small'>Coût global issu de la productivité projet BOOND.</div>${detail}`;}
 function renderAll(){renderHero();renderKpis();renderProductionPilot();renderFinanceChart();renderCumulativeChart();renderMonthlyTable();renderMissions();renderInsights();renderBoondImputation();document.getElementById('exportBtn').disabled=!state.selectedAffaireId;const dash=document.getElementById('dashboardBtn');dash.href=state.selectedAffaireId?`/dashboard?affaire_id=${encodeURIComponent(state.selectedAffaireId)}`:'/dashboard';const pm=document.getElementById('pmBtn');pm.href=state.selectedAffaireId?`/gestion-projet?affaire_id=${encodeURIComponent(state.selectedAffaireId)}`:'/gestion-projet';}
 async function rebuildCache(){clearError();showNotice('Reconstruction du cache en cours…');await api('/api/finance/rebuild-cache',{method:'POST'});await loadCacheStatus();await loadAffairesList(document.getElementById('searchInput').value||'');if(state.selectedAffaireId&&state.affaires.some(x=>x.affaire_id===state.selectedAffaireId)){await loadSelectedAffaire(state.selectedAffaireId);}else{state.selectedAffaireId='';state.selectedAffaire=null;renderAll();}showNotice('Cache reconstruit avec succès.');}
 async function initFinancePage(){clearError();try{await loadCacheStatus();await loadAffairesList('');const params=new URLSearchParams(window.location.search);const affairFromUrl=params.get('affaire_id');const affairFromStorage=localStorage.getItem('selectedAffaireId')||'';const preselected=affairFromUrl||affairFromStorage;if(preselected&&state.affaires.some(x=>x.affaire_id===preselected)){document.getElementById('affaireSelect').value=preselected;await loadSelectedAffaire(preselected);}else{renderAll();}}catch(err){showError(err.message||'Erreur de chargement');}
