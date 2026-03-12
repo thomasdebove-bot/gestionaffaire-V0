@@ -752,7 +752,8 @@ class BoondService:
                     }
                     return result
 
-        candidates: List[Dict[str, Any]] = []
+        strict_candidates: List[Dict[str, Any]] = []
+        loose_candidates: List[Dict[str, Any]] = []
         for p in boond_projects:
             pref = clean_text(p.get("project_reference"))
             ref_tokens = set(self.normalize_match_text(pref).split())
@@ -762,36 +763,45 @@ class BoondService:
             if score < 35:
                 continue
 
-            if discriminant_tokens and not discriminant_hits:
-                # Évite les faux positifs où seul le nom client match (ex: EIFFAGE-XXX).
-                continue
-
             has_conflict = ("client_conflict" in reasons) or ("client_conflict_single_site" in reasons)
             if has_conflict and score < 80:
                 continue
 
+            local_reasons = list(reasons)
             if discriminant_hits:
-                reasons = [*reasons, f"discriminant_hits:{','.join(sorted(discriminant_hits))}"]
+                local_reasons.append(f"discriminant_hits:{','.join(sorted(discriminant_hits))}")
 
-            candidates.append({
+            entry = {
                 "project_id": clean_text(p.get("project_id")),
                 "project_reference": pref,
                 "match_score": int(score),
-                "matched_on": reasons[0] if reasons else "scored",
-                "match_reasons": reasons,
+                "matched_on": local_reasons[0] if local_reasons else "scored",
+                "match_reasons": local_reasons,
                 "match_warning": "client_conflict" if has_conflict else None,
                 "metronome_context": context,
-            })
+            }
 
-        candidates.sort(key=lambda c: (-int(c.get("match_score", 0)), clean_text(c.get("project_reference"))))
+            loose_candidates.append(entry)
+            if (not discriminant_tokens) or discriminant_hits:
+                strict_candidates.append(entry)
+
+        strict_candidates.sort(key=lambda c: (-int(c.get("match_score", 0)), clean_text(c.get("project_reference"))))
+        loose_candidates.sort(key=lambda c: (-int(c.get("match_score", 0)), clean_text(c.get("project_reference"))))
+
+        chosen_pool = strict_candidates if strict_candidates else loose_candidates
         self._last_match_debug = {
             "input_project_name": project_name,
             "metronome_context": context,
-            "top_candidates": candidates[:5],
+            "matching_mode": "strict" if strict_candidates else "fallback_loose",
+            "top_candidates": chosen_pool[:5],
         }
 
-        if candidates and int(candidates[0].get("match_score", 0)) >= 55:
-            return candidates[0]
+        if chosen_pool and int(chosen_pool[0].get("match_score", 0)) >= 55:
+            best = dict(chosen_pool[0])
+            if not strict_candidates:
+                best["match_warning"] = best.get("match_warning") or "fallback_loose"
+                best["match_reasons"] = [*(best.get("match_reasons") or []), "fallback_loose_no_discriminant"]
+            return best
         return None
 
     @staticmethod
@@ -1446,11 +1456,16 @@ class BoondService:
         forced_project_id = clean_text(boond_project_id)
         matched = None
         if forced_project_id:
+            forced_norm = self.normalize_match_text(forced_project_id)
             for p in boond_projects_for_match:
-                if clean_text(p.get("project_id")) == forced_project_id:
+                pid = clean_text(p.get("project_id"))
+                pref = clean_text(p.get("project_reference"))
+                pref_norm = self.normalize_match_text(pref)
+                # Tolère un forçage par ID technique ou par référence lisible.
+                if pid == forced_project_id or forced_norm == pref_norm or (forced_norm and forced_norm in pref_norm):
                     matched = {
-                        "project_id": forced_project_id,
-                        "project_reference": clean_text(p.get("project_reference")),
+                        "project_id": pid,
+                        "project_reference": pref,
                         "match_score": 100,
                         "matched_on": "forced_project_id",
                         "match_reasons": ["forced_project_id"],
