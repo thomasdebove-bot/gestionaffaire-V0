@@ -1145,6 +1145,73 @@ class BoondService:
         }
 
 
+    @staticmethod
+    def _build_productivity_resource_index(payload: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
+        resource_index: Dict[str, Dict[str, str]] = {}
+        included = payload.get("included") or []
+        if not isinstance(included, list):
+            return resource_index
+
+        for item in included:
+            if clean_text((item or {}).get("type")) != "resource":
+                continue
+            rid = clean_text((item or {}).get("id"))
+            if not rid:
+                continue
+            attrs = (item or {}).get("attributes") or {}
+            first_name = clean_text(attrs.get("firstName"))
+            last_name = clean_text(attrs.get("lastName")).upper()
+            display_name = clean_text(f"{last_name} {first_name}".strip())
+            resource_index[rid] = {
+                "id": rid,
+                "first_name": first_name,
+                "last_name": last_name,
+                "display_name": display_name or f"RESOURCE {rid}",
+            }
+        return resource_index
+
+    def build_productivity_resource_table(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        resource_index = self._build_productivity_resource_index(payload)
+        resource_totals: Dict[str, Dict[str, Any]] = defaultdict(
+            lambda: {"resource_id": "", "days": 0.0, "expenses": 0.0, "cost_ht": 0.0, "turnover_ht": 0.0}
+        )
+
+        data_items = payload.get("data") or []
+        if isinstance(data_items, dict):
+            data_items = [data_items]
+
+        for item in data_items:
+            if clean_text((item or {}).get("type")) != "delivery":
+                continue
+            attrs = (item or {}).get("attributes") or {}
+            rel = (item or {}).get("relationships") or {}
+            resource_id = clean_text((((rel.get("dependsOn") or {}).get("data") or {}).get("id")))
+            if not resource_id:
+                continue
+
+            row = resource_totals[resource_id]
+            row["resource_id"] = resource_id
+            row["days"] += clean_number(attrs.get("regularTimesProduction"))
+            row["expenses"] += clean_number(attrs.get("expensesProduction"))
+            row["cost_ht"] += clean_number(attrs.get("costsProductionExcludingTax"))
+            row["turnover_ht"] += clean_number(attrs.get("turnoverProductionExcludingTax"))
+
+        out: List[Dict[str, Any]] = []
+        for resource_id, totals in resource_totals.items():
+            info = resource_index.get(resource_id) or {}
+            out.append({
+                "resource_id": resource_id,
+                "resource_name": clean_text(info.get("display_name")) or f"RESOURCE {resource_id}",
+                "days": round(clean_number(totals.get("days")), 2),
+                "expenses": round(clean_number(totals.get("expenses")), 2),
+                "turnover_ht": round(clean_number(totals.get("turnover_ht")), 2),
+                "cost_ht": round(clean_number(totals.get("cost_ht")), 2),
+            })
+
+        out.sort(key=lambda r: (-clean_number(r.get("days")), clean_text(r.get("resource_name"))))
+        return out
+
+
     def compute_project_cumulative_cost_from_existing_engine(self, project_id: str, end_term: str, force_refresh: bool = False) -> Dict[str, Any]:
         cached = None if force_refresh else self.get_cached_project_cumulative_cost(project_id, end_term)
         if cached is not None:
@@ -1335,6 +1402,7 @@ class BoondService:
         self.set_api_cache(cache_key, result, ttl_seconds=1800)
         return result
 
+
     def get_project_imputation_summary(self, project_name: str, refresh: bool = False) -> Dict[str, Any]:
         index = self.build_boond_imputation_index(refresh=refresh)
 
@@ -1372,59 +1440,7 @@ class BoondService:
             }
 
         project_id = clean_text(matched.get("project_id"))
-        rows = self.get_project_workplaces_times(project_id)
 
-        # Jours imputés: source validée workplaces-times
-        total_days = 0.0
-        by_month_map: Dict[str, Dict[str, float]] = defaultdict(lambda: {"days": 0.0, "cost": 0.0})
-        by_resource: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"resource_id": "", "resource_name": "", "days": 0.0, "cost": 0.0})
-        resource_name_map = self.get_boond_resource_name_map()
-
-        for row in rows:
-            attrs = row.get("attributes", {}) or {}
-            rel = row.get("relationships", {}) or {}
-            duration = clean_number(attrs.get("duration"))
-            if duration <= 0:
-                continue
-            start_date = clean_text(attrs.get("startDate"))
-            month = start_date[:7]
-            total_days += duration
-            if re.match(r"^\d{4}-\d{2}$", month):
-                by_month_map[month]["days"] += duration
-
-            # Détail secondaire par ressource (jours + coût ligne)
-            resource_id = self._extract_resource_id_from_workplace_time(row)
-            resource_name = self._extract_resource_name_from_workplace_row(row)
-            if resource_id:
-                by_resource[resource_id]["resource_id"] = resource_id
-                by_resource[resource_id]["resource_name"] = (
-                    resource_name
-                    or resource_name_map.get(resource_id)
-                    or resource_id
-                )
-                by_resource[resource_id]["days"] += duration
-
-            times_report_id = clean_text((((rel.get("timesReport") or {}).get("data") or {}).get("id")))
-            if not times_report_id:
-                continue
-            try:
-                line_info = self.resolve_line_cost_from_positioning(
-                    times_report_id=times_report_id,
-                    work_date=start_date,
-                    duration=duration,
-                    force_refresh=False,
-                )
-            except Exception:
-                line_info = {}
-            line_resource_id = clean_text(line_info.get("resource_id"))
-            if line_resource_id:
-                by_resource[line_resource_id]["resource_id"] = line_resource_id
-                if not by_resource[line_resource_id].get("resource_name"):
-                    by_resource[line_resource_id]["resource_name"] = resource_name_map.get(line_resource_id) or line_resource_id
-                line_cost = clean_number(line_info.get("line_cost"))
-                if line_cost > 0:
-                    by_resource[line_resource_id]["cost"] += line_cost
-        # Coût global: source de vérité BOOND /projects/{id}/productivity
         productivity_payload = {}
         productivity_totals = {
             "cost_production_ht": 0.0,
@@ -1434,12 +1450,15 @@ class BoondService:
             "turnover_production_ht": 0.0,
             "rows": 0.0,
         }
+        resources_table: List[Dict[str, Any]] = []
         try:
             productivity_payload = self.get_project_productivity(project_id, force_refresh=bool(refresh))
             productivity_totals = self.extract_project_productivity_totals(productivity_payload)
+            resources_table = self.build_productivity_resource_table(productivity_payload)
         except Exception:
             pass
 
+        total_days = sum(clean_number(r.get("days")) for r in resources_table)
         total_cost_val = clean_number(productivity_totals.get("cost_production_ht"))
         total_cost_out = round(total_cost_val, 2) if total_cost_val > 0 else None
         average_daily_rate = (total_cost_val / total_days) if total_days > 0 and total_cost_val > 0 else None
@@ -1452,16 +1471,6 @@ class BoondService:
             cost_status = "missing"
             cost_source = "none"
             message = "Coût global BOOND indisponible sur la productivité projet"
-
-        by_month = [
-            {
-                "month": month,
-                "days": round(vals["days"], 2),
-                # Pas de source mensuelle fiable sur /projects/{id}/productivity
-                "cost": None,
-            }
-            for month, vals in sorted(by_month_map.items())
-        ]
 
         return {
             "input_project_name": project_name,
@@ -1477,17 +1486,20 @@ class BoondService:
                 "turnover_production_ht": round(clean_number(productivity_totals.get("turnover_production_ht")), 2) if clean_number(productivity_totals.get("turnover_production_ht")) != 0 else None,
                 "rows": round(clean_number(productivity_totals.get("rows")), 2) if clean_number(productivity_totals.get("rows")) != 0 else None,
             },
-            "by_month": by_month,
+            "by_month": [],
             "resources_imputation": [
                 {
-                    "resource_id": v.get("resource_id"),
-                    "resource_name": v.get("resource_name"),
-                    "days": round(clean_number(v.get("days")), 2),
-                    "cost": round(clean_number(v.get("cost")), 2) if clean_number(v.get("cost")) > 0 else None,
+                    "resource_id": r.get("resource_id"),
+                    "resource_name": r.get("resource_name"),
+                    "days": r.get("days"),
+                    "expenses": r.get("expenses"),
+                    "turnover_ht": r.get("turnover_ht"),
+                    "cost": r.get("cost_ht"),
+                    "cost_ht": r.get("cost_ht"),
                 }
-                for _rid, v in sorted(by_resource.items(), key=lambda kv: (-clean_number((kv[1] or {}).get("days")), clean_text((kv[1] or {}).get("resource_name"))))
+                for r in resources_table
             ],
-            "meta": {**(index.get("meta", {}) or {}), "project_workplaces_rows": len(rows)},
+            "meta": {**(index.get("meta", {}) or {}), "productivity_delivery_rows": len((productivity_payload.get("data") or [])) if isinstance((productivity_payload.get("data") or []), list) else 0},
             "match_debug": self._last_match_debug,
             "message": message,
         }
@@ -3709,6 +3721,13 @@ def api_boond_debug_project_productivity(project_id: str, refresh: bool = False)
         "totals": totals,
         "raw": payload,
     }
+
+
+@app.get("/api/boond/debug/project-resource-table/{project_id}", response_class=JSONResponse)
+def api_boond_debug_project_resource_table(project_id: str, refresh: bool = False):
+    payload = boond_service.get_project_productivity(project_id, force_refresh=bool(refresh))
+    rows = boond_service.build_productivity_resource_table(payload)
+    return rows
 
 
 @app.get("/api/boond/debug/project-cost-path", response_class=JSONResponse)
