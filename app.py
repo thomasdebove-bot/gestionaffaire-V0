@@ -1084,6 +1084,32 @@ class BoondService:
         cache_key = f"boond:project:cumulative_cost:{project_id}:{end_term}"
         self.set_api_cache(cache_key, payload, ttl_seconds=ttl_seconds)
 
+    def get_cached_project_productivity(self, project_id: str):
+        return self.get_api_cache(f"boond:project:productivity:{project_id}")
+
+    def set_cached_project_productivity(self, project_id: str, payload: dict, ttl_seconds: int = 3600):
+        self.set_api_cache(f"boond:project:productivity:{project_id}", payload, ttl_seconds=ttl_seconds)
+
+    def get_project_productivity(self, project_id: str, force_refresh: bool = False) -> Dict[str, Any]:
+        cached = None if force_refresh else self.get_cached_project_productivity(project_id)
+        if cached is not None:
+            return cached
+        payload = self.boond_get(f"/projects/{project_id}/productivity")
+        self.set_cached_project_productivity(project_id, payload, ttl_seconds=3600)
+        return payload
+
+    @staticmethod
+    def extract_project_productivity_totals(payload: Dict[str, Any]) -> Dict[str, Any]:
+        meta = payload.get("meta") or {}
+        totals = meta.get("totals") or {}
+        return {
+            "cost_production_ht": clean_number(totals.get("costsProductionExcludingTax")),
+            "cost_resources_ht": clean_number(totals.get("costsResourcesExcludingTax")),
+            "margin_production_ht": clean_number(totals.get("marginProductionExcludingTax")),
+            "profitability_production": clean_number(totals.get("profitabilityProduction")),
+            "turnover_production_ht": clean_number(totals.get("turnoverProductionExcludingTax")),
+        }
+
 
     def compute_project_cumulative_cost_from_existing_engine(self, project_id: str, end_term: str, force_refresh: bool = False) -> Dict[str, Any]:
         cached = None if force_refresh else self.get_cached_project_cumulative_cost(project_id, end_term)
@@ -1277,7 +1303,6 @@ class BoondService:
 
     def get_project_imputation_summary(self, project_name: str, refresh: bool = False) -> Dict[str, Any]:
         index = self.build_boond_imputation_index(refresh=refresh)
-        projects = index.get("projects") or []
 
         # Matching sur l'ensemble des projets BOOND paginés, pas uniquement sur l'index d'imputation.
         catalog = self.get_all_boond_projects()
@@ -1297,12 +1322,13 @@ class BoondService:
                 "matched_project": None,
                 "totals": {
                     "total_days": 0.0,
-                    "rated_days": 0.0,
-                    "unrated_days": 0.0,
-                    "cost_coverage_ratio": 0.0,
                     "average_daily_rate": None,
                     "total_cost": None,
-                    "cost_status": "missing_rate",
+                    "cost_status": "missing",
+                    "cost_source": "none",
+                    "margin_production_ht": None,
+                    "profitability_production": None,
+                    "turnover_production_ht": None,
                 },
                 "by_month": [],
                 "meta": index.get("meta", {}),
@@ -1313,84 +1339,70 @@ class BoondService:
         project_id = clean_text(matched.get("project_id"))
         rows = self.get_project_workplaces_times(project_id)
 
+        # Jours imputés: source validée workplaces-times
         total_days = 0.0
-        total_cost = 0.0
-        rated_days = 0.0
-        unrated_days = 0.0
         by_month_map: Dict[str, Dict[str, float]] = defaultdict(lambda: {"days": 0.0, "cost": 0.0})
-
         for row in rows:
             attrs = row.get("attributes", {}) or {}
-            rel = row.get("relationships", {}) or {}
             duration = clean_number(attrs.get("duration"))
             if duration <= 0:
                 continue
-
             start_date = clean_text(attrs.get("startDate"))
             month = start_date[:7]
             total_days += duration
             if re.match(r"^\d{4}-\d{2}$", month):
                 by_month_map[month]["days"] += duration
 
-            times_report_id = clean_text((((rel.get("timesReport") or {}).get("data") or {}).get("id")))
-            if not times_report_id:
-                unrated_days += duration
-                continue
+        # Coût global: source de vérité BOOND /projects/{id}/productivity
+        productivity_payload = {}
+        productivity_totals = {
+            "cost_production_ht": 0.0,
+            "cost_resources_ht": 0.0,
+            "margin_production_ht": 0.0,
+            "profitability_production": 0.0,
+            "turnover_production_ht": 0.0,
+        }
+        try:
+            productivity_payload = self.get_project_productivity(project_id, force_refresh=bool(refresh))
+            productivity_totals = self.extract_project_productivity_totals(productivity_payload)
+        except Exception:
+            pass
 
-            cost_info = self.resolve_line_cost_from_positioning(
-                times_report_id=times_report_id,
-                work_date=start_date,
-                duration=duration,
-                force_refresh=bool(refresh),
-            )
-            line_cost = clean_number(cost_info.get("line_cost"))
+        total_cost_val = clean_number(productivity_totals.get("cost_production_ht"))
+        total_cost_out = round(total_cost_val, 2) if total_cost_val > 0 else None
+        average_daily_rate = (total_cost_val / total_days) if total_days > 0 and total_cost_val > 0 else None
 
-            if line_cost > 0:
-                total_cost += line_cost
-                rated_days += duration
-                if re.match(r"^\d{4}-\d{2}$", month):
-                    by_month_map[month]["cost"] += line_cost
-            else:
-                unrated_days += duration
-
-        cost_coverage_ratio = (rated_days / total_days) if total_days > 0 else 0.0
-        average_daily_rate = (total_cost / rated_days) if rated_days > 0 else None
-        if rated_days == total_days and total_cost > 0:
-            cost_status = "ok"
-            total_cost_out = round(total_cost, 2)
-        elif rated_days > 0 and unrated_days > 0:
-            cost_status = "partial"
-            total_cost_out = round(total_cost, 2)
+        if total_cost_val > 0:
+            cost_status = "boond_productivity"
+            cost_source = "projects_productivity"
+            message = "Coût global issu de la productivité projet BOOND"
         else:
-            cost_status = "missing_rate"
-            total_cost_out = None
+            cost_status = "missing"
+            cost_source = "none"
+            message = "Coût global BOOND indisponible sur la productivité projet"
 
         by_month = [
             {
                 "month": month,
                 "days": round(vals["days"], 2),
-                "cost": round(vals["cost"], 2) if vals["cost"] > 0 else None,
+                # Pas de source mensuelle fiable sur /projects/{id}/productivity
+                "cost": None,
             }
             for month, vals in sorted(by_month_map.items())
         ]
-
-        message = "OK"
-        if cost_status == "missing_rate":
-            message = "Coût indisponible: aucun taux journalier fiable trouvé."
-        elif cost_status == "partial":
-            message = "Coût partiel : certaines imputations n’ont pas trouvé de positioning actif"
 
         return {
             "input_project_name": project_name,
             "matched_project": matched,
             "totals": {
                 "total_days": round(total_days, 2),
-                "rated_days": round(rated_days, 2),
-                "unrated_days": round(unrated_days, 2),
-                "cost_coverage_ratio": round(cost_coverage_ratio, 4),
                 "average_daily_rate": round(average_daily_rate, 2) if average_daily_rate is not None else None,
                 "total_cost": total_cost_out,
                 "cost_status": cost_status,
+                "cost_source": cost_source,
+                "margin_production_ht": round(clean_number(productivity_totals.get("margin_production_ht")), 2) if clean_number(productivity_totals.get("margin_production_ht")) != 0 else None,
+                "profitability_production": round(clean_number(productivity_totals.get("profitability_production")), 2) if clean_number(productivity_totals.get("profitability_production")) != 0 else None,
+                "turnover_production_ht": round(clean_number(productivity_totals.get("turnover_production_ht")), 2) if clean_number(productivity_totals.get("turnover_production_ht")) != 0 else None,
             },
             "by_month": by_month,
             "meta": {**(index.get("meta", {}) or {}), "project_workplaces_rows": len(rows)},
@@ -3429,7 +3441,7 @@ table{width:100%;border-collapse:collapse}th,td{padding:8px;border-bottom:1px so
 <div class='card'><h2>Imputation des temps</h2><div id='state' class='small'>Chargement…</div></div>
 <div id='content' style='display:none'>
 <div class='card'><div class='small'>Projet METRONOME</div><div id='inputName'></div><div class='small' style='margin-top:6px'>Projet BOOND matché</div><div id='matched'></div><div id='matchDetails' class='small' style='margin-top:8px'></div></div>
-<div class='card kpis'><div><div class='small'>Jours imputés cumulés</div><div id='kpiDays' class='value'>-</div></div><div><div class='small'>Coût cumulé</div><div id='kpiCost' class='value'>-</div><div id='costCoverage' class='small'></div></div></div>
+<div class='card kpis'><div><div class='small'>Jours imputés cumulés</div><div id='kpiDays' class='value'>-</div></div><div><div class='small'>Coût cumulé</div><div id='kpiCost' class='value'>-</div><div id='costSubtext' class='small'></div><div id='costMeta' class='small'></div></div></div>
 <div id='warning' class='card warn' style='display:none'></div>
 <div class='card'><h3>Répartition mensuelle</h3><div id='chart'></div><div id='table'></div></div>
 </div></div>
@@ -3449,11 +3461,16 @@ function fmt(v){const n=Number(v||0);return n.toLocaleString('fr-FR',{maximumFra
     document.getElementById('matched').textContent=`${d.matched_project.project_reference} (score ${d.matched_project.match_score})`;const reasons=(d.matched_project.match_reasons||[]);document.getElementById('matchDetails').innerHTML=reasons.length?`Raisons: ${reasons.map(esc).join(', ')}`:'';
     document.getElementById('kpiDays').textContent=fmt(d.totals.total_days);
     document.getElementById('kpiCost').textContent=d.totals.total_cost==null?'Indisponible':fmt(d.totals.total_cost)+' €';
-    const coverage=((d.totals||{}).cost_coverage_ratio||0)*100;document.getElementById('costCoverage').textContent=`Couverture coût: ${fmt(coverage)}%`;
+    document.getElementById('costSubtext').textContent='Coût global issu de la productivité projet BOOND';
+    const meta=[];
+    if(d.totals.average_daily_rate!=null){meta.push(`Taux moyen: ${fmt(d.totals.average_daily_rate)} €/j`);}
+    if(d.totals.margin_production_ht!=null){meta.push(`Marge: ${fmt(d.totals.margin_production_ht)} €`);}
+    if(d.totals.profitability_production!=null){meta.push(`Rentabilité: ${fmt(d.totals.profitability_production)}%`);}
+    document.getElementById('costMeta').textContent=meta.join(' | ');
     const warning=document.getElementById('warning');
-    if(d.totals.cost_status!=='ok'){
+    if(d.totals.cost_status==='missing'){
       warning.style.display='block';
-      warning.textContent=d.message||'Coût indisponible faute de taux journalier.';
+      warning.textContent=d.message||'Coût global BOOND indisponible.';
     }
 
     const rows=d.by_month||[]; const max=Math.max(1,...rows.map(x=>Number(x.days||0)));
@@ -3479,12 +3496,13 @@ def api_boond_imputation_by_project(project_name: str = Query(...), refresh: boo
                 "matched_project": None,
                 "totals": {
                     "total_days": 0.0,
-                    "rated_days": 0.0,
-                    "unrated_days": 0.0,
-                    "cost_coverage_ratio": 0.0,
                     "average_daily_rate": None,
                     "total_cost": None,
-                    "cost_status": "missing_rate",
+                    "cost_status": "missing",
+                    "cost_source": "none",
+                    "margin_production_ht": None,
+                    "profitability_production": None,
+                    "turnover_production_ht": None,
                 },
                 "by_month": [],
                 "meta": {"error": str(exc), "generated_at": now_iso()},
@@ -3598,6 +3616,17 @@ def api_boond_debug_delivery(delivery_id: str):
 def api_boond_debug_times_report(times_report_id: str):
     payload, _ = boond_service.get_times_report_cached(times_report_id, ttl_seconds=300)
     return payload
+
+
+@app.get("/api/boond/debug/project-productivity/{project_id}", response_class=JSONResponse)
+def api_boond_debug_project_productivity(project_id: str, refresh: bool = False):
+    payload = boond_service.get_project_productivity(project_id, force_refresh=bool(refresh))
+    totals = boond_service.extract_project_productivity_totals(payload)
+    return {
+        "project_id": project_id,
+        "totals": totals,
+        "raw": payload,
+    }
 
 
 @app.get("/api/boond/debug/project-cost-path", response_class=JSONResponse)
