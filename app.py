@@ -721,7 +721,13 @@ class BoondService:
             clean_text(context.get("affaire_id")),
         ]
         target_texts = [t for t in target_texts if t]
-        target_keywords = context.get("keywords") or self._keywords_from_values(target_texts)
+        base_keywords = context.get("keywords") or []
+        target_keywords = sorted(set(base_keywords) | set(self._keywords_from_values(target_texts)))
+        normalized_kw_set = {self.normalize_match_text(k) for k in target_keywords if self.normalize_match_text(k)}
+        discriminant_tokens = {
+            tok for tok in normalized_kw_set
+            if tok not in self.SENSITIVE_COMPANY_TOKENS and (tok.isdigit() or len(tok) >= 3)
+        }
 
         mapping = self._load_manual_boond_mapping()
         mapped_ids = mapping.get(clean_text(project_name), [])
@@ -749,12 +755,24 @@ class BoondService:
         candidates: List[Dict[str, Any]] = []
         for p in boond_projects:
             pref = clean_text(p.get("project_reference"))
+            ref_tokens = set(self.normalize_match_text(pref).split())
+            discriminant_hits = discriminant_tokens & ref_tokens
+
             score, reasons = self.score_project_match(target_texts, target_keywords, pref)
             if score < 35:
                 continue
+
+            if discriminant_tokens and not discriminant_hits:
+                # Évite les faux positifs où seul le nom client match (ex: EIFFAGE-XXX).
+                continue
+
             has_conflict = ("client_conflict" in reasons) or ("client_conflict_single_site" in reasons)
             if has_conflict and score < 80:
                 continue
+
+            if discriminant_hits:
+                reasons = [*reasons, f"discriminant_hits:{','.join(sorted(discriminant_hits))}"]
+
             candidates.append({
                 "project_id": clean_text(p.get("project_id")),
                 "project_reference": pref,
