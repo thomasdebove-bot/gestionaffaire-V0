@@ -763,38 +763,30 @@ class BoondService:
             "top_candidates": candidates[:5],
         }
 
-        if candidates and int(candidates[0].get("match_score", 0)) >= 45:
+        if candidates and int(candidates[0].get("match_score", 0)) >= 55:
             return candidates[0]
-
-        # Fallback robuste: si aucun candidat fort, conserver le meilleur score faible
-        # pour éviter les absences de match sur des libellés dégradés.
-        if candidates:
-            best = candidates[0]
-            best["matched_on"] = (best.get("matched_on") or "scored") + ":fallback"
-            return best
-
-        # Dernier recours: overlap de tokens sur la référence brute BOOND.
-        target_tokens = set(self.normalize_match_text(" ".join(target_texts)).split())
-        raw_best = None
-        raw_best_score = -1
-        for p in boond_projects:
-            pref = clean_text(p.get("project_reference"))
-            ref_tokens = set(self.normalize_match_text(pref).split())
-            overlap = len((target_tokens & ref_tokens) - self.SENSITIVE_COMPANY_TOKENS)
-            if overlap > raw_best_score:
-                raw_best_score = overlap
-                raw_best = p
-        if raw_best and raw_best_score >= 1:
-            return {
-                "project_id": clean_text(raw_best.get("project_id")),
-                "project_reference": clean_text(raw_best.get("project_reference")),
-                "match_score": 30,
-                "matched_on": "token_overlap_fallback",
-                "match_reasons": [f"token_overlap:{raw_best_score}"],
-                "match_warning": "low_confidence",
-                "metronome_context": context,
-            }
         return None
+
+    @staticmethod
+    def _extract_resource_name_from_workplace_row(row: Dict[str, Any]) -> str:
+        attrs = row.get("attributes", {}) or {}
+        for key in ["resourceName", "resource_name", "resource", "user", "collaborator"]:
+            raw = attrs.get(key)
+            if isinstance(raw, dict):
+                name = clean_text(raw.get("name") or raw.get("fullName") or raw.get("displayName"))
+            else:
+                name = clean_text(raw)
+            if name and not name.isdigit():
+                return name
+
+        rel = row.get("relationships", {}) or {}
+        for rel_key in ["resource", "user", "collaborator"]:
+            data = (rel.get(rel_key) or {}).get("data") or {}
+            if isinstance(data, dict):
+                name = clean_text(data.get("name") or data.get("fullName") or data.get("displayName"))
+                if name and not name.isdigit():
+                    return name
+        return ""
 
 
     def get_project_workplaces_times(self, project_id: str):
@@ -1401,6 +1393,17 @@ class BoondService:
                 by_month_map[month]["days"] += duration
 
             # Détail secondaire par ressource (jours + coût ligne)
+            resource_id = self._extract_resource_id_from_workplace_time(row)
+            resource_name = self._extract_resource_name_from_workplace_row(row)
+            if resource_id:
+                by_resource[resource_id]["resource_id"] = resource_id
+                by_resource[resource_id]["resource_name"] = (
+                    resource_name
+                    or resource_name_map.get(resource_id)
+                    or resource_id
+                )
+                by_resource[resource_id]["days"] += duration
+
             times_report_id = clean_text((((rel.get("timesReport") or {}).get("data") or {}).get("id")))
             if not times_report_id:
                 continue
@@ -1413,14 +1416,14 @@ class BoondService:
                 )
             except Exception:
                 line_info = {}
-            resource_id = clean_text(line_info.get("resource_id"))
-            if resource_id:
-                by_resource[resource_id]["resource_id"] = resource_id
-                by_resource[resource_id]["resource_name"] = resource_name_map.get(resource_id) or resource_id
-                by_resource[resource_id]["days"] += duration
+            line_resource_id = clean_text(line_info.get("resource_id"))
+            if line_resource_id:
+                by_resource[line_resource_id]["resource_id"] = line_resource_id
+                if not by_resource[line_resource_id].get("resource_name"):
+                    by_resource[line_resource_id]["resource_name"] = resource_name_map.get(line_resource_id) or line_resource_id
                 line_cost = clean_number(line_info.get("line_cost"))
                 if line_cost > 0:
-                    by_resource[resource_id]["cost"] += line_cost
+                    by_resource[line_resource_id]["cost"] += line_cost
         # Coût global: source de vérité BOOND /projects/{id}/productivity
         productivity_payload = {}
         productivity_totals = {
