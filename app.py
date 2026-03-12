@@ -569,7 +569,7 @@ class BoondService:
                     kws.add(tok)
         return sorted(kws)
 
-    def _get_metronome_match_context(self, project_name: str) -> Dict[str, Any]:
+    def _get_metronome_match_context(self, project_name: str, affaire_id: str = "") -> Dict[str, Any]:
         # Réutilise le cache finance METRONOME pour enrichir le matching BOOND.
         finance_service = globals().get("service")
         if finance_service is None:
@@ -581,33 +581,38 @@ class BoondService:
         except Exception:
             items = {}
 
+        preferred_id = clean_text(affaire_id)
         target = self.normalize_match_text(project_name)
         best_score = -1
         best_item: Dict[str, Any] = {}
         best_id = ""
 
-        for affaire_id, item in items.items():
-            display_name = clean_text(item.get("display_name"))
-            affaire = clean_text(item.get("affaire"))
-            numero = clean_text(item.get("numero"))
-            local_id = clean_text(affaire_id)
-            candidates = [display_name, affaire, numero, local_id]
-            score = 0
-            for c in candidates:
-                n = self.normalize_match_text(c)
-                if not n:
-                    continue
-                if n == target:
-                    score = max(score, 100)
-                elif target and (target in n or n in target):
-                    score = max(score, 80)
-                else:
-                    overlap = set(target.split()) & set(n.split())
-                    score = max(score, len(overlap) * 10)
-            if score > best_score:
-                best_score = score
-                best_item = item
-                best_id = local_id
+        if preferred_id and preferred_id in items:
+            best_item = items.get(preferred_id) or {}
+            best_id = preferred_id
+        else:
+            for local_affaire_id, item in items.items():
+                display_name = clean_text(item.get("display_name"))
+                affaire = clean_text(item.get("affaire"))
+                numero = clean_text(item.get("numero"))
+                local_id = clean_text(local_affaire_id)
+                candidates = [display_name, affaire, numero, local_id]
+                score = 0
+                for c in candidates:
+                    n = self.normalize_match_text(c)
+                    if not n:
+                        continue
+                    if n == target:
+                        score = max(score, 100)
+                    elif target and (target in n or n in target):
+                        score = max(score, 80)
+                    else:
+                        overlap = set(target.split()) & set(n.split())
+                        score = max(score, len(overlap) * 10)
+                if score > best_score:
+                    best_score = score
+                    best_item = item
+                    best_id = local_id
 
         context = {
             "affaire_id": clean_text(best_id),
@@ -701,8 +706,8 @@ class BoondService:
         score = max(0, min(100, score))
         return score, reasons
 
-    def find_best_boond_project_match(self, project_name: str, boond_projects: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        context = self._get_metronome_match_context(project_name)
+    def find_best_boond_project_match(self, project_name: str, boond_projects: List[Dict[str, Any]], affaire_id: str = "") -> Optional[Dict[str, Any]]:
+        context = self._get_metronome_match_context(project_name, affaire_id=affaire_id)
         target_texts = [
             project_name,
             clean_text(context.get("display_name")),
@@ -1403,7 +1408,7 @@ class BoondService:
         return result
 
 
-    def get_project_imputation_summary(self, project_name: str, refresh: bool = False) -> Dict[str, Any]:
+    def get_project_imputation_summary(self, project_name: str, refresh: bool = False, affaire_id: str = "") -> Dict[str, Any]:
         index = self.build_boond_imputation_index(refresh=refresh)
 
         # Matching sur l'ensemble des projets BOOND paginés, pas uniquement sur l'index d'imputation.
@@ -1416,7 +1421,7 @@ class BoondService:
                 "project_reference": clean_text(attrs.get("reference") or attrs.get("title") or attrs.get("name")),
             })
 
-        matched = self.find_best_boond_project_match(project_name, boond_projects_for_match)
+        matched = self.find_best_boond_project_match(project_name, boond_projects_for_match, affaire_id=affaire_id)
 
         if not matched:
             return {
@@ -3576,12 +3581,12 @@ function fmt(v){const n=Number(v||0);return n.toLocaleString('fr-FR',{maximumFra
 
 
 @app.get("/api/boond/imputations/by-project", response_class=JSONResponse)
-def api_boond_imputation_by_project(project_name: str = Query(...), refresh: bool = Query(default=False)):
+def api_boond_imputation_by_project(project_name: str = Query(...), refresh: bool = Query(default=False), affaire_id: str = Query(default="")):
     pname = clean_text(project_name)
     if not pname:
         raise HTTPException(status_code=400, detail="project_name obligatoire")
     try:
-        return boond_service.get_project_imputation_summary(project_name=pname, refresh=bool(refresh))
+        return boond_service.get_project_imputation_summary(project_name=pname, refresh=bool(refresh), affaire_id=clean_text(affaire_id))
     except RuntimeError as exc:
         return JSONResponse(
             status_code=200,
@@ -3731,7 +3736,7 @@ def api_boond_debug_project_resource_table(project_id: str, refresh: bool = Fals
 
 
 @app.get("/api/boond/debug/project-cost-path", response_class=JSONResponse)
-def api_boond_debug_project_cost_path(project_name: str):
+def api_boond_debug_project_cost_path(project_name: str, affaire_id: str = ""):
     catalog = boond_service.get_all_boond_projects()
     boond_projects_for_match: List[Dict[str, Any]] = []
     for item in catalog:
@@ -3741,7 +3746,7 @@ def api_boond_debug_project_cost_path(project_name: str):
             "project_reference": clean_text(attrs.get("reference") or attrs.get("title") or attrs.get("name")),
         })
 
-    matched = boond_service.find_best_boond_project_match(project_name, boond_projects_for_match)
+    matched = boond_service.find_best_boond_project_match(project_name, boond_projects_for_match, affaire_id=clean_text(affaire_id))
     if not matched:
         return {
             "input_project_name": project_name,
@@ -3949,7 +3954,7 @@ def api_boond_debug_project_cumulative_cost(project_id: str, term: str):
 
 @app.get("/api/boond/debug/project-cost-summary", response_class=JSONResponse)
 def api_boond_debug_project_cost_summary(project_name: str, refresh: bool = False):
-    return boond_service.get_project_imputation_summary(project_name, refresh=refresh)
+    return boond_service.get_project_imputation_summary(project_name, refresh=refresh, affaire_id="")
 
 
 @app.get("/boond-imputations", response_class=HTMLResponse)
@@ -4135,7 +4140,7 @@ async function api(url,options){const r=await fetch(url,options||{});const data=
 function healthClass(a){const reste=Number(a.reste_a_facturer||0),taux=Number(a.taux_avancement_financier||0);if(taux>=0.9)return{label:'Presque soldée',cls:'ok'};if(reste>0&&taux<0.35)return{label:'À surveiller',cls:'warn'};if(reste<0)return{label:'Incohérence à vérifier',cls:'bad'};return{label:'Stable',cls:'ok'};}
 async function loadCacheStatus(){const d=await api('/api/finance/cache-status');state.cacheStatus=d;const label=d.status==='ready'?`Cache prêt · ${d.affaires_count} affaires`:d.status==='building'?'Cache en reconstruction…':`Cache : ${d.status}`;setCacheBadge(d.status,label);document.getElementById('statusMeta').textContent=`${d.affaires_count||0} affaires · ${d.rows_kept||0} lignes utiles · ${d.generated_at||'pas encore généré'}`;}
 async function loadAffairesList(search=''){const d=await api(`/api/finance/affaires?search=${encodeURIComponent(search)}`);state.affaires=d.items||[];const sel=document.getElementById('affaireSelect');const prev=state.selectedAffaireId;sel.innerHTML=`<option value=''>Sélectionnez une affaire</option>`+state.affaires.map(x=>`<option value="${esc(x.affaire_id)}">${esc(x.display_name)}</option>`).join('');if(prev&&state.affaires.some(x=>x.affaire_id===prev)){sel.value=prev;}else{state.selectedAffaireId='';state.selectedAffaire=null;}showNotice(state.affaires.length?`${state.affaires.length} affaire(s) disponible(s)`:'Aucune affaire trouvée pour ce filtre.');}
-async function loadSelectedAffaire(id){if(!id){state.selectedAffaireId='';state.selectedAffaire=null;state.boondImputation=null;renderAll();return;}const d=await api(`/api/finance/affaire/${encodeURIComponent(id)}`);state.selectedAffaireId=id;state.selectedAffaire=d.affaire||null;state.boondImputation=null;renderAll();try{const boondName=(state.selectedAffaire&&(state.selectedAffaire.affaire||state.selectedAffaire.display_name))||'';if(boondName){state.boondImputation=await api(`/api/boond/imputations/by-project?project_name=${encodeURIComponent(boondName)}`);}else{state.boondImputation={matched_project:null,totals:{}};}}catch(_){state.boondImputation={matched_project:null,totals:{}};}renderAll();localStorage.setItem('selectedAffaireId',id);}
+async function loadSelectedAffaire(id){if(!id){state.selectedAffaireId='';state.selectedAffaire=null;state.boondImputation=null;renderAll();return;}const d=await api(`/api/finance/affaire/${encodeURIComponent(id)}`);state.selectedAffaireId=id;state.selectedAffaire=d.affaire||null;state.boondImputation=null;renderAll();try{const boondName=(state.selectedAffaire&&(state.selectedAffaire.affaire||state.selectedAffaire.display_name))||'';if(boondName){state.boondImputation=await api(`/api/boond/imputations/by-project?project_name=${encodeURIComponent(boondName)}&affaire_id=${encodeURIComponent(id)}`);}else{state.boondImputation={matched_project:null,totals:{}};}}catch(_){state.boondImputation={matched_project:null,totals:{}};}renderAll();localStorage.setItem('selectedAffaireId',id);}
 function setHeroEmpty(){document.getElementById('heroTitle').textContent='Sélectionnez une affaire';document.getElementById('heroSubtitle').textContent='Le cockpit se remplit à partir du cache du tableau activité.';document.getElementById('metaClient').textContent='-';document.getElementById('metaProject').textContent='-';document.getElementById('metaMissions').textContent='-';document.getElementById('metaStatus').textContent='🟠 Attention';const h=document.getElementById('heroHealth');h.textContent='En attente';h.className='health warn';}
 function cardTone(id,tone){const el=document.getElementById(id);el.classList.remove('good','warn','bad');if(tone)el.classList.add(tone);}
 function renderHero(){const a=state.selectedAffaire;if(!a){setHeroEmpty();return;}document.getElementById('heroTitle').textContent=a.display_name||'-';document.getElementById('heroSubtitle').textContent=`Client ${a.client||'-'} · ${(a.missions||[]).length} mission(s)`;document.getElementById('metaClient').textContent=a.client||'-';document.getElementById('metaProject').textContent=a.affaire||'-';document.getElementById('metaMissions').textContent=String((a.missions||[]).length||0);const hh=healthClass(a),el=document.getElementById('heroHealth');el.textContent=hh.label;el.className=`health ${hh.cls}`;const reste=euro(a.reste_a_facturer||0);document.getElementById('metaStatus').textContent=hh.cls==='ok'?`🟢 Stable · Reste ${reste}`:(hh.cls==='warn'?`🟠 Attention · Reste ${reste}`:`🔴 Risque · Reste ${reste}`);}
