@@ -1468,7 +1468,7 @@ class BoondService:
                 "score": int(score),
             })
         options_scored.sort(key=lambda x: (-int(x.get("score", 0)), clean_text(x.get("project_reference"))))
-        project_options = options_scored[:30]
+        project_options = options_scored
 
         matched = None
         if forced_project_id:
