@@ -217,6 +217,7 @@ class BoondService:
         page = 1
         per_page = 200
         projects: List[Dict[str, Any]] = []
+        total_rows: Optional[int] = None
 
         while True:
             payload = self.boond_get(
@@ -227,12 +228,20 @@ class BoondService:
                 }
             )
             items = payload.get("data", []) or []
+            meta = payload.get("meta", {}) or {}
+            totals = meta.get("totals", {}) or {}
+
+            if total_rows is None:
+                rows = totals.get("rows")
+                parsed_rows = safe_int(rows)
+                total_rows = parsed_rows if parsed_rows > 0 else None
+
             if not items:
                 break
 
             projects.extend(items)
 
-            if len(items) < per_page:
+            if total_rows is not None and len(projects) >= total_rows:
                 break
 
             page += 1
@@ -3707,22 +3716,10 @@ def api_boond_imputation_by_project(project_name: str = Query(...), refresh: boo
 
 @app.get("/api/boond/debug/projects", response_class=JSONResponse)
 def api_boond_debug_projects():
-    items = boond_service.get_all_boond_projects()
-
-    simplified = []
-    for item in items[:300]:
-        attrs = item.get("attributes", {}) or {}
-        simplified.append({
-            "id": item.get("id"),
-            "type": item.get("type"),
-            "reference": attrs.get("reference"),
-            "title": attrs.get("title"),
-            "name": attrs.get("name"),
-        })
-
+    projects = boond_service.get_all_boond_projects()
     return {
-        "count": len(items),
-        "projects": simplified,
+        "total_projects_returned": len(projects),
+        "sample_ids": [p.get("id") for p in projects[:20]],
     }
 
 
