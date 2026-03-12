@@ -1108,6 +1108,7 @@ class BoondService:
             "margin_production_ht": clean_number(totals.get("marginProductionExcludingTax")),
             "profitability_production": clean_number(totals.get("profitabilityProduction")),
             "turnover_production_ht": clean_number(totals.get("turnoverProductionExcludingTax")),
+            "rows": clean_number(totals.get("rows")),
         }
 
 
@@ -1361,6 +1362,7 @@ class BoondService:
             "margin_production_ht": 0.0,
             "profitability_production": 0.0,
             "turnover_production_ht": 0.0,
+            "rows": 0.0,
         }
         try:
             productivity_payload = self.get_project_productivity(project_id, force_refresh=bool(refresh))
@@ -1403,6 +1405,7 @@ class BoondService:
                 "margin_production_ht": round(clean_number(productivity_totals.get("margin_production_ht")), 2) if clean_number(productivity_totals.get("margin_production_ht")) != 0 else None,
                 "profitability_production": round(clean_number(productivity_totals.get("profitability_production")), 2) if clean_number(productivity_totals.get("profitability_production")) != 0 else None,
                 "turnover_production_ht": round(clean_number(productivity_totals.get("turnover_production_ht")), 2) if clean_number(productivity_totals.get("turnover_production_ht")) != 0 else None,
+                "rows": round(clean_number(productivity_totals.get("rows")), 2) if clean_number(productivity_totals.get("rows")) != 0 else None,
             },
             "by_month": by_month,
             "meta": {**(index.get("meta", {}) or {}), "project_workplaces_rows": len(rows)},
