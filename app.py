@@ -2,14 +2,21 @@
 import csv
 import io
 import json
+import jwt
 import logging
 import os
 import re
+import sqlite3
 import unicodedata
+from collections import defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlencode, urljoin
+import urllib.error as urllib_error
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from fastapi import Body, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
@@ -27,6 +34,7 @@ EXPECTED_SCHEMA_VERSION = "finance_affaires_dataset_v4"
 TEMPO_LOGO_PATH = os.getenv("TEMPO_LOGO_PATH", r"\\192.168.10.100\02 - affaires\02.2 - SYNTHESE\ZZ - METRONOME\Content\T logo.png")
 METRONOME_BASE_PATH = os.getenv("METRONOME_BASE_PATH", r"\\192.168.10.100\02 - affaires\02.2 - SYNTHESE\ZZ - METRONOME")
 POINTAGE_STORE_FILE = Path(os.getenv("POINTAGE_STORE_FILE", "pointage_store.json"))
+BOOND_CACHE_DB_PATH = Path(os.getenv("BOOND_CACHE_DB_PATH", "boond_cache.sqlite3"))
 METRONOME_FILES = {
     "projects": "Projects.csv",
     "entries": "Entries (Tasks & Memos).csv",
@@ -105,6 +113,1505 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 
 app = FastAPI(title=APP_TITLE)
 
+
+
+
+def maybe_load_dotenv() -> None:
+    """Charge .env si python-dotenv est disponible (sans dépendance obligatoire)."""
+    dotenv_spec = __import__("importlib.util").util.find_spec("dotenv")
+    if dotenv_spec is None:
+        return
+    dotenv_module = __import__("importlib").import_module("dotenv")
+    load_dotenv = getattr(dotenv_module, "load_dotenv", None)
+    if callable(load_dotenv):
+        load_dotenv()
+
+
+maybe_load_dotenv()
+
+
+class BoondService:
+    """Service BOOND : appels API, cache SQLite et agrégation imputations."""
+
+    IMPORTANT_TOKENS = {"115", "CDG", "MDZ", "PASSY", "KENNEDY", "VALHUBERT", "PICPUS", "CONDORCET"}
+    SENSITIVE_COMPANY_TOKENS = {"BOUYGUES", "EIFFAGE", "VINCI", "FAYAT", "DUMEZ", "SPIE", "ARTELIA", "ENGIE", "LVMH", "COBAT"}
+
+    def __init__(self, db_path: Path) -> None:
+        self.db_path = Path(db_path)
+        self._cache_lock = Lock()
+        self.manual_daily_rates_by_project: Dict[str, float] = {}
+        self._last_match_debug: Dict[str, Any] = {}
+
+        self.base_url = clean_text(os.getenv("BOOND_BASE_URL"))
+        self.client_token = clean_text(os.getenv("BOOND_CLIENT_TOKEN"))
+        self.client_key = clean_text(os.getenv("BOOND_CLIENT_KEY"))
+        self.user_token = clean_text(os.getenv("BOOND_USER_TOKEN"))
+        self.ensure_boond_cache_table()
+
+    def _validate_config(self) -> None:
+        missing = [
+            k for k, v in {
+                "BOOND_BASE_URL": self.base_url,
+                "BOOND_CLIENT_TOKEN": self.client_token,
+                "BOOND_CLIENT_KEY": self.client_key,
+                "BOOND_USER_TOKEN": self.user_token,
+            }.items() if not v
+        ]
+        if missing:
+            raise RuntimeError(f"[BOOND] Variables .env manquantes: {', '.join(missing)}")
+
+    def build_boond_jwt(self) -> str:
+        self._validate_config()
+
+        payload = {
+            "clientToken": self.client_token,
+            "userToken": self.user_token,
+        }
+
+        token = jwt.encode(payload, self.client_key, algorithm="HS256")
+
+        if isinstance(token, bytes):
+            token = token.decode("utf-8")
+
+        return token
+
+    def boond_headers(self) -> Dict[str, str]:
+        jwt_value = self.build_boond_jwt()
+
+        return {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "X-Jwt-Client-BoondManager": jwt_value,
+        }
+
+    def boond_get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        self._validate_config()
+        base = self.base_url.rstrip("/") + "/"
+        clean_path = path.lstrip("/")
+        url = urljoin(base, clean_path)
+        if params:
+            url = f"{url}?{urlencode(params, doseq=True)}"
+        req = Request(url, headers=self.boond_headers(), method="GET")
+        try:
+            with urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib_error.HTTPError as exc:
+            try:
+                body = exc.read().decode("utf-8", errors="ignore")
+            except Exception:
+                body = "<no body>"
+            logger.error("[BOOND] HTTP %s sur %s | %s", exc.code, url, body)
+            raise HTTPException(
+                status_code=502,
+                detail=f"Erreur Boond {exc.code} sur {clean_path}: {body[:1000]}"
+            ) from exc
+        except URLError as exc:
+            logger.error("[BOOND] Réseau KO sur %s | %s", url, exc)
+            raise RuntimeError(f"Erreur BOOND sur {path}: {exc}")
+        except Exception as exc:
+            logger.exception("[BOOND] Erreur GET %s", url)
+            raise RuntimeError(f"Erreur BOOND sur {path}: {exc}")
+
+
+    def get_all_boond_projects(self) -> List[Dict[str, Any]]:
+        page = 1
+        per_page = 200
+        projects: List[Dict[str, Any]] = []
+        total_rows: Optional[int] = None
+
+        while True:
+            payload = self.boond_get(
+                "/projects",
+                params={
+                    "page": page,
+                    "perPage": per_page,
+                }
+            )
+            items = payload.get("data", []) or []
+            meta = payload.get("meta", {}) or {}
+            totals = meta.get("totals", {}) or {}
+
+            if total_rows is None:
+                rows = totals.get("rows")
+                parsed_rows = safe_int(rows)
+                total_rows = parsed_rows if parsed_rows > 0 else None
+
+            if not items:
+                break
+
+            projects.extend(items)
+
+            if total_rows is not None and len(projects) >= total_rows:
+                break
+
+            page += 1
+
+        return projects
+
+
+    def get_all_boond_resources(self) -> List[Dict[str, Any]]:
+        cache_key = "boond:resources:all"
+        cached = self.get_api_cache(cache_key)
+        if cached is not None:
+            return cached.get("items", []) or []
+
+        page = 1
+        per_page = 200
+        resources: List[Dict[str, Any]] = []
+
+        while True:
+            payload = self.boond_get(
+                "/resources",
+                params={
+                    "page": page,
+                    "perPage": per_page,
+                }
+            )
+            items = payload.get("data", []) or []
+            if not items:
+                break
+
+            resources.extend(items)
+
+            if len(items) < per_page:
+                break
+
+            page += 1
+
+        self.set_api_cache(cache_key, {"items": resources}, ttl_seconds=86400)
+        return resources
+
+    def get_boond_resource_name_map(self) -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        for item in self.get_all_boond_resources():
+            rid = clean_text(item.get("id"))
+            attrs = item.get("attributes", {}) or {}
+            name = clean_text(attrs.get("name"))
+            if not name:
+                name = clean_text((attrs.get("firstName") or "") + " " + (attrs.get("lastName") or ""))
+            if rid:
+                out[rid] = name or rid
+        return out
+
+    @staticmethod
+    def extract_rate_from_resource(resource: Dict[str, Any]) -> Optional[float]:
+        attrs = resource.get("attributes", {}) or {}
+        candidates = [
+            "productionDailyRate",
+            "internalDailyRate",
+            "dailyRate",
+            "costDailyRate",
+            "averageDailyCost",
+            "billingDailyRate",
+            "defaultDailyRate",
+            "unitPrice",
+            "costRate"
+        ]
+        for field in candidates:
+            value = attrs.get(field)
+            num = clean_number(value)
+            if num > 0:
+                return float(num)
+        return None
+
+    @staticmethod
+    def extract_rate_from_resource_rates(payload: Dict[str, Any]) -> Optional[float]:
+        data = payload.get("data") or []
+        if isinstance(data, dict):
+            data = [data]
+        for item in data:
+            attrs = (item or {}).get("attributes", {}) or {}
+            for key in ["dailyRate", "costRate", "unitPrice", "price", "amount"]:
+                num = clean_number(attrs.get(key))
+                if num > 0:
+                    return float(num)
+            for key, value in attrs.items():
+                k = clean_text(key).lower()
+                if any(x in k for x in ["daily", "rate", "price", "amount", "cost"]):
+                    num = clean_number(value)
+                    if num > 0:
+                        return float(num)
+        return None
+
+    @staticmethod
+    def extract_rate_from_delivery(delivery: Dict[str, Any]) -> Optional[float]:
+        attrs = delivery.get("attributes", {}) or {}
+        candidates = [
+            "unitPrice",
+            "dailyRate",
+            "price",
+            "productionPrice",
+            "averageDailyCost",
+            "costRate"
+        ]
+        for field in candidates:
+            num = clean_number(attrs.get(field))
+            if num > 0:
+                return float(num)
+        return None
+
+    @staticmethod
+    def extract_resource_daily_rate(resource: Dict[str, Any]) -> Optional[float]:
+        return BoondService.extract_rate_from_resource(resource)
+
+    def _build_resource_rate_index(self) -> Dict[str, Dict[str, Any]]:
+        index: Dict[str, Dict[str, Any]] = {}
+        for item in self.get_all_boond_resources():
+            rid = clean_text(item.get("id"))
+            if not rid:
+                continue
+            index[rid] = item
+        return index
+
+    @staticmethod
+    def _extract_resource_id_from_workplace_time(row: Dict[str, Any]) -> str:
+        rel = row.get("relationships", {}) or {}
+        candidates = [
+            (((rel.get("resource") or {}).get("data") or {}).get("id")),
+            (((rel.get("user") or {}).get("data") or {}).get("id")),
+            (((rel.get("collaborator") or {}).get("data") or {}).get("id")),
+        ]
+        for val in candidates:
+            rid = clean_text(val)
+            if rid:
+                return rid
+        attrs = row.get("attributes", {}) or {}
+        for key in ["resource", "resourceId", "resource_id", "userId", "collaboratorId"]:
+            rid = clean_text(attrs.get(key))
+            if rid:
+                return rid
+        return ""
+
+    @staticmethod
+    def _extract_resource_ids_from_times_report(report: Dict[str, Any]) -> List[str]:
+        ids: set[str] = set()
+        rel_times = ((report.get("data") or {}).get("relationships") or {}).get("times") or {}
+        items = rel_times.get("data") or []
+        for item in items:
+            attrs = item.get("attributes") or {}
+            for key in ["resource", "user", "collaborator"]:
+                node = attrs.get(key) or {}
+                rid = clean_text((node or {}).get("id"))
+                if rid:
+                    ids.add(rid)
+            delivery = attrs.get("delivery") or {}
+            for key in ["resource", "user", "collaborator"]:
+                node = delivery.get(key) or {}
+                rid = clean_text((node or {}).get("id"))
+                if rid:
+                    ids.add(rid)
+        return sorted(ids)
+
+
+    @staticmethod
+    def _extract_resource_id_from_times_report(report: Dict[str, Any]) -> str:
+        data = report.get("data") or {}
+        rel = data.get("relationships") or {}
+        rid = clean_text((((rel.get("resource") or {}).get("data") or {}).get("id")))
+        if rid:
+            return rid
+        # Fallback: certaines instances exposent la resource dans les times.
+        ctx = BoondService._extract_times_report_context(report)
+        return clean_text(ctx.get("resource_id"))
+
+    @staticmethod
+    def _extract_times_report_context(report: Dict[str, Any]) -> Dict[str, str]:
+        resource_id = ""
+        delivery_id = ""
+        project_id = ""
+        rel_times = ((report.get("data") or {}).get("relationships") or {}).get("times") or {}
+        items = rel_times.get("data") or []
+        for item in items:
+            attrs = item.get("attributes") or {}
+            for key in ["resource", "user", "collaborator"]:
+                node = attrs.get(key) or {}
+                rid = clean_text((node or {}).get("id"))
+                if rid and not resource_id:
+                    resource_id = rid
+            delivery = attrs.get("delivery") or {}
+            did = clean_text(delivery.get("id"))
+            if did and not delivery_id:
+                delivery_id = did
+            project = delivery.get("project") or {}
+            pid = clean_text(project.get("id"))
+            if pid and not project_id:
+                project_id = pid
+            for key in ["resource", "user", "collaborator"]:
+                node = delivery.get(key) or {}
+                rid = clean_text((node or {}).get("id"))
+                if rid and not resource_id:
+                    resource_id = rid
+        return {
+            "resource_id": resource_id,
+            "delivery_id": delivery_id,
+            "project_id": project_id,
+        }
+
+    def resolve_row_daily_rate(self, row_context: Dict[str, Any], resources_index: Dict[str, Any]) -> Tuple[Optional[float], str]:
+        resource_id = clean_text(row_context.get("resource_id"))
+        if resource_id:
+            resource = resources_index.get(resource_id)
+            if resource:
+                rate = self.extract_rate_from_resource(resource)
+                if rate and rate > 0:
+                    return rate, "resource"
+
+            cache_key = f"boond:resource-rates:{resource_id}"
+            rates_payload = self.get_api_cache(cache_key)
+            if rates_payload is None:
+                try:
+                    rates_payload = self.boond_get(f"/resources/{resource_id}/rates")
+                    self.set_api_cache(cache_key, rates_payload, ttl_seconds=86400)
+                except Exception:
+                    rates_payload = None
+            if isinstance(rates_payload, dict):
+                rate = self.extract_rate_from_resource_rates(rates_payload)
+                if rate and rate > 0:
+                    return rate, "resource_rates"
+
+        delivery_id = clean_text(row_context.get("delivery_id"))
+        if delivery_id:
+            cache_key = f"boond:delivery:{delivery_id}"
+            delivery_payload = self.get_api_cache(cache_key)
+            if delivery_payload is None:
+                try:
+                    delivery_payload = self.boond_get(f"/deliveries/{delivery_id}")
+                    self.set_api_cache(cache_key, delivery_payload, ttl_seconds=86400)
+                except Exception:
+                    delivery_payload = None
+            if isinstance(delivery_payload, dict):
+                rate = self.extract_rate_from_delivery(delivery_payload.get("data") or delivery_payload)
+                if rate and rate > 0:
+                    return rate, "delivery"
+
+        return None, "missing"
+
+    def _db(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def ensure_boond_cache_table(self) -> None:
+        with self._cache_lock:
+            with self._db() as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS boond_api_cache (
+                        cache_key TEXT PRIMARY KEY,
+                        payload TEXT NOT NULL,
+                        expires_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL
+                    )
+                    """
+                )
+                conn.commit()
+
+    def get_api_cache(self, cache_key: str, allow_expired: bool = False) -> Optional[Dict[str, Any]]:
+        now_ts = int(datetime.now().timestamp())
+        with self._db() as conn:
+            row = conn.execute(
+                "SELECT payload, expires_at FROM boond_api_cache WHERE cache_key = ?",
+                (cache_key,),
+            ).fetchone()
+        if not row:
+            return None
+        if (not allow_expired) and int(row["expires_at"]) < now_ts:
+            return None
+        return json.loads(row["payload"])
+
+    def set_api_cache(self, cache_key: str, payload: Dict[str, Any], ttl_seconds: int) -> None:
+        now_ts = int(datetime.now().timestamp())
+        expires_at = now_ts + int(ttl_seconds)
+        with self._db() as conn:
+            conn.execute(
+                """
+                INSERT INTO boond_api_cache(cache_key, payload, expires_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    payload = excluded.payload,
+                    expires_at = excluded.expires_at,
+                    updated_at = excluded.updated_at
+                """,
+                (cache_key, json.dumps(payload, ensure_ascii=False), expires_at, now_ts),
+            )
+            conn.commit()
+
+    def get_times_report_cached(self, times_report_id: str, ttl_seconds: int = 86400) -> Tuple[Dict[str, Any], str]:
+        cache_key = f"boond:times-report:{times_report_id}"
+        cached = self.get_api_cache(cache_key)
+        if cached is not None:
+            return cached, "cache"
+        payload = self.boond_get(f"/times-reports/{times_report_id}")
+        self.set_api_cache(cache_key, payload, ttl_seconds=ttl_seconds)
+        return payload, "api"
+
+    @staticmethod
+    def extract_projects_from_times_report(report: Dict[str, Any]) -> List[Dict[str, str]]:
+        # Chaîne fiable validée: workplaces-times -> times-report -> times -> delivery.project
+        projects: Dict[str, Dict[str, str]] = {}
+        rel_times = ((report.get("data") or {}).get("relationships") or {}).get("times") or {}
+        items = rel_times.get("data") or []
+        for item in items:
+            attrs = item.get("attributes") or {}
+            delivery = attrs.get("delivery") or {}
+            project = delivery.get("project") or {}
+            pid = clean_text(project.get("id"))
+            pref = clean_text(project.get("reference"))
+            if pid:
+                projects[pid] = {"project_id": pid, "project_reference": pref}
+        return list(projects.values())
+
+    @staticmethod
+    def normalize_match_text(value: Any) -> str:
+        txt = clean_text(value)
+        txt = unicodedata.normalize("NFKD", txt)
+        txt = "".join(ch for ch in txt if not unicodedata.combining(ch))
+        txt = txt.upper().replace("_", " ").replace("-", " ").replace("/", " ")
+        txt = re.sub(r"[^A-Z0-9\s]", " ", txt)
+        return re.sub(r"\s+", " ", txt).strip()
+
+    def _keywords_from_values(self, values: List[str]) -> List[str]:
+        kws: set[str] = set()
+        for value in values:
+            for tok in self.normalize_match_text(value).split():
+                if tok.isdigit() or len(tok) >= 3:
+                    kws.add(tok)
+        return sorted(kws)
+
+    def _get_metronome_match_context(self, project_name: str, affaire_id: str = "") -> Dict[str, Any]:
+        # Réutilise le cache finance METRONOME pour enrichir le matching BOOND.
+        finance_service = globals().get("service")
+        if finance_service is None:
+            return {"keywords": self._keywords_from_values([project_name])}
+
+        try:
+            cache = finance_service.get_finance_cache()
+            items = (cache or {}).get("items", {}) or {}
+        except Exception:
+            items = {}
+
+        preferred_id = clean_text(affaire_id)
+        target = self.normalize_match_text(project_name)
+        best_score = -1
+        best_item: Dict[str, Any] = {}
+        best_id = ""
+
+        if preferred_id and preferred_id in items:
+            best_item = items.get(preferred_id) or {}
+            best_id = preferred_id
+        else:
+            for local_affaire_id, item in items.items():
+                display_name = clean_text(item.get("display_name"))
+                affaire = clean_text(item.get("affaire"))
+                numero = clean_text(item.get("numero"))
+                local_id = clean_text(local_affaire_id)
+                candidates = [display_name, affaire, numero, local_id]
+                score = 0
+                for c in candidates:
+                    n = self.normalize_match_text(c)
+                    if not n:
+                        continue
+                    if n == target:
+                        score = max(score, 100)
+                    elif target and (target in n or n in target):
+                        score = max(score, 80)
+                    else:
+                        overlap = set(target.split()) & set(n.split())
+                        score = max(score, len(overlap) * 10)
+                if score > best_score:
+                    best_score = score
+                    best_item = item
+                    best_id = local_id
+
+        context = {
+            "affaire_id": clean_text(best_id),
+            "display_name": clean_text(best_item.get("display_name")),
+            "affaire": clean_text(best_item.get("affaire")),
+            "numero": clean_text(best_item.get("numero")),
+            "client": clean_text(best_item.get("client")),
+        }
+        context_values = [
+            project_name,
+            context.get("display_name", ""),
+            context.get("affaire", ""),
+            context.get("numero", ""),
+            context.get("client", ""),
+            context.get("affaire_id", ""),
+        ]
+        context["keywords"] = self._keywords_from_values(context_values)
+        return context
+
+    @staticmethod
+    def _load_manual_boond_mapping() -> Dict[str, List[str]]:
+        path = Path("boond_affaire_map.json")
+        if not path.exists():
+            return {}
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return {}
+            out: Dict[str, List[str]] = {}
+            for key, value in raw.items():
+                if isinstance(value, list):
+                    out[clean_text(key)] = [clean_text(v) for v in value if clean_text(v)]
+            return out
+        except Exception:
+            logger.exception("[BOOND] Mapping manuel invalide")
+            return {}
+
+    def score_project_match(self, target_texts: List[str], target_keywords: List[str], boond_ref: str) -> Tuple[int, List[str]]:
+        ref = self.normalize_match_text(boond_ref)
+        if not ref:
+            return 0, ["empty_reference"]
+
+        score = 0
+        reasons: List[str] = []
+        strong_tokens = {"CDG", "MDZ", "PICPUS", "PASSY", "KENNEDY", "CONDORCET", "VALHUBERT", "MONTAIGNE", "ENGIE"}
+        strong_hits: set[str] = set()
+        ref_tokens = set(ref.split())
+
+        for txt in target_texts:
+            n_txt = self.normalize_match_text(txt)
+            if not n_txt:
+                continue
+            if n_txt == ref:
+                score += 100
+                reasons.append(f"exact:{n_txt}")
+            elif n_txt in ref:
+                score += 45
+                reasons.append(f"contains:{n_txt}")
+
+        target_kw_set = {self.normalize_match_text(k) for k in target_keywords if self.normalize_match_text(k)}
+        for n_kw in sorted(target_kw_set):
+            if re.search(rf"\b{re.escape(n_kw)}\b", ref):
+                score += 12
+                reasons.append(f"keyword:{n_kw}")
+                if n_kw in strong_tokens:
+                    score += 10
+                    reasons.append(f"strong:{n_kw}")
+                    strong_hits.add(n_kw)
+
+        if len(strong_hits) >= 2:
+            score += 10
+            reasons.append("strong_coherence")
+
+        target_companies = target_kw_set & self.SENSITIVE_COMPANY_TOKENS
+        ref_companies = ref_tokens & self.SENSITIVE_COMPANY_TOKENS
+        if target_companies and ref_companies and (target_companies & ref_companies):
+            score += 25
+            reasons.append("company_match")
+
+        conflict = False
+        if target_companies and ref_companies and not (target_companies & ref_companies):
+            score -= 35
+            conflict = True
+            reasons.append("client_conflict")
+
+        overlap_non_company = (target_kw_set & ref_tokens) - self.SENSITIVE_COMPANY_TOKENS
+        if conflict and len(overlap_non_company) <= 1:
+            score = min(score, 20)
+            reasons.append("client_conflict_single_site")
+
+        score = max(0, min(100, score))
+        return score, reasons
+
+    def find_best_boond_project_match(self, project_name: str, boond_projects: List[Dict[str, Any]], affaire_id: str = "", context_hint: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        context = self._get_metronome_match_context(project_name, affaire_id=affaire_id)
+        hint = context_hint or {}
+        for key in ["display_name", "affaire", "numero", "client"]:
+            if clean_text(hint.get(key)):
+                context[key] = clean_text(hint.get(key))
+        target_texts = [
+            project_name,
+            clean_text(context.get("display_name")),
+            clean_text(context.get("affaire")),
+            clean_text(context.get("numero")),
+            clean_text(context.get("client")),
+            clean_text(context.get("affaire_id")),
+        ]
+        target_texts = [t for t in target_texts if t]
+        base_keywords = context.get("keywords") or []
+        target_keywords = sorted(set(base_keywords) | set(self._keywords_from_values(target_texts)))
+        normalized_kw_set = {self.normalize_match_text(k) for k in target_keywords if self.normalize_match_text(k)}
+        discriminant_tokens = {
+            tok for tok in normalized_kw_set
+            if tok not in self.SENSITIVE_COMPANY_TOKENS and (tok.isdigit() or len(tok) >= 3)
+        }
+
+        mapping = self._load_manual_boond_mapping()
+        mapped_ids = mapping.get(clean_text(project_name), [])
+        if mapped_ids:
+            mapped_set = set(mapped_ids)
+            for p in boond_projects:
+                pid = clean_text(p.get("project_id"))
+                if pid in mapped_set:
+                    result = {
+                        "project_id": pid,
+                        "project_reference": clean_text(p.get("project_reference")),
+                        "match_score": 100,
+                        "matched_on": "manual_mapping",
+                        "match_reasons": ["manual_mapping"],
+                        "match_warning": None,
+                        "metronome_context": context,
+                    }
+                    self._last_match_debug = {
+                        "input_project_name": project_name,
+                        "metronome_context": context,
+                        "top_candidates": [result],
+                    }
+                    return result
+
+        strict_candidates: List[Dict[str, Any]] = []
+        loose_candidates: List[Dict[str, Any]] = []
+        for p in boond_projects:
+            pref = clean_text(p.get("project_reference"))
+            plabel = clean_text(p.get("project_label")) or pref
+            ref_tokens = set(self.normalize_match_text(plabel).split())
+            discriminant_hits = discriminant_tokens & ref_tokens
+
+            score, reasons = self.score_project_match(target_texts, target_keywords, plabel)
+            if score < 35:
+                continue
+
+            has_conflict = ("client_conflict" in reasons) or ("client_conflict_single_site" in reasons)
+            if has_conflict and score < 80:
+                continue
+
+            local_reasons = list(reasons)
+            if discriminant_hits:
+                local_reasons.append(f"discriminant_hits:{','.join(sorted(discriminant_hits))}")
+
+            entry = {
+                "project_id": clean_text(p.get("project_id")),
+                "project_reference": pref,
+                "project_label": plabel,
+                "match_score": int(score),
+                "matched_on": local_reasons[0] if local_reasons else "scored",
+                "match_reasons": local_reasons,
+                "match_warning": "client_conflict" if has_conflict else None,
+                "metronome_context": context,
+            }
+
+            loose_candidates.append(entry)
+            if (not discriminant_tokens) or discriminant_hits:
+                strict_candidates.append(entry)
+
+        strict_candidates.sort(key=lambda c: (-int(c.get("match_score", 0)), clean_text(c.get("project_reference"))))
+        loose_candidates.sort(key=lambda c: (-int(c.get("match_score", 0)), clean_text(c.get("project_reference"))))
+
+        chosen_pool = strict_candidates if strict_candidates else loose_candidates
+        self._last_match_debug = {
+            "input_project_name": project_name,
+            "metronome_context": context,
+            "matching_mode": "strict" if strict_candidates else "fallback_loose",
+            "top_candidates": chosen_pool[:5],
+        }
+
+        if chosen_pool and int(chosen_pool[0].get("match_score", 0)) >= 55:
+            best = dict(chosen_pool[0])
+            if not strict_candidates:
+                best["match_warning"] = best.get("match_warning") or "fallback_loose"
+                best["match_reasons"] = [*(best.get("match_reasons") or []), "fallback_loose_no_discriminant"]
+            return best
+        return None
+
+    @staticmethod
+    def _extract_resource_name_from_workplace_row(row: Dict[str, Any]) -> str:
+        attrs = row.get("attributes", {}) or {}
+        for key in ["resourceName", "resource_name", "resource", "user", "collaborator"]:
+            raw = attrs.get(key)
+            if isinstance(raw, dict):
+                name = clean_text(raw.get("name") or raw.get("fullName") or raw.get("displayName"))
+            else:
+                name = clean_text(raw)
+            if name and not name.isdigit():
+                return name
+
+        rel = row.get("relationships", {}) or {}
+        for rel_key in ["resource", "user", "collaborator"]:
+            data = (rel.get(rel_key) or {}).get("data") or {}
+            if isinstance(data, dict):
+                name = clean_text(data.get("name") or data.get("fullName") or data.get("displayName"))
+                if name and not name.isdigit():
+                    return name
+        return ""
+
+
+    def get_project_workplaces_times(self, project_id: str):
+
+        page = 1
+        per_page = 500
+        rows = []
+
+        while True:
+
+            payload = self.boond_get(
+                "/workplaces-times",
+                params={
+                    "project": project_id,
+                    "page": page,
+                    "perPage": per_page
+                }
+            )
+
+            items = payload.get("data", []) or []
+
+            if not items:
+                break
+
+            rows.extend(items)
+
+            if len(items) < per_page:
+                break
+
+            page += 1
+
+        return rows
+
+    def find_active_positioning_by_date(
+        self,
+        work_date: str,
+        normalized_positionings: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        work_date = clean_text(work_date)[:10]
+        if not work_date:
+            return None
+
+        candidates: List[Dict[str, Any]] = []
+        for pos in normalized_positionings:
+            start = clean_text(pos.get("start_date"))[:10]
+            end = clean_text(pos.get("end_date"))[:10]
+            avg = clean_number(pos.get("average_daily_cost"))
+
+            if avg <= 0:
+                continue
+
+            if start and work_date < start:
+                continue
+            if end and work_date > end:
+                continue
+
+            candidates.append(pos)
+
+        if not candidates:
+            return None
+
+        # prendre celui dont la start_date est la plus proche, mais <= work_date
+        def sort_key(pos: Dict[str, Any]):
+            start = clean_text(pos.get("start_date"))[:10]
+            return start or "0000-00-00"
+
+        candidates.sort(key=sort_key, reverse=True)
+        return candidates[0]
+
+    def resolve_line_cost_from_positioning(
+        self,
+        times_report_id: str,
+        work_date: str,
+        duration: float,
+        force_refresh: bool = False,
+    ) -> Dict[str, Any]:
+        tr_payload, _ = self.get_times_report_cached(times_report_id)
+        tr_data = tr_payload.get("data") or {}
+        tr_rel = tr_data.get("relationships") or {}
+
+        resource_id = clean_text((((tr_rel.get("resource") or {}).get("data")) or {}).get("id"))
+        if not resource_id:
+            return {
+                "resource_id": None,
+                "positioning_id": None,
+                "average_daily_cost": None,
+                "line_cost": None,
+            }
+
+        pos_items = self.get_all_resource_positionings(resource_id, force_refresh=force_refresh)
+
+        normalized_positionings: List[Dict[str, Any]] = []
+        for item in pos_items:
+            pos_id = clean_text(item.get("id"))
+            if not pos_id:
+                continue
+            try:
+                detail = self._positioning_detail(pos_id)
+            except Exception:
+                continue
+
+            data = detail.get("data") or {}
+            attrs = data.get("attributes") or {}
+
+            normalized_positionings.append({
+                "id": clean_text(data.get("id")),
+                "start_date": clean_text(attrs.get("startDate")),
+                "end_date": clean_text(attrs.get("endDate")),
+                "average_daily_cost": clean_number(attrs.get("averageDailyCost")),
+            })
+
+        active = self.find_active_positioning_by_date(work_date, normalized_positionings)
+        if not active:
+            return {
+                "resource_id": resource_id,
+                "positioning_id": None,
+                "average_daily_cost": None,
+                "line_cost": None,
+            }
+
+        avg = clean_number(active.get("average_daily_cost"))
+        line_cost = round(clean_number(duration) * avg, 6) if avg > 0 else None
+
+        logger.info(
+            "[BOOND COST] resource=%s positioning=%s rate=%s days=%s cost=%s",
+            resource_id,
+            active.get("id"),
+            avg,
+            duration,
+            line_cost,
+        )
+
+        return {
+            "resource_id": resource_id,
+            "positioning_id": active.get("id"),
+            "average_daily_cost": avg if avg > 0 else None,
+            "line_cost": line_cost,
+        }
+
+    def _resources_directory(self) -> List[Dict[str, Any]]:
+        return self.get_all_boond_resources()
+
+    def _resource_report_list(self, resource_id: str) -> Dict[str, Any]:
+        cache_key = f"boond:resource:{resource_id}:times-reports"
+        cached = self.get_api_cache(cache_key)
+        if cached is not None:
+            return cached
+        try:
+            payload = self.boond_get(f"/resources/{resource_id}/times-reports", params={"perPage": 500})
+        except Exception:
+            payload = {"data": []}
+        self.set_api_cache(cache_key, payload, ttl_seconds=86400)
+        return payload
+
+    @staticmethod
+    def _extract_report_item(report_list_payload: Dict[str, Any], term: str) -> List[Dict[str, Any]]:
+        # Garde les reports jusqu'au mois demandé (YYYY-MM)
+        items = report_list_payload.get("data", []) or []
+        out: List[Dict[str, Any]] = []
+        for item in items:
+            attrs = item.get("attributes", {}) or {}
+            dt = clean_text(attrs.get("startDate") or attrs.get("date") or attrs.get("endDate"))[:7]
+            if not term or (dt and dt <= term):
+                out.append(item)
+            elif not dt:
+                out.append(item)
+        return out
+
+    def _times_report_detail(self, report_id: str) -> Dict[str, Any]:
+        payload, _ = self.get_times_report_cached(report_id)
+        return payload
+
+    @staticmethod
+    def normalize_times_report_lines(report_detail: Dict[str, Any]) -> List[Dict[str, Any]]:
+        lines: List[Dict[str, Any]] = []
+        rel_times = ((report_detail.get("data") or {}).get("relationships") or {}).get("times") or {}
+        items = rel_times.get("data") or []
+        for item in items:
+            attrs = item.get("attributes", {}) or {}
+            delivery = attrs.get("delivery") or {}
+            project = delivery.get("project") or {}
+            lines.append({
+                "duration": clean_number(attrs.get("duration")),
+                "date": clean_text(attrs.get("startDate") or attrs.get("date")),
+                "project_id": clean_text(project.get("id")),
+                "delivery_id": clean_text(delivery.get("id")),
+            })
+        return lines
+
+    def _resource_positionings(self, resource_id: str) -> Dict[str, Any]:
+        cache_key = f"boond:resource:{resource_id}:positionings"
+        cached = self.get_api_cache(cache_key)
+        if cached is not None:
+            return cached
+        try:
+            payload = self.boond_get(f"/resources/{resource_id}/positionings", params={"perPage": 200})
+        except Exception:
+            payload = {"data": []}
+        self.set_api_cache(cache_key, payload, ttl_seconds=86400)
+        return payload
+
+    def get_all_resource_positionings(self, resource_id: str, force_refresh: bool = False) -> List[Dict[str, Any]]:
+        cache_key = f"boond:resource:{resource_id}:positionings:all"
+        cached = None if force_refresh else self.get_api_cache(cache_key)
+        if isinstance(cached, list):
+            return cached
+
+        page = 1
+        per_page = 200
+        items: List[Dict[str, Any]] = []
+
+        while True:
+            try:
+                payload = self.boond_get(
+                    f"/resources/{resource_id}/positionings",
+                    params={"page": page, "perPage": per_page},
+                )
+            except Exception:
+                break
+
+            batch = payload.get("data", []) or []
+            if not batch:
+                break
+
+            items.extend(batch)
+
+            if len(batch) < per_page:
+                break
+
+            page += 1
+
+        self.set_api_cache(cache_key, items, ttl_seconds=86400)
+        return items
+
+    def _positioning_detail(self, pos_id: str) -> Dict[str, Any]:
+        cache_key = f"boond:positioning:{pos_id}"
+        cached = self.get_api_cache(cache_key)
+        if cached is not None:
+            return cached
+        payload = self.boond_get(f"/positionings/{pos_id}")
+        self.set_api_cache(cache_key, payload, ttl_seconds=86400)
+        return payload
+
+    @staticmethod
+    def normalize_positioning_detail(detail: Dict[str, Any]) -> Dict[str, Any]:
+        data = detail.get("data") or detail
+        attrs = data.get("attributes", {}) or {}
+        avg = None
+        for key in ["average_daily_cost", "averageDailyCost", "dailyCost", "cost", "costRate", "dailyRate"]:
+            num = clean_number(attrs.get(key))
+            if num > 0:
+                avg = float(num)
+                break
+        return {
+            "id": clean_text(data.get("id")),
+            "start_date": clean_text(attrs.get("startDate") or attrs.get("start")),
+            "end_date": clean_text(attrs.get("endDate") or attrs.get("end")),
+            "average_daily_cost": avg,
+        }
+
+    @staticmethod
+    def find_active_positioning_for_time(line: Dict[str, Any], normalized_positionings: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        # Version robuste simple: premier positioning avec coût > 0 (ou actif par date si dispo).
+        line_month = clean_text(line.get("date"))[:10]
+        for pos in normalized_positionings:
+            if not pos.get("average_daily_cost"):
+                continue
+            start = clean_text(pos.get("start_date"))[:10]
+            end = clean_text(pos.get("end_date"))[:10]
+            if start and line_month and line_month < start:
+                continue
+            if end and line_month and line_month > end:
+                continue
+            return pos
+        for pos in normalized_positionings:
+            if pos.get("average_daily_cost"):
+                return pos
+        return None
+
+    def compute_resource_month_costs(self, resource_id: str, term: str) -> Dict[str, Any]:
+        report_list = self._resource_report_list(resource_id)
+        report_items = self._extract_report_item(report_list, term)
+
+        raw_pos = self.get_all_resource_positionings(resource_id)
+        normalized_positionings: List[Dict[str, Any]] = []
+        for pos in raw_pos:
+            pos_id = clean_text(pos.get("id"))
+            if not pos_id:
+                continue
+            try:
+                det = self._positioning_detail(pos_id)
+                normalized_positionings.append(self.normalize_positioning_detail(det))
+            except Exception:
+                continue
+
+        lines_out: List[Dict[str, Any]] = []
+        for rep in report_items:
+            rep_id = clean_text(rep.get("id"))
+            if not rep_id:
+                continue
+            try:
+                detail = self._times_report_detail(rep_id)
+            except Exception:
+                continue
+            lines = self.normalize_times_report_lines(detail)
+            for line in lines:
+                active = self.find_active_positioning_for_time(line, normalized_positionings)
+                avg = clean_number((active or {}).get("average_daily_cost"))
+                duration = clean_number(line.get("duration"))
+                cost = duration * avg if avg > 0 else 0.0
+                lines_out.append({
+                    "resource_id": resource_id,
+                    "project_id": clean_text(line.get("project_id")),
+                    "date": clean_text(line.get("date")),
+                    "duration": duration,
+                    "average_daily_cost": avg if avg > 0 else None,
+                    "cost": cost if cost > 0 else None,
+                })
+
+        return {"resource_id": resource_id, "term": term, "lines": lines_out}
+
+
+    def get_cached_project_cumulative_cost(self, project_id: str, end_term: str):
+        cache_key = f"boond:project:cumulative_cost:{project_id}:{end_term}"
+        return self.get_api_cache(cache_key)
+
+    def set_cached_project_cumulative_cost(self, project_id: str, end_term: str, payload: dict, ttl_seconds: int = 21600):
+        cache_key = f"boond:project:cumulative_cost:{project_id}:{end_term}"
+        self.set_api_cache(cache_key, payload, ttl_seconds=ttl_seconds)
+
+    def get_cached_project_productivity(self, project_id: str):
+        return self.get_api_cache(f"boond:project:productivity:{project_id}")
+
+    def set_cached_project_productivity(self, project_id: str, payload: dict, ttl_seconds: int = 3600):
+        self.set_api_cache(f"boond:project:productivity:{project_id}", payload, ttl_seconds=ttl_seconds)
+
+    def get_project_productivity(self, project_id: str, force_refresh: bool = False) -> Dict[str, Any]:
+        cached = None if force_refresh else self.get_cached_project_productivity(project_id)
+        if cached is not None:
+            return cached
+        payload = self.boond_get(f"/projects/{project_id}/productivity")
+        self.set_cached_project_productivity(project_id, payload, ttl_seconds=3600)
+        return payload
+
+    @staticmethod
+    def extract_project_productivity_totals(payload: Dict[str, Any]) -> Dict[str, Any]:
+        meta = payload.get("meta") or {}
+        totals = meta.get("totals") or {}
+        return {
+            "cost_production_ht": clean_number(totals.get("costsProductionExcludingTax")),
+            "cost_resources_ht": clean_number(totals.get("costsResourcesExcludingTax")),
+            "margin_production_ht": clean_number(totals.get("marginProductionExcludingTax")),
+            "profitability_production": clean_number(totals.get("profitabilityProduction")),
+            "turnover_production_ht": clean_number(totals.get("turnoverProductionExcludingTax")),
+            "rows": clean_number(totals.get("rows")),
+        }
+
+
+    @staticmethod
+    def _build_productivity_resource_index(payload: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
+        resource_index: Dict[str, Dict[str, str]] = {}
+        included = payload.get("included") or []
+        if not isinstance(included, list):
+            return resource_index
+
+        for item in included:
+            if clean_text((item or {}).get("type")) != "resource":
+                continue
+            rid = clean_text((item or {}).get("id"))
+            if not rid:
+                continue
+            attrs = (item or {}).get("attributes") or {}
+            first_name = clean_text(attrs.get("firstName"))
+            last_name = clean_text(attrs.get("lastName")).upper()
+            display_name = clean_text(f"{last_name} {first_name}".strip())
+            resource_index[rid] = {
+                "id": rid,
+                "first_name": first_name,
+                "last_name": last_name,
+                "display_name": display_name or f"RESOURCE {rid}",
+            }
+        return resource_index
+
+    def build_productivity_resource_table(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        resource_index = self._build_productivity_resource_index(payload)
+        resource_totals: Dict[str, Dict[str, Any]] = defaultdict(
+            lambda: {"resource_id": "", "days": 0.0, "expenses": 0.0, "cost_ht": 0.0, "turnover_ht": 0.0}
+        )
+
+        data_items = payload.get("data") or []
+        if isinstance(data_items, dict):
+            data_items = [data_items]
+
+        for item in data_items:
+            if clean_text((item or {}).get("type")) != "delivery":
+                continue
+            attrs = (item or {}).get("attributes") or {}
+            rel = (item or {}).get("relationships") or {}
+            resource_id = clean_text((((rel.get("dependsOn") or {}).get("data") or {}).get("id")))
+            if not resource_id:
+                continue
+
+            row = resource_totals[resource_id]
+            row["resource_id"] = resource_id
+            row["days"] += clean_number(attrs.get("regularTimesProduction"))
+            row["expenses"] += clean_number(attrs.get("expensesProduction"))
+            row["cost_ht"] += clean_number(attrs.get("costsProductionExcludingTax"))
+            row["turnover_ht"] += clean_number(attrs.get("turnoverProductionExcludingTax"))
+
+        out: List[Dict[str, Any]] = []
+        for resource_id, totals in resource_totals.items():
+            info = resource_index.get(resource_id) or {}
+            out.append({
+                "resource_id": resource_id,
+                "resource_name": clean_text(info.get("display_name")) or f"RESOURCE {resource_id}",
+                "days": round(clean_number(totals.get("days")), 2),
+                "expenses": round(clean_number(totals.get("expenses")), 2),
+                "turnover_ht": round(clean_number(totals.get("turnover_ht")), 2),
+                "cost_ht": round(clean_number(totals.get("cost_ht")), 2),
+            })
+
+        out.sort(key=lambda r: (-clean_number(r.get("days")), clean_text(r.get("resource_name"))))
+        return out
+
+
+    def compute_project_cumulative_cost_from_existing_engine(self, project_id: str, end_term: str, force_refresh: bool = False) -> Dict[str, Any]:
+        cached = None if force_refresh else self.get_cached_project_cumulative_cost(project_id, end_term)
+        if cached is not None:
+            return cached
+
+        rows = self.get_project_workplaces_times(project_id)
+        total_days = 0.0
+        total_cost = 0.0
+        rated_days = 0.0
+        unrated_days = 0.0
+        by_month: Dict[str, Dict[str, float]] = defaultdict(lambda: {"days": 0.0, "cost": 0.0})
+
+        times_report_cache: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            attrs = row.get("attributes", {}) or {}
+            rel = row.get("relationships", {}) or {}
+            duration = clean_number(attrs.get("duration"))
+            if duration <= 0:
+                continue
+            work_date = clean_text(attrs.get("startDate"))
+            month = work_date[:7]
+            total_days += duration
+            if re.match(r"^\d{4}-\d{2}$", month):
+                by_month[month]["days"] += duration
+
+            times_report_id = clean_text((((rel.get("timesReport") or {}).get("data") or {}).get("id")))
+            if not times_report_id:
+                unrated_days += duration
+                continue
+
+            if times_report_id in times_report_cache:
+                _ = times_report_cache[times_report_id]
+            else:
+                tr_payload, _src = self.get_times_report_cached(times_report_id, ttl_seconds=86400)
+                times_report_cache[times_report_id] = tr_payload
+
+            cost_info = self.resolve_line_cost_from_positioning(
+                times_report_id=times_report_id,
+                work_date=work_date,
+                duration=duration,
+            )
+            line_cost = clean_number(cost_info.get("line_cost"))
+            if line_cost > 0:
+                total_cost += line_cost
+                rated_days += duration
+                if re.match(r"^\d{4}-\d{2}$", month):
+                    by_month[month]["cost"] += line_cost
+            else:
+                unrated_days += duration
+
+        cost_coverage_ratio = (rated_days / total_days) if total_days > 0 else 0.0
+        average_daily_cost = (total_cost / rated_days) if rated_days > 0 else None
+        if rated_days == total_days and total_cost > 0:
+            cost_status = "ok"
+            total_cost_out = round(total_cost, 2)
+        elif rated_days > 0 and unrated_days > 0:
+            cost_status = "partial"
+            total_cost_out = round(total_cost, 2)
+        else:
+            cost_status = "missing_rate"
+            total_cost_out = None
+
+        result = {
+            "project_id": clean_text(project_id),
+            "total_days": round(total_days, 2),
+            "rated_days": round(rated_days, 2),
+            "unrated_days": round(unrated_days, 2),
+            "cost_coverage_ratio": round(cost_coverage_ratio, 4),
+            "total_cost": total_cost_out,
+            "average_daily_cost": round(average_daily_cost, 2) if average_daily_cost is not None else None,
+            "rate_sources_count": {"resource": rated_days, "resource_rates": 0, "delivery": 0, "missing": unrated_days},
+            "by_month": [
+                {
+                    "month": m,
+                    "days": round(v["days"], 2),
+                    "cost": round(v["cost"], 2) if v["cost"] > 0 else None,
+                }
+                for m, v in sorted(by_month.items())
+                if (not end_term) or (m <= end_term)
+            ],
+            "cost_status": cost_status,
+        }
+        self.set_cached_project_cumulative_cost(project_id, end_term, result, ttl_seconds=21600)
+        return result
+
+
+    def _fetch_all_workplaces_times(self) -> List[Dict[str, Any]]:
+        # Une seule collecte de workplaces-times, puis enrichissement avec times-reports en cache.
+        attempts: List[Tuple[str, Optional[Dict[str, Any]]]] = [
+            ("/workplaces-times", None),
+            ("/workplaces-times", {"limit": 1000}),
+            ("/workplaces-times", {"perPage": 1000}),
+            ("/workplaces-times", {"page": 1, "limit": 1000}),
+        ]
+        last_error: Optional[Exception] = None
+        for path, params in attempts:
+            try:
+                payload = self.boond_get(path, params=params)
+                data = payload.get("data") or []
+                if isinstance(data, list):
+                    return data
+            except RuntimeError as exc:
+                last_error = exc
+                if "422" not in str(exc):
+                    break
+        if last_error:
+            raise RuntimeError(str(last_error))
+        return []
+
+    def build_boond_imputation_index(self, refresh: bool = False) -> Dict[str, Any]:
+        cache_key = "boond:index:projects:imputations"
+        if not refresh:
+            cached = self.get_api_cache(cache_key)
+            if cached is not None:
+                return cached
+
+        try:
+            rows = self._fetch_all_workplaces_times()
+        except RuntimeError as exc:
+            stale = self.get_api_cache(cache_key, allow_expired=True)
+            if stale is not None:
+                stale_meta = stale.setdefault("meta", {})
+                stale_meta["warning"] = f"Données BOOND indisponibles, cache stale utilisé: {exc}"
+                stale_meta["stale_fallback_used"] = True
+                stale_meta["generated_at"] = stale_meta.get("generated_at") or now_iso()
+                return stale
+            raise
+        structured_rows = []
+        unique_reports = set()
+        for row in rows:
+            attrs = row.get("attributes") or {}
+            rel = row.get("relationships") or {}
+            tr_id = clean_text((((rel.get("timesReport") or {}).get("data") or {}).get("id")))
+            duration = clean_number(attrs.get("duration"))
+            start_date = clean_text(attrs.get("startDate"))
+            if tr_id:
+                unique_reports.add(tr_id)
+            structured_rows.append({"times_report_id": tr_id, "duration": duration, "start_date": start_date})
+
+        report_to_projects: Dict[str, List[Dict[str, str]]] = {}
+        loaded_api = 0
+        loaded_cache = 0
+        for tr_id in unique_reports:
+            report_payload, source = self.get_times_report_cached(tr_id)
+            if source == "api":
+                loaded_api += 1
+            else:
+                loaded_cache += 1
+            report_to_projects[tr_id] = self.extract_projects_from_times_report(report_payload)
+
+        projects_index: Dict[str, Dict[str, Any]] = {}
+        for wr in structured_rows:
+            tr_projects = report_to_projects.get(wr["times_report_id"], [])
+            for project in tr_projects:
+                pid = project["project_id"]
+                pref = project.get("project_reference") or ""
+                if pid not in projects_index:
+                    projects_index[pid] = {
+                        "project_id": pid,
+                        "project_reference": pref,
+                        "project_label": plabel,
+                        "total_days": 0.0,
+                        "by_month": defaultdict(float),
+                    }
+                projects_index[pid]["total_days"] += wr["duration"]
+                month = clean_text(wr["start_date"])[:7]
+                if re.match(r"^\d{4}-\d{2}$", month):
+                    projects_index[pid]["by_month"][month] += wr["duration"]
+
+        serializable_projects = []
+        for item in projects_index.values():
+            serializable_projects.append({
+                "project_id": item["project_id"],
+                "project_reference": item["project_reference"],
+                "total_days": round(item["total_days"], 2),
+                "by_month": {k: round(v, 2) for k, v in sorted(item["by_month"].items())},
+            })
+
+        result = {
+            "projects": serializable_projects,
+            "meta": {
+                "workplaces_rows": len(structured_rows),
+                "unique_times_reports": len(unique_reports),
+                "times_reports_loaded_from_api": loaded_api,
+                "times_reports_loaded_from_cache": loaded_cache,
+                "generated_at": now_iso(),
+            },
+        }
+        self.set_api_cache(cache_key, result, ttl_seconds=1800)
+        return result
+
+
+    def get_project_imputation_summary(self, project_name: str, refresh: bool = False, affaire_id: str = "", context_hint: Optional[Dict[str, Any]] = None, boond_project_id: str = "") -> Dict[str, Any]:
+        index = self.build_boond_imputation_index(refresh=refresh)
+
+        # Matching sur l'ensemble des projets BOOND paginés, pas uniquement sur l'index d'imputation.
+        catalog = self.get_all_boond_projects()
+        boond_projects_for_match: List[Dict[str, Any]] = []
+        for item in catalog:
+            attrs = item.get("attributes", {}) or {}
+            pref = clean_text(attrs.get("reference"))
+            ptitle = clean_text(attrs.get("title"))
+            pname = clean_text(attrs.get("name"))
+            label_parts = []
+            for part in [pref, ptitle, pname]:
+                if part and part not in label_parts:
+                    label_parts.append(part)
+            boond_projects_for_match.append({
+                "project_id": clean_text(item.get("id")),
+                "project_reference": pref or ptitle or pname,
+                "project_label": " | ".join(label_parts),
+            })
+
+        forced_project_id = clean_text(boond_project_id)
+        options_scored: List[Dict[str, Any]] = []
+        for p in boond_projects_for_match:
+            pref = clean_text(p.get("project_reference"))
+            plabel = clean_text(p.get("project_label")) or pref
+            score, _reasons = self.score_project_match(
+                [project_name, clean_text((context_hint or {}).get("display_name")), clean_text((context_hint or {}).get("affaire")), clean_text((context_hint or {}).get("numero")), clean_text((context_hint or {}).get("client"))],
+                self._keywords_from_values([project_name, clean_text((context_hint or {}).get("display_name")), clean_text((context_hint or {}).get("affaire")), clean_text((context_hint or {}).get("numero")), clean_text((context_hint or {}).get("client"))]),
+                plabel,
+            )
+            options_scored.append({
+                "project_id": clean_text(p.get("project_id")),
+                "project_reference": pref,
+                "project_label": plabel,
+                "score": int(score),
+            })
+        options_scored.sort(key=lambda x: (-int(x.get("score", 0)), clean_text(x.get("project_reference"))))
+        project_options = options_scored
+
+        matched = None
+        if forced_project_id:
+            forced_norm = self.normalize_match_text(forced_project_id)
+            for p in boond_projects_for_match:
+                pid = clean_text(p.get("project_id"))
+                pref = clean_text(p.get("project_reference"))
+                plabel = clean_text(p.get("project_label")) or pref
+                pref_norm = self.normalize_match_text(pref)
+                plabel_norm = self.normalize_match_text(plabel)
+                # Tolère un forçage par ID technique ou par référence/titre lisible.
+                if pid == forced_project_id or forced_norm == pref_norm or forced_norm == plabel_norm or (forced_norm and (forced_norm in pref_norm or forced_norm in plabel_norm)):
+                    matched = {
+                        "project_id": pid,
+                        "project_reference": pref,
+                        "match_score": 100,
+                        "matched_on": "forced_project_id",
+                        "match_reasons": ["forced_project_id"],
+                        "match_warning": None,
+                        "metronome_context": self._get_metronome_match_context(project_name, affaire_id=affaire_id),
+                    }
+                    self._last_match_debug = {
+                        "input_project_name": project_name,
+                        "forced_project_id": forced_project_id,
+                        "metronome_context": matched.get("metronome_context"),
+                        "top_candidates": [matched],
+                    }
+                    break
+
+        if not matched:
+            matched = self.find_best_boond_project_match(project_name, boond_projects_for_match, affaire_id=affaire_id, context_hint=context_hint)
+
+        if not matched:
+            return {
+                "input_project_name": project_name,
+                "matched_project": None,
+                "totals": {
+                    "total_days": 0.0,
+                    "average_daily_rate": None,
+                    "total_cost": None,
+                    "cost_status": "missing",
+                    "cost_source": "none",
+                    "margin_production_ht": None,
+                    "profitability_production": None,
+                    "turnover_production_ht": None,
+                },
+                "by_month": [],
+                "resources_imputation": [],
+                "meta": index.get("meta", {}),
+                "match_debug": self._last_match_debug,
+                "message": "Aucun projet BOOND correspondant trouvé.",
+                "selection": {"forced_project_id": forced_project_id or None},
+                "project_options": project_options,
+            }
+
+        project_id = clean_text(matched.get("project_id"))
+
+        productivity_payload = {}
+        productivity_totals = {
+            "cost_production_ht": 0.0,
+            "cost_resources_ht": 0.0,
+            "margin_production_ht": 0.0,
+            "profitability_production": 0.0,
+            "turnover_production_ht": 0.0,
+            "rows": 0.0,
+        }
+        resources_table: List[Dict[str, Any]] = []
+        try:
+            productivity_payload = self.get_project_productivity(project_id, force_refresh=bool(refresh))
+            productivity_totals = self.extract_project_productivity_totals(productivity_payload)
+            resources_table = self.build_productivity_resource_table(productivity_payload)
+        except Exception:
+            pass
+
+        total_days = sum(clean_number(r.get("days")) for r in resources_table)
+        total_cost_val = clean_number(productivity_totals.get("cost_production_ht"))
+        total_cost_out = round(total_cost_val, 2) if total_cost_val > 0 else None
+        average_daily_rate = (total_cost_val / total_days) if total_days > 0 and total_cost_val > 0 else None
+
+        if total_cost_val > 0:
+            cost_status = "boond_productivity"
+            cost_source = "projects_productivity"
+            message = "Coût global issu de la productivité projet BOOND"
+        else:
+            cost_status = "missing"
+            cost_source = "none"
+            message = "Coût global BOOND indisponible sur la productivité projet"
+
+        return {
+            "input_project_name": project_name,
+            "matched_project": matched,
+            "totals": {
+                "total_days": round(total_days, 2),
+                "average_daily_rate": round(average_daily_rate, 2) if average_daily_rate is not None else None,
+                "total_cost": total_cost_out,
+                "cost_status": cost_status,
+                "cost_source": cost_source,
+                "margin_production_ht": round(clean_number(productivity_totals.get("margin_production_ht")), 2) if clean_number(productivity_totals.get("margin_production_ht")) != 0 else None,
+                "profitability_production": round(clean_number(productivity_totals.get("profitability_production")), 2) if clean_number(productivity_totals.get("profitability_production")) != 0 else None,
+                "turnover_production_ht": round(clean_number(productivity_totals.get("turnover_production_ht")), 2) if clean_number(productivity_totals.get("turnover_production_ht")) != 0 else None,
+                "rows": round(clean_number(productivity_totals.get("rows")), 2) if clean_number(productivity_totals.get("rows")) != 0 else None,
+            },
+            "by_month": [],
+            "resources_imputation": [
+                {
+                    "resource_id": r.get("resource_id"),
+                    "resource_name": r.get("resource_name"),
+                    "days": r.get("days"),
+                    "expenses": r.get("expenses"),
+                    "turnover_ht": r.get("turnover_ht"),
+                    "cost": r.get("cost_ht"),
+                    "cost_ht": r.get("cost_ht"),
+                }
+                for r in resources_table
+            ],
+            "meta": {**(index.get("meta", {}) or {}), "productivity_delivery_rows": len((productivity_payload.get("data") or [])) if isinstance((productivity_payload.get("data") or []), list) else 0},
+            "match_debug": self._last_match_debug,
+            "message": message,
+            "selection": {"forced_project_id": forced_project_id or None},
+            "project_options": project_options,
+        }
 
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
@@ -2099,6 +3606,7 @@ class PointageService:
 service = FinanceService(WORKBOOK_PATH, SHEET_NAME, CACHE_FILE)
 metronome_service = MetronomeService(METRONOME_BASE_PATH)
 pointage_service = PointageService(POINTAGE_STORE_FILE)
+boond_service = BoondService(BOOND_CACHE_DB_PATH)
 
 
 def pointage_finance_summary(affaire_id: str, commande_ht: float) -> Dict[str, float]:
@@ -2120,6 +3628,431 @@ def pointage_finance_summary(affaire_id: str, commande_ht: float) -> Dict[str, f
     }
 
 
+
+
+def boond_imputations_html() -> str:
+    return """<!doctype html>
+<html lang='fr'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>Imputation des temps</title>
+<style>
+body{font-family:Inter,Arial,sans-serif;background:#f5f7fb;margin:0;color:#122033}.wrap{max-width:980px;margin:24px auto;padding:0 16px}
+.card{background:#fff;border:1px solid #dfe5ef;border-radius:14px;padding:16px;margin-bottom:12px}.kpis{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.small{color:#6e7a90;font-size:13px}.value{font-size:30px;font-weight:800}.warn{padding:10px;border-radius:10px;background:#fff7ef;border:1px solid #f1d4a4}
+table{width:100%;border-collapse:collapse}th,td{padding:8px;border-bottom:1px solid #eef2f7;text-align:left}
+.bar{height:10px;background:#eef2f7;border-radius:999px;overflow:hidden}.fill{height:100%;background:#ef8d00}
+</style></head><body><div class='wrap'>
+<div class='card'><h2>Imputation des temps</h2><div id='state' class='small'>Chargement…</div></div>
+<div id='content' style='display:none'>
+<div class='card'><div class='small'>Projet METRONOME</div><div id='inputName'></div><div class='small' style='margin-top:6px'>Projet BOOND matché</div><div id='matched'></div><div id='matchDetails' class='small' style='margin-top:8px'></div></div>
+<div class='card kpis'><div><div class='small'>Jours imputés cumulés</div><div id='kpiDays' class='value'>-</div></div><div><div class='small'>Coût cumulé</div><div id='kpiCost' class='value'>-</div><div id='costSubtext' class='small'></div><div id='costMeta' class='small'></div></div></div>
+<div id='warning' class='card warn' style='display:none'></div>
+<div class='card'><h3>Répartition mensuelle</h3><div id='chart'></div><div id='table'></div></div>
+</div></div>
+<script>
+function esc(v){return String(v??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]||c));}
+function fmt(v){const n=Number(v||0);return n.toLocaleString('fr-FR',{maximumFractionDigits:2});}
+(async function(){
+  const params=new URLSearchParams(location.search); const project=params.get('project_name')||'';
+  const state=document.getElementById('state'); const content=document.getElementById('content');
+  if(!project){state.textContent='Paramètre project_name manquant.';return;}
+  try{
+    const r=await fetch('/api/boond/imputations/by-project?project_name='+encodeURIComponent(project));
+    const d=await r.json(); if(!r.ok) throw new Error(d.detail||'Erreur API');
+    state.style.display='none'; content.style.display='block';
+    document.getElementById('inputName').textContent=d.input_project_name||'-';
+    if(!d.matched_project){document.getElementById('matched').textContent='Aucun match BOOND';document.getElementById('kpiDays').textContent='0';document.getElementById('kpiCost').textContent='-';const top=((d.match_debug||{}).top_candidates||[]).slice(0,3);document.getElementById('matchDetails').innerHTML=top.length?`Suggestions: <ul>${top.map(c=>`<li>${esc(c.project_reference)} (score ${c.match_score})</li>`).join('')}</ul>`:'Aucun candidat pertinent';return;}
+    document.getElementById('matched').textContent=`${d.matched_project.project_reference} (score ${d.matched_project.match_score})`;const reasons=(d.matched_project.match_reasons||[]);document.getElementById('matchDetails').innerHTML=reasons.length?`Raisons: ${reasons.map(esc).join(', ')}`:'';
+    document.getElementById('kpiDays').textContent=fmt(d.totals.total_days);
+    document.getElementById('kpiCost').textContent=d.totals.total_cost==null?'Indisponible':fmt(d.totals.total_cost)+' €';
+    document.getElementById('costSubtext').textContent='Coût global issu de la productivité projet BOOND';
+    const meta=[];
+    if(d.totals.average_daily_rate!=null){meta.push(`Taux moyen: ${fmt(d.totals.average_daily_rate)} €/j`);}
+    if(d.totals.margin_production_ht!=null){meta.push(`Marge: ${fmt(d.totals.margin_production_ht)} €`);}
+    if(d.totals.profitability_production!=null){meta.push(`Rentabilité: ${fmt(d.totals.profitability_production)}%`);}
+    document.getElementById('costMeta').textContent=meta.join(' | ');
+    const warning=document.getElementById('warning');
+    if(d.totals.cost_status==='missing'){
+      warning.style.display='block';
+      warning.textContent=d.message||'Coût global BOOND indisponible.';
+    }
+
+    const rows=d.by_month||[]; const max=Math.max(1,...rows.map(x=>Number(x.days||0)));
+    document.getElementById('chart').innerHTML=rows.map(x=>`<div style='margin:8px 0'><div class='small'>${esc(x.month)} — ${fmt(x.days)} j</div><div class='bar'><div class='fill' style='width:${(Number(x.days||0)/max)*100}%'></div></div></div>`).join('')||"<div class='small'>Aucune donnée mensuelle</div>";
+    document.getElementById('table').innerHTML=rows.length?`<table><thead><tr><th>Mois</th><th>Jours</th><th>Coût</th></tr></thead><tbody>${rows.map(x=>`<tr><td>${esc(x.month)}</td><td>${fmt(x.days)}</td><td>${x.cost==null?'-':fmt(x.cost)+' €'}</td></tr>`).join('')}</tbody></table>`:"";
+  }catch(e){state.textContent=e.message||'Erreur';}
+})();
+</script></body></html>"""
+
+
+@app.get("/api/boond/imputations/by-project", response_class=JSONResponse)
+def api_boond_imputation_by_project(project_name: str = Query(...), refresh: bool = Query(default=False), affaire_id: str = Query(default=""), affaire: str = Query(default=""), numero: str = Query(default=""), client: str = Query(default=""), display_name: str = Query(default=""), boond_project_id: str = Query(default="")):
+    pname = clean_text(project_name)
+    if not pname:
+        raise HTTPException(status_code=400, detail="project_name obligatoire")
+    try:
+        return boond_service.get_project_imputation_summary(project_name=pname, refresh=bool(refresh), affaire_id=clean_text(affaire_id), context_hint={"affaire": clean_text(affaire), "numero": clean_text(numero), "client": clean_text(client), "display_name": clean_text(display_name)}, boond_project_id=clean_text(boond_project_id))
+    except RuntimeError as exc:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "input_project_name": pname,
+                "matched_project": None,
+                "totals": {
+                    "total_days": 0.0,
+                    "average_daily_rate": None,
+                    "total_cost": None,
+                    "cost_status": "missing",
+                    "cost_source": "none",
+                    "margin_production_ht": None,
+                    "profitability_production": None,
+                    "turnover_production_ht": None,
+                },
+                "by_month": [],
+                "meta": {"error": str(exc), "generated_at": now_iso()},
+                "message": "Impossible de charger BOOND pour le moment.",
+            },
+        )
+
+
+@app.get("/api/boond/debug/projects", response_class=JSONResponse)
+def api_boond_debug_projects():
+    projects = boond_service.get_all_boond_projects()
+    return {
+        "total_projects_returned": len(projects),
+        "sample_ids": [p.get("id") for p in projects[:20]],
+    }
+
+
+@app.get("/api/boond/debug/projects/search", response_class=JSONResponse)
+def api_boond_debug_projects_search(q: str):
+    items = boond_service.get_all_boond_projects()
+    needle = q.strip().lower()
+
+    matches = []
+    for item in items:
+        attrs = item.get("attributes", {}) or {}
+        reference = str(attrs.get("reference") or "")
+        title = str(attrs.get("title") or "")
+        name = str(attrs.get("name") or "")
+        blob = f"{reference} {title} {name}".lower()
+
+        if needle in blob:
+            matches.append({
+                "id": item.get("id"),
+                "type": item.get("type"),
+                "reference": reference,
+                "title": title,
+                "name": name,
+            })
+
+    return {
+        "query": q,
+        "count": len(matches),
+        "matches": matches[:100],
+    }
+
+
+@app.get("/api/boond/debug/resources/search", response_class=JSONResponse)
+def api_boond_debug_resources_search(q: str):
+    items = boond_service.get_all_boond_resources()
+    needle = clean_text(q).lower()
+
+    matches = []
+    for item in items:
+        attrs = item.get("attributes", {}) or {}
+        first_name = str(attrs.get("firstName") or "")
+        last_name = str(attrs.get("lastName") or "")
+        name = str(attrs.get("name") or "")
+        blob = f"{first_name} {last_name} {name}".lower()
+        if needle and needle not in blob:
+            continue
+        matches.append({
+            "id": item.get("id"),
+            "type": item.get("type"),
+            "first_name": first_name,
+            "last_name": last_name,
+            "name": name,
+            "attributes": attrs,
+        })
+
+    return {
+        "query": q,
+        "count": len(matches),
+        "matches": matches[:50],
+    }
+
+
+@app.get("/api/boond/debug/resource/{resource_id}", response_class=JSONResponse)
+def api_boond_debug_resource(resource_id: str):
+    resource = boond_service.boond_get(f"/resources/{resource_id}")
+    return resource
+
+
+@app.get("/api/boond/debug/resource/{resource_id}/rates", response_class=JSONResponse)
+def api_boond_debug_resource_rates(resource_id: str):
+    try:
+        rates = boond_service.boond_get(f"/resources/{resource_id}/rates")
+        return rates
+    except Exception as exc:
+        return {"resource_id": resource_id, "error": str(exc)}
+
+
+@app.get("/api/boond/debug/delivery/{delivery_id}", response_class=JSONResponse)
+def api_boond_debug_delivery(delivery_id: str):
+    delivery = boond_service.boond_get(f"/deliveries/{delivery_id}")
+    return delivery
+
+
+@app.get("/api/boond/debug/times-report/{times_report_id}", response_class=JSONResponse)
+def api_boond_debug_times_report(times_report_id: str):
+    payload, _ = boond_service.get_times_report_cached(times_report_id, ttl_seconds=300)
+    return payload
+
+
+@app.get("/api/boond/debug/project-productivity/{project_id}", response_class=JSONResponse)
+def api_boond_debug_project_productivity(project_id: str, refresh: bool = False):
+    payload = boond_service.get_project_productivity(project_id, force_refresh=bool(refresh))
+    totals = boond_service.extract_project_productivity_totals(payload)
+    return {
+        "project_id": project_id,
+        "totals": totals,
+        "raw": payload,
+    }
+
+
+@app.get("/api/boond/debug/project-resource-table/{project_id}", response_class=JSONResponse)
+def api_boond_debug_project_resource_table(project_id: str, refresh: bool = False):
+    payload = boond_service.get_project_productivity(project_id, force_refresh=bool(refresh))
+    rows = boond_service.build_productivity_resource_table(payload)
+    return rows
+
+
+@app.get("/api/boond/debug/project-cost-path", response_class=JSONResponse)
+def api_boond_debug_project_cost_path(project_name: str, affaire_id: str = "", affaire: str = "", numero: str = "", client: str = "", display_name: str = ""):
+    catalog = boond_service.get_all_boond_projects()
+    boond_projects_for_match: List[Dict[str, Any]] = []
+    for item in catalog:
+        attrs = item.get("attributes", {}) or {}
+        boond_projects_for_match.append({
+            "project_id": clean_text(item.get("id")),
+            "project_reference": clean_text(attrs.get("reference") or attrs.get("title") or attrs.get("name")),
+        })
+
+    matched = boond_service.find_best_boond_project_match(project_name, boond_projects_for_match, affaire_id=clean_text(affaire_id), context_hint={"affaire": clean_text(affaire), "numero": clean_text(numero), "client": clean_text(client), "display_name": clean_text(display_name)})
+    if not matched:
+        return {
+            "input_project_name": project_name,
+            "matched_project": None,
+            "sample_rows": [],
+        }
+
+    rows = boond_service.get_project_workplaces_times(clean_text(matched.get("project_id")))
+    sample_rows = []
+    for row in rows[:5]:
+        attrs = row.get("attributes", {}) or {}
+        rel = row.get("relationships", {}) or {}
+        tr_id = clean_text((((rel.get("timesReport") or {}).get("data") or {}).get("id")))
+        tr_ctx = {"resource_id": "", "delivery_id": "", "project_id": ""}
+        if tr_id:
+            payload, _ = boond_service.get_times_report_cached(tr_id, ttl_seconds=300)
+            tr_ctx = boond_service._extract_times_report_context(payload)
+
+        sample_rows.append({
+            "duration": attrs.get("duration"),
+            "start_date": attrs.get("startDate"),
+            "times_report_id": tr_id,
+            "resource_id": boond_service._extract_resource_id_from_workplace_time(row) or tr_ctx.get("resource_id"),
+            "delivery_id": tr_ctx.get("delivery_id"),
+            "project_id": tr_ctx.get("project_id") or clean_text(matched.get("project_id")),
+        })
+
+    return {
+        "input_project_name": project_name,
+        "matched_project": matched,
+        "sample_rows": sample_rows,
+    }
+
+
+@app.get("/api/boond/debug/line-cost", response_class=JSONResponse)
+def api_boond_debug_line_cost(times_report_id: str, work_date: str, duration: float, refresh: bool = False):
+    return boond_service.resolve_line_cost_from_positioning(
+        times_report_id=times_report_id,
+        work_date=work_date,
+        duration=duration,
+        force_refresh=bool(refresh),
+    )
+
+
+@app.get("/api/boond/debug/positioning-project-links/{positioning_id}", response_class=JSONResponse)
+def api_boond_debug_positioning_project_links(positioning_id: str):
+    payload = boond_service.boond_get(f"/positionings/{positioning_id}")
+    data = payload.get("data") or {}
+    rel = data.get("relationships") or {}
+    attrs = data.get("attributes") or {}
+
+    return {
+        "positioning_id": positioning_id,
+        "startDate": attrs.get("startDate"),
+        "endDate": attrs.get("endDate"),
+        "averageDailyCost": attrs.get("averageDailyCost"),
+        "project_rel": ((rel.get("project") or {}).get("data")),
+        "opportunity_rel": ((rel.get("opportunity") or {}).get("data")),
+        "dependsOn_rel": ((rel.get("dependsOn") or {}).get("data")),
+        "all_relationship_keys": list(rel.keys()),
+    }
+
+
+@app.get("/api/boond/debug/positioning-match-check", response_class=JSONResponse)
+def api_boond_debug_positioning_match_check(positioning_id: str, project_id: str):
+    payload = boond_service.boond_get(f"/positionings/{positioning_id}")
+    data = payload.get("data") or {}
+    rel = data.get("relationships") or {}
+
+    project_rel = ((rel.get("project") or {}).get("data")) or {}
+    opportunity_rel = ((rel.get("opportunity") or {}).get("data")) or {}
+
+    project_rel_id = str(project_rel.get("id") or "")
+    opportunity_rel_id = str(opportunity_rel.get("id") or "")
+
+    return {
+        "positioning_id": positioning_id,
+        "input_project_id": str(project_id),
+        "project_rel_id": project_rel_id,
+        "opportunity_rel_id": opportunity_rel_id,
+        "note": "No project/opportunity equality check is used in cost computation; active positioning is selected by resource + date only.",
+    }
+
+
+@app.get("/api/boond/debug/positionings-covering-date", response_class=JSONResponse)
+def api_boond_debug_positionings_covering_date(resource_id: str, work_date: str, refresh: bool = False):
+    items = boond_service.get_all_resource_positionings(resource_id, force_refresh=bool(refresh))
+
+    results = []
+    for item in items:
+        pos_id = str(item.get("id") or "")
+        if not pos_id:
+            continue
+
+        try:
+            detail = boond_service.boond_get(f"/positionings/{pos_id}")
+        except Exception:
+            continue
+
+        data = detail.get("data") or {}
+        attrs = data.get("attributes") or {}
+
+        start = str(attrs.get("startDate") or "")
+        end = str(attrs.get("endDate") or "")
+        avg = attrs.get("averageDailyCost")
+
+        is_active = True
+        if start and work_date < start:
+            is_active = False
+        if end and work_date > end:
+            is_active = False
+
+        results.append({
+            "positioning_id": pos_id,
+            "startDate": start,
+            "endDate": end,
+            "averageDailyCost": avg,
+            "is_active_for_date": is_active,
+        })
+
+    results.sort(key=lambda x: x["startDate"] or "")
+    return {
+        "resource_id": resource_id,
+        "work_date": work_date,
+        "count": len(results),
+        "items": results,
+    }
+
+
+@app.get("/api/boond/debug/line-cost-window", response_class=JSONResponse)
+def api_boond_debug_line_cost_window(times_report_id: str, work_date: str, refresh: bool = False):
+    tr_payload, _ = boond_service.get_times_report_cached(times_report_id)
+    tr_data = tr_payload.get("data") or {}
+    tr_rel = tr_data.get("relationships") or {}
+    resource_id = str((((tr_rel.get("resource") or {}).get("data")) or {}).get("id") or "")
+
+    if not resource_id:
+        return {"error": "no_resource_id", "times_report_id": times_report_id}
+
+    items = boond_service.get_all_resource_positionings(resource_id, force_refresh=bool(refresh))
+
+    active = []
+    for item in items:
+        pos_id = str(item.get("id") or "")
+        if not pos_id:
+            continue
+
+        try:
+            detail = boond_service.boond_get(f"/positionings/{pos_id}")
+        except Exception:
+            continue
+
+        data = detail.get("data") or {}
+        attrs = data.get("attributes") or {}
+
+        start = str(attrs.get("startDate") or "")
+        end = str(attrs.get("endDate") or "")
+        avg = attrs.get("averageDailyCost")
+
+        if start and work_date < start:
+            continue
+        if end and work_date > end:
+            continue
+
+        active.append({
+            "positioning_id": pos_id,
+            "startDate": start,
+            "endDate": end,
+            "averageDailyCost": avg,
+        })
+
+    active.sort(key=lambda x: x["startDate"] or "", reverse=True)
+
+    return {
+        "times_report_id": times_report_id,
+        "work_date": work_date,
+        "resource_id": resource_id,
+        "active_positionings": active,
+    }
+
+
+@app.get("/api/boond/project-cumulative-cost/rebuild", response_class=JSONResponse)
+def api_boond_project_cumulative_cost_rebuild(project_id: str, term: str):
+    payload = boond_service.compute_project_cumulative_cost_from_existing_engine(project_id, term)
+    boond_service.set_cached_project_cumulative_cost(project_id, term, payload, ttl_seconds=21600)
+    return payload
+
+
+@app.get("/api/boond/project-cumulative-cost", response_class=JSONResponse)
+def api_boond_project_cumulative_cost(project_id: str, term: str):
+    cached = boond_service.get_cached_project_cumulative_cost(project_id, term)
+    if cached is None:
+        return {
+            "project_id": project_id,
+            "cost_status": "pending",
+            "total_cost": None,
+        }
+    return cached
+
+
+@app.get("/api/boond/debug/project-cumulative-cost", response_class=JSONResponse)
+def api_boond_debug_project_cumulative_cost(project_id: str, term: str):
+    return boond_service.compute_project_cumulative_cost_from_existing_engine(project_id, term)
+
+
+@app.get("/api/boond/debug/project-cost-summary", response_class=JSONResponse)
+def api_boond_debug_project_cost_summary(project_name: str, refresh: bool = False):
+    return boond_service.get_project_imputation_summary(project_name, refresh=refresh, affaire_id="")
+
+
+@app.get("/boond-imputations", response_class=HTMLResponse)
+def boond_imputations_page():
+    return HTMLResponse(boond_imputations_html())
+
 def landing_html() -> str:
     return """<!doctype html>
 <html lang='fr'>
@@ -2131,14 +4064,14 @@ def landing_html() -> str:
 :root{--panel:#fff;--line:#dfe5ef;--ink:#122033;--muted:#6e7a90;--accent:#ef8d00;--shadow:0 16px 48px rgba(18,32,51,.09)}
 *{box-sizing:border-box}body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:linear-gradient(180deg,#f5f7fb 0%,#eef2f7 100%);color:var(--ink)}
 .wrap{max-width:1260px;margin:30px auto 52px;padding:0 20px}.hero,.card{background:var(--panel);border:1px solid rgba(20,32,51,.05);border-radius:24px;box-shadow:var(--shadow)}
-.hero{padding:28px}.hero-top{display:flex;align-items:center;gap:16px}.logo{width:56px;height:56px;object-fit:contain;border-radius:10px;background:#fff7ef;border:1px solid #f8ddb4;padding:6px}
+.hero{padding:28px}.hero-top{display:flex;align-items:center;justify-content:space-between;gap:16px}.logo{width:96px;height:96px;object-fit:contain;border-radius:18px;background:#fff;border:1px solid var(--line);padding:14px;box-shadow:0 8px 20px rgba(18,32,51,.08)}
 .eyebrow{font-size:12px;font-weight:800;color:var(--accent);text-transform:uppercase;letter-spacing:.14em}h1{margin:8px 0 12px;font-size:44px;line-height:1.05}.sub{font-size:20px;color:var(--muted);max-width:930px}
 .selector{margin-top:22px;display:grid;grid-template-columns:2fr 1fr;gap:12px}.search{height:52px;border:1px solid var(--line);border-radius:14px;padding:0 14px;font-size:16px;width:100%}
 .badge{display:inline-flex;align-items:center;justify-content:center;padding:0 14px;height:52px;border-radius:14px;background:#f9fbff;color:#41547b;font-weight:700;border:1px solid var(--line)}
-.grid{margin-top:18px;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{padding:20px;display:flex;flex-direction:column;justify-content:space-between;min-height:220px}.card h3{margin:0;font-size:21px}.card p{margin:10px 0 18px;color:var(--muted);font-size:14px;min-height:44px}.card .btn{width:100%}
+.grid{margin-top:18px;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.card{padding:20px;display:flex;flex-direction:column;justify-content:space-between;min-height:220px}.card h3{margin:0;font-size:21px}.card p{margin:10px 0 18px;color:var(--muted);font-size:14px;min-height:44px}.card .btn{width:100%}
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;height:44px;padding:0 16px;border-radius:12px;text-decoration:none;border:none;font-weight:800;cursor:pointer}
 .btn.primary,.btn.dark{background:var(--accent);color:#fff}.btn.disabled{background:#ecf0f7;color:#8a94a8;cursor:not-allowed}
-.state{margin-top:14px;padding:14px 16px;border-radius:14px;background:#f8faff;border:1px solid var(--line);color:#4f5d78;font-weight:600}
+.state{margin-top:14px;padding:14px 16px;border-radius:14px;background:#f8faff;border:1px solid var(--line);color:#4f5d78;font-weight:600}.hero-top a{display:inline-flex;text-decoration:none}
 @media (max-width:980px){.grid{grid-template-columns:repeat(2,1fr)}.selector{grid-template-columns:1fr}}@media (max-width:640px){h1{font-size:34px}.grid{grid-template-columns:1fr}}
 </style>
 </head>
@@ -2146,8 +4079,8 @@ def landing_html() -> str:
   <div class='wrap'>
     <section class='hero'>
       <div class='hero-top'>
-        <img class='logo' src='/assets/logo-tempo' alt='Logo Tempo'>
-        <div><div class='eyebrow'>Gestion affaire</div><h1>Accueil multiprojets</h1></div>
+        <div><div class='eyebrow'>Gestion affaire</div><h1>Gestion d'affaires</h1></div>
+        <a href='/' aria-label='Retour accueil'><img class='logo' src='/assets/logo-tempo' alt='Logo Tempo'></a>
       </div>
       <div class='sub'>Choisissez une affaire en saisissant ses premières lettres, puis accédez directement aux modules disponibles.</div>
       <div class='selector'>
@@ -2161,21 +4094,20 @@ def landing_html() -> str:
     <section class='grid'>
       <article class='card'>
         <h3>Tableau de bord</h3><p>Porte d'entrée de pilotage de l'affaire.</p>
-        <a id='dashboardLink' class='btn disabled' href='javascript:void(0)' aria-disabled='true'>Ouvrir le tableau de bord</a>
+        <a id='dashboardLink' class='btn disabled' href='javascript:void(0)' aria-disabled='true'>Ouvrir</a>
       </article>
       <article class='card'>
         <h3>Finances</h3><p>Cockpit financier détaillé de l'affaire.</p>
-        <a id='financeLink' class='btn disabled' href='javascript:void(0)' aria-disabled='true'>Ouvrir Finances</a>
+        <a id='financeLink' class='btn disabled' href='javascript:void(0)' aria-disabled='true'>Ouvrir</a>
       </article>
       <article class='card'><h3>Gestion de projet</h3><p>Planification, jalons et coordination.</p><a id='pmLink' class='btn disabled' href='javascript:void(0)' aria-disabled='true'>Ouvrir</a></article>
-      <article class='card'><h3>Imputation</h3><p>Suivi des temps et affectations.</p><button class='btn disabled' disabled>Ouvrir</button></article>
     </section>
   </div>
 <script>
 const state={projects:[],selectedId:'',selectedLabel:''};
 function esc(v){return String(v||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
 function setModuleLink(id,base){const el=document.getElementById(id);if(state.selectedId){el.className='btn primary';el.href=`/${base}?affaire_id=${encodeURIComponent(state.selectedId)}`;el.removeAttribute('aria-disabled');}else{el.className='btn disabled';el.href='javascript:void(0)';el.setAttribute('aria-disabled','true');}}
-function updateUi(){document.getElementById('projectBadge').textContent=state.selectedLabel?`Affaire : ${state.selectedLabel}`:'Aucune affaire sélectionnée';document.getElementById('state').textContent=state.selectedLabel?`Vous naviguez sur l'affaire ${state.selectedLabel}.`:'Sélectionnez une affaire pour activer les modules.';setModuleLink('financeLink','finance');setModuleLink('dashboardLink','dashboard');setModuleLink('pmLink','gestion-projet');if(state.selectedId){localStorage.setItem('selectedAffaireId',state.selectedId);} }
+function updateUi(){document.getElementById('projectBadge').textContent=state.selectedLabel?`Affaire : ${state.selectedLabel}`:'Aucune affaire sélectionnée';document.getElementById('state').textContent=state.selectedLabel?`Vous naviguez sur l'affaire ${state.selectedLabel}.`:'Sélectionnez une affaire pour activer les modules.';setModuleLink('financeLink','finance');setModuleLink('dashboardLink','dashboard');setModuleLink('pmLink','gestion-projet');if(state.selectedId){localStorage.setItem('selectedAffaireId',state.selectedId);}else{localStorage.removeItem('selectedAffaireId');}}
 async function loadProjects(){try{const res=await fetch('/api/finance/affaires');const data=await res.json();state.projects=(data.items||[]).map(x=>({id:x.affaire_id,label:x.display_name})).filter(x=>x.id&&x.label).sort((a,b)=>a.label.localeCompare(b.label,'fr'));}catch(_){state.projects=[];}
 const list=document.getElementById('projectList');list.innerHTML=state.projects.map(p=>`<option value="${esc(p.label)}"></option>`).join('');const savedId=localStorage.getItem('selectedAffaireId')||'';const selected=state.projects.find(x=>x.id===savedId);if(selected){state.selectedId=selected.id;state.selectedLabel=selected.label;document.getElementById('projectSearch').value=selected.label;}updateUi();}
 document.getElementById('projectSearch').addEventListener('input',ev=>{const q=(ev.target.value||'').trim().toLowerCase();const selected=state.projects.find(p=>p.label.toLowerCase()===q)||state.projects.find(p=>p.label.toLowerCase().startsWith(q));state.selectedId=selected?.id||'';state.selectedLabel=selected?.label||'';updateUi();});
@@ -2198,37 +4130,41 @@ def finance_html() -> str:
 :root{--bg:#eef2f7;--panel:#fff;--panel2:#f7f9fc;--line:#dfe5ef;--ink:#122033;--muted:#6e7a90;--blue:#ef8d00;--green:#1d9a5b;--amber:#c48716;--red:#c84c4c;--shadow:0 14px 40px rgba(19,31,53,.08)}
 *{box-sizing:border-box}body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:linear-gradient(180deg,#f5f7fb 0%,#eef2f7 100%);color:var(--ink)}
 .container{max-width:1440px;margin:22px auto 36px;padding:0 18px}.topbar,.hero,.section,.kpis{background:var(--panel);border:1px solid rgba(22,34,51,.04);box-shadow:var(--shadow);border-radius:24px}
-.topbar{display:flex;gap:16px;align-items:center;padding:18px 20px;position:sticky;top:14px;z-index:10}.brand{min-width:200px}.brand h1{margin:0;font-size:36px;line-height:1}.brand p{margin:6px 0 0;color:var(--muted);font-size:14px}
-.controls{display:flex;gap:12px;align-items:center;flex:1;flex-wrap:wrap}.search,.select{height:48px;border-radius:14px;border:1px solid var(--line);background:#fff;padding:0 14px;color:var(--ink);font-size:15px}.search{min-width:280px;flex:1}.select{min-width:340px;flex:1}
-.btn{height:48px;border:none;border-radius:14px;padding:0 16px;font-weight:700;cursor:pointer}.btn.primary{background:var(--blue);color:#fff}.btn.dark{background:#ef8d00;color:#fff}
+.topbar{display:grid;grid-template-columns:auto 1fr;gap:14px;align-items:start;padding:16px 18px;background:rgba(255,255,255,.96);backdrop-filter:blur(6px)}.logo-link{display:inline-flex;text-decoration:none}.brand-mini{display:inline-flex;align-items:center;justify-content:center;width:78px;height:78px;border:1px solid var(--line);border-radius:16px;background:#fff;box-shadow:0 8px 20px rgba(18,32,51,.08)}.brand-mini img{width:48px;height:48px;object-fit:contain}
+.controls{display:flex;flex-direction:column;gap:10px;flex:1}.menu-row,.project-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.search,.select{height:48px;border-radius:14px;border:1px solid var(--line);background:#fff;padding:0 14px;color:var(--ink);font-size:15px}.search{min-width:260px;flex:1}.select{min-width:300px;flex:1}
+.btn{height:44px;border:none;border-radius:12px;padding:0 14px;background:var(--accent);color:#fff;font-weight:800;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center}.btn:disabled{opacity:.65;cursor:not-allowed}
 .badge{display:inline-flex;align-items:center;gap:8px;padding:10px 12px;border-radius:999px;background:var(--panel2);color:var(--muted);font-size:13px;font-weight:700}.dot{width:10px;height:10px;border-radius:50%}.dot.ready{background:var(--green)}.dot.building{background:var(--amber)}.dot.error{background:var(--red)}.dot.idle{background:#9aa6b8}
-.hero{margin-top:18px;padding:26px 28px}.hero-top{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap}.hero h2{margin:8px 0 4px;font-size:42px;line-height:1.02}.eyebrow{font-size:12px;font-weight:800;color:var(--blue);letter-spacing:.14em;text-transform:uppercase}
-.meta-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin-top:18px}.meta-pill{background:var(--panel2);border:1px solid var(--line);border-radius:18px;padding:14px 16px}.meta-pill .label{font-size:12px;color:var(--muted);text-transform:uppercase;font-weight:800;letter-spacing:.08em}.meta-pill .value{margin-top:6px;font-size:16px;font-weight:700}
+.hero{margin-top:18px;padding:26px 28px}.hero-top{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap}.hero h2{margin:8px 0 4px;font-size:42px;line-height:1.02}.eyebrow{font-size:12px;font-weight:800;color:var(--blue);letter-spacing:.14em;text-transform:uppercase}.hero-side{display:flex;align-items:center;gap:12px}.hero-logo{width:88px;height:88px;border-radius:16px;background:#fff;border:1px solid var(--line);padding:14px;box-shadow:0 8px 20px rgba(18,32,51,.08);object-fit:contain}
+.meta-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:18px}.meta-pill{background:var(--panel2);border:1px solid var(--line);border-radius:18px;padding:14px 16px}.meta-pill .label{font-size:12px;color:var(--muted);text-transform:uppercase;font-weight:800;letter-spacing:.08em}.meta-pill .value{margin-top:6px;font-size:16px;font-weight:700}
 .health{padding:10px 14px;border-radius:999px;font-size:13px;font-weight:800}.health.ok{background:#eaf8f0;color:var(--green)}.health.warn{background:#fff6e6;color:var(--amber)}.health.bad{background:#fff0f0;color:var(--red)}
-.kpis{margin-top:18px;padding:16px}.kpi-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:14px}.kpi{background:linear-gradient(180deg,#fff,#f8faff);border:1px solid var(--line);border-radius:20px;padding:18px;min-height:132px}.kpi .label{font-size:13px;color:var(--muted);font-weight:800;text-transform:uppercase;letter-spacing:.06em}.kpi .value{margin-top:10px;font-size:34px;font-weight:800;line-height:1}.kpi .sub{margin-top:10px;font-size:13px;color:var(--muted)}
+.kpis{margin-top:18px;padding:16px}.kpi-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.kpi{background:linear-gradient(180deg,#fff,#f8faff);border:1px solid var(--line);border-radius:20px;padding:18px;min-height:132px}.kpi .label{font-size:13px;color:var(--muted);font-weight:800;text-transform:uppercase;letter-spacing:.06em}.kpi .value{margin-top:10px;font-size:34px;font-weight:800;line-height:1}.kpi .sub{margin-top:10px;font-size:13px;color:var(--muted)}
 .kpi.good{background:linear-gradient(180deg,#ffffff,#ebf9f1);border-color:#8fd5b0}.kpi.warn{background:linear-gradient(180deg,#ffffff,#fff4e1);border-color:#f1c171}.kpi.bad{background:linear-gradient(180deg,#ffffff,#ffe9e9);border-color:#ee9a9a}.prod-pilot{margin-top:14px;border:1px solid #d7e1ef;border-radius:18px;padding:16px;background:linear-gradient(180deg,#ffffff,#f7faff)}.prod-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.prod-card{border:1px solid #dbe4f2;border-radius:14px;padding:14px;background:#fff}.prod-card .t{font-size:12px;color:#5f6f88;font-weight:800;text-transform:uppercase;letter-spacing:.06em}.prod-card .v{margin-top:8px;font-size:30px;font-weight:900}.prod-card .s{margin-top:6px;font-size:13px;color:#6e7a90}.prod-card.future{background:linear-gradient(180deg,#fff,#f3f7ff)}
 .layout{display:grid;grid-template-columns:1fr;gap:18px;margin-top:18px}.section{padding:18px 18px 22px}.section h3{margin:0 0 14px;font-size:24px}
 .chart-card{min-height:560px}.chart-wrap{height:340px;border-radius:18px;background:linear-gradient(180deg,#fbfcff 0%,#f4f7fd 100%);border:1px solid #d5deec;padding:16px}.cum-wrap{margin-top:14px;padding:16px;border:1px solid #d5deec;border-radius:16px;background:linear-gradient(180deg,#ffffff 0%,#f8fbff 100%)}.cum-title{margin:0 0 10px;font-size:16px;font-weight:900}.cum-row{display:grid;grid-template-columns:200px 1fr 130px;gap:12px;align-items:center;margin:10px 0}.cum-track{height:12px;background:#e7edf7;border-radius:999px;overflow:hidden}.cum-fill{height:100%}.cum-pre{background:#a6bbe6}.cum-fac{background:#ef8d00}
 .legend{display:flex;gap:18px;align-items:center;font-size:13px;color:var(--muted);font-weight:700;margin-top:10px}.legend span{display:inline-flex;align-items:center;gap:8px}.swatch{display:inline-block;width:14px;height:14px;border-radius:4px}
-.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:18px}table{width:100%;border-collapse:collapse}th,td{padding:14px;border-bottom:1px solid var(--line);font-size:14px;text-align:left}th{background:#f7f9fc;color:#536079;font-size:12px;text-transform:uppercase;letter-spacing:.08em}tr:last-child td{border-bottom:none}td.num{text-align:right;font-variant-numeric:tabular-nums}
+.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:18px}table{width:100%;border-collapse:collapse}th,td{padding:14px;border-bottom:1px solid var(--line);border-right:1px solid #e8edf5;font-size:14px;text-align:left}th:last-child,td:last-child{border-right:none}th{background:#f7f9fc;color:#536079;font-size:12px;text-transform:uppercase;letter-spacing:.08em}tr:last-child td{border-bottom:none}td.num{text-align:right;font-variant-numeric:tabular-nums}
 .delta.pos{color:var(--green);font-weight:800}.delta.neg{color:var(--red);font-weight:800}.insights{display:flex;flex-wrap:wrap;gap:10px}.insight{padding:12px 14px;border-radius:16px;font-size:14px;font-weight:700;border:1px solid var(--line);background:var(--panel2)}
 .notice{padding:14px 16px;border-radius:16px;background:#fff7e7;color:#8c6211;border:1px solid #f0dcab}.error{padding:14px 16px;border-radius:16px;background:#fff0f0;color:#992f2f;border:1px solid #f1c6c6}.empty{padding:28px;border:1px dashed var(--line);border-radius:18px;color:var(--muted);text-align:center;background:#fafbfd}.small{font-size:13px;color:var(--muted)}.footer-row{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-top:12px}
-@media (max-width:1200px){.kpi-grid{grid-template-columns:repeat(2,1fr)}.prod-grid{grid-template-columns:repeat(2,1fr)}.layout{grid-template-columns:1fr}.meta-grid{grid-template-columns:repeat(2,1fr)}}@media (max-width:720px){.topbar{position:static}.kpi-grid{grid-template-columns:1fr}.prod-grid{grid-template-columns:1fr}.meta-grid{grid-template-columns:1fr}.hero h2{font-size:30px}.select,.search{min-width:100%}}
+@media (max-width:1200px){.kpi-grid{grid-template-columns:repeat(2,1fr)}.prod-grid{grid-template-columns:repeat(2,1fr)}.layout{grid-template-columns:1fr}.meta-grid{grid-template-columns:repeat(2,1fr)}}@media (max-width:720px){.topbar{grid-template-columns:1fr}.menu-row,.project-row{flex-direction:column;align-items:stretch}.kpi-grid{grid-template-columns:1fr}.prod-grid{grid-template-columns:1fr}.meta-grid{grid-template-columns:1fr}.hero h2{font-size:30px}.select,.search{min-width:100%}}
 </style>
 </head>
 <body>
 <div class='container'>
   <div class='topbar'>
-    <div class='brand'><div class='eyebrow'>Gestion affaire</div><h1>Finance</h1><p>Cockpit financier par affaire</p></div>
+    <a class='logo-link' href='/' aria-label='Retour accueil'><div class='brand-mini'><img src='/assets/logo-tempo' alt='Logo Tempo'></div></a>
     <div class='controls'>
-      <input id='searchInput' class='search locked' type='search' placeholder='Projet verrouillé (changer depuis Accueil)' readonly>
-      <select id='affaireSelect' class='select locked' disabled><option value=''>Projet verrouillé</option></select>
-      <button id='reloadBtn' class='btn primary'>Reconstruire le cache</button>
-      <button id='exportBtn' class='btn dark' disabled>Exporter CSV</button>
-      <a id='pmBtn' class='btn dark' href='/gestion-projet'>Gestion de projet</a>
-      <a class='btn dark' href='/'>Accueil</a>
-      <a id='dashboardBtn' class='btn dark' href='/dashboard'>Tableau de bord</a>
-      <div id='cacheBadge' class='badge'><span class='dot idle'></span><span>Cache : attente</span></div>
+      <div class='menu-row'>
+        <a class='btn' href='/'>Accueil</a>
+        <a id='dashboardBtn' class='btn' href='/dashboard'>Tableau de bord</a>
+        <a id='pmBtn' class='btn' href='/gestion-projet'>Gestion de projet</a>
+        <button id='reloadBtn' class='btn'>Reconstruire le cache</button>
+        <button id='exportBtn' class='btn' disabled>Exporter CSV</button>
+        <div id='cacheBadge' class='badge'><span class='dot idle'></span><span>Cache : attente</span></div>
+      </div>
+      <div class='project-row'>
+        <input id='searchInput' class='search locked' type='search' placeholder='Projet verrouillé (changer depuis Accueil)' readonly>
+        <select id='affaireSelect' class='select locked' disabled><option value=''>Projet verrouillé</option></select>
+      </div>
     </div>
   </div>
 
@@ -2242,7 +4178,7 @@ def finance_html() -> str:
         <h2 id='heroTitle'>Sélectionnez une affaire</h2>
         <div id='heroSubtitle' class='small'>Le cockpit se remplit à partir du cache du tableau activité.</div>
       </div>
-      <div id='heroHealth' class='health warn'>En attente</div>
+      <div class='hero-side'><div id='heroHealth' class='health warn'>En attente</div><a class='logo-link' href='/' aria-label='Retour accueil'><img class='hero-logo' src='/assets/logo-tempo' alt='Logo Tempo'></a></div>
     </div>
     <div class='meta-grid'>
       <div class='meta-pill'><div class='label'>CLIENT</div><div class='value' id='metaClient'>-</div></div>
@@ -2255,20 +4191,23 @@ def finance_html() -> str:
 
 
   <div class='kpis'><div class='kpi-grid'>
-    <div class='kpi' id='kpiCommandeCard'><div class='label'>💰 Commandes achetées</div><div class='value' id='kpiCommande'>0 €</div><div class='sub'>Montant contractualisé</div></div>
-    <div class='kpi' id='kpiAnterioriteCard'><div class='label'>📚 Antériorité</div><div class='value' id='kpiAnteriorite'>0 €</div><div class='sub'>Somme G → M</div></div>
-    <div class='kpi' id='kpiFacture2026Card'><div class='label'>📈 Facturé 2026</div><div class='value' id='kpiFacture2026'>0 €</div><div class='sub'>Colonne N</div></div>
-    <div class='kpi' id='kpiFacturationTotaleCard'><div class='label'>🧾 Facturation totale</div><div class='value' id='kpiFacturationTotale'>0 €</div><div class='sub'>📚 Antériorité + 2026</div></div>
-    <div class='kpi' id='kpiResteCard'><div class='label'>⚠ Reste à facturer</div><div class='value' id='kpiReste'>0 €</div><div class='sub'>Solde estimé</div></div>
+    <div class='kpi' id='kpiCommandeCard'><div class='label'>💰 Commande</div><div class='value' id='kpiCommande'>0 €</div><div class='sub'>Montant contractualisé</div></div>
+    <div class='kpi' id='kpiFactureCard'><div class='label'>🧾 Facturé</div><div class='value' id='kpiFacture'>0 €</div><div class='sub'>Cumul facturé depuis le début</div></div>
+    <div class='kpi' id='kpiResteCard'><div class='label'>⚠ Reste à facturer</div><div class='value' id='kpiReste'>0 €</div><div class='sub'>Commande - facturé</div></div>
     <div class='kpi' id='kpiAvanceCard'><div class='label'>✅ Avancement financier</div><div class='value' id='kpiAvance'>0 %</div><div class='sub'>Facturé / commande</div></div>
   </div></div>
 
-  <div class='prod-pilot'><h3 style='margin:0 0 12px'>Pilotage production & rentabilité (préparation)</h3><div class='prod-grid'><div class='prod-card'><div class='t'>Avancement financier</div><div id='prodFinPct' class='v'>0 %</div><div class='s'>Facturation cumulée / commande</div></div><div class='prod-card'><div class='t'>Avancement production pointé</div><div id='prodPointagePct' class='v'>0 %</div><div class='s'>Pointage opérationnel (CST)</div></div><div class='prod-card'><div class='t'>Écart financier vs production</div><div id='prodGapPct' class='v'>0 pt</div><div id='prodGapEur' class='s'>0 €</div></div><div class='prod-card future'><div class='t'>Imputation & rentabilité</div><div class='v'>À venir</div><div class='s'>Tuile prête pour l'intégration des pointages ressources</div></div></div></div>
+  <div class='prod-pilot'><h3 style='margin:0 0 12px'>Pilotage production & rentabilité</h3><div class='prod-grid'><div class='prod-card'><div class='t'>Avancement financier</div><div id='prodFinPct' class='v'>0 %</div><div class='s'>Facturation cumulée / commande</div></div><div class='prod-card'><div class='t'>Avancement production pointé</div><div id='prodPointagePct' class='v'>0 %</div><div class='s'>Issue du pointage du planning</div></div><div class='prod-card'><div class='t'>Écart financier vs production</div><div id='prodGapPct' class='v'>0 pt</div><div id='prodGapEur' class='s'>0 €</div></div><div id='prodBoondRentabilityCard' class='prod-card future'><div class='t'>Rentabilité imputation BOOND</div><div id='prodBoondRentability' class='v'>-</div><div id='prodBoondRentabilitySub' class='s'>Facturé vs coût imputations ressources</div></div></div></div>
+
+  <div class='section'>
+    <h3>Imputation des temps (BOOND)</h3>
+    <div id='boondImputationBox' class='empty'>Sélectionnez une affaire pour charger le coût cumulé BOOND.</div>
+  </div>
 
   <div class='layout'>
     <div class='section chart-card'>
-      <h3>Facturation mensuelle 2026</h3>
-      <div class='chart-wrap'><svg id='monthlyChart' width='100%' height='100%' viewBox='0 0 980 320' preserveAspectRatio='none'></svg></div>
+      <h3>Facturation mensuelle</h3><div id='historicalBilling' class='small' style='margin:-2px 0 10px'>Historique facturé (années antérieures): -</div>
+      <div class='chart-wrap'><svg id='monthlyChart' width='100%' height='100%' viewBox='0 0 980 320' preserveAspectRatio='xMidYMid meet'></svg></div>
       <div class='legend'><span><i class='swatch' style='background:#dbe6ff'></i>Prévisionnel</span><span><i class='swatch' style='background:#ef8d00'></i>Facturation</span></div><div class='cum-wrap'><div class='cum-title'>Graphique cumulatif</div><div id='cumulativeChart'></div></div>
     </div>
   </div>
@@ -2284,11 +4223,12 @@ def finance_html() -> str:
 <script>
 const MONTHS=["janvier","fevrier","mars","avril","mai","juin","juillet","aout","septembre","octobre","novembre","decembre"];
 const MONTH_LABELS={"janvier":"Janv.","fevrier":"Févr.","mars":"Mars","avril":"Avr.","mai":"Mai","juin":"Juin","juillet":"Juil.","aout":"Août","septembre":"Sept.","octobre":"Oct.","novembre":"Nov.","decembre":"Déc."};
-const state={cacheStatus:null,affaires:[],selectedAffaireId:"",selectedAffaire:null,monthlyExpanded:false};
+const state={cacheStatus:null,affaires:[],selectedAffaireId:"",selectedAffaire:null,monthlyExpanded:false,boondImputation:null,boondForcedProjectId:"",boondProjectSearch:""};
 function euro(v){return new Intl.NumberFormat('fr-FR',{style:'currency',currency:'EUR',maximumFractionDigits:0}).format(Number(v||0));}
 function pct(v){return new Intl.NumberFormat('fr-FR',{style:'percent',maximumFractionDigits:1}).format(Number(v||0));}
 function fmt(v){return new Intl.NumberFormat('fr-FR',{maximumFractionDigits:0}).format(Number(v||0));}
 function esc(v){return String(v??'').replace(/[&<>]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[ch]||ch));}
+function boondOptionsHtml(b){const opts=(b&&b.project_options)||[];const q=String(state.boondProjectSearch||'').trim().toLowerCase();const visible=opts.filter(o=>{if(!q)return true;const txt=`${o.project_label||o.project_reference||''} ${o.project_id||''}`.toLowerCase();return txt.includes(q);});const current=String(state.boondForcedProjectId||(((b||{}).matched_project||{}).project_id||''));return [`<option value=''>-- Choisir un projet BOOND --</option>`].concat(visible.map(o=>`<option value='${esc(o.project_id)}' ${String(o.project_id)===current?'selected':''}>${esc(o.project_label||o.project_reference||o.project_id)} [${esc(String(o.project_id))}] (score ${esc(String(o.score||0))})</option>`)).join('');}
 function showError(msg){const b=document.getElementById('errorBox');b.textContent=msg||'Erreur';b.style.display='block';}
 function clearError(){document.getElementById('errorBox').style.display='none';}
 function showNotice(msg){const b=document.getElementById('noticeBox');b.textContent=msg||'';b.style.display=msg?'block':'none';}
@@ -2297,30 +4237,27 @@ async function api(url,options){const r=await fetch(url,options||{});const data=
 function healthClass(a){const reste=Number(a.reste_a_facturer||0),taux=Number(a.taux_avancement_financier||0);if(taux>=0.9)return{label:'Presque soldée',cls:'ok'};if(reste>0&&taux<0.35)return{label:'À surveiller',cls:'warn'};if(reste<0)return{label:'Incohérence à vérifier',cls:'bad'};return{label:'Stable',cls:'ok'};}
 async function loadCacheStatus(){const d=await api('/api/finance/cache-status');state.cacheStatus=d;const label=d.status==='ready'?`Cache prêt · ${d.affaires_count} affaires`:d.status==='building'?'Cache en reconstruction…':`Cache : ${d.status}`;setCacheBadge(d.status,label);document.getElementById('statusMeta').textContent=`${d.affaires_count||0} affaires · ${d.rows_kept||0} lignes utiles · ${d.generated_at||'pas encore généré'}`;}
 async function loadAffairesList(search=''){const d=await api(`/api/finance/affaires?search=${encodeURIComponent(search)}`);state.affaires=d.items||[];const sel=document.getElementById('affaireSelect');const prev=state.selectedAffaireId;sel.innerHTML=`<option value=''>Sélectionnez une affaire</option>`+state.affaires.map(x=>`<option value="${esc(x.affaire_id)}">${esc(x.display_name)}</option>`).join('');if(prev&&state.affaires.some(x=>x.affaire_id===prev)){sel.value=prev;}else{state.selectedAffaireId='';state.selectedAffaire=null;}showNotice(state.affaires.length?`${state.affaires.length} affaire(s) disponible(s)`:'Aucune affaire trouvée pour ce filtre.');}
-async function loadSelectedAffaire(id){if(!id){state.selectedAffaireId='';state.selectedAffaire=null;renderAll();return;}const d=await api(`/api/finance/affaire/${encodeURIComponent(id)}`);state.selectedAffaireId=id;state.selectedAffaire=d.affaire||null;renderAll();localStorage.setItem('selectedAffaireId',id);}
+async function loadSelectedAffaire(id){if(!id){state.selectedAffaireId='';state.selectedAffaire=null;state.boondImputation=null;renderAll();return;}const d=await api(`/api/finance/affaire/${encodeURIComponent(id)}`);state.selectedAffaireId=id;state.selectedAffaire=d.affaire||null;state.boondImputation=null;renderAll();try{const boondName=(state.selectedAffaire&&(state.selectedAffaire.display_name||state.selectedAffaire.affaire))||'';if(boondName){state.boondForcedProjectId=localStorage.getItem(`boondForcedProjectId:${id}`)||'';state.boondImputation=await api(`/api/boond/imputations/by-project?project_name=${encodeURIComponent(boondName)}&affaire_id=${encodeURIComponent(id)}&affaire=${encodeURIComponent((state.selectedAffaire&&state.selectedAffaire.affaire)||'')}&numero=${encodeURIComponent((state.selectedAffaire&&state.selectedAffaire.numero)||'')}&client=${encodeURIComponent((state.selectedAffaire&&state.selectedAffaire.client)||'')}&display_name=${encodeURIComponent((state.selectedAffaire&&state.selectedAffaire.display_name)||'')}&boond_project_id=${encodeURIComponent(state.boondForcedProjectId||'')}`);}else{state.boondImputation={matched_project:null,totals:{}};}}catch(_){state.boondImputation={matched_project:null,totals:{}};}renderAll();localStorage.setItem('selectedAffaireId',id);}
 function setHeroEmpty(){document.getElementById('heroTitle').textContent='Sélectionnez une affaire';document.getElementById('heroSubtitle').textContent='Le cockpit se remplit à partir du cache du tableau activité.';document.getElementById('metaClient').textContent='-';document.getElementById('metaProject').textContent='-';document.getElementById('metaMissions').textContent='-';document.getElementById('metaStatus').textContent='🟠 Attention';const h=document.getElementById('heroHealth');h.textContent='En attente';h.className='health warn';}
 function cardTone(id,tone){const el=document.getElementById(id);el.classList.remove('good','warn','bad');if(tone)el.classList.add(tone);}
-function renderHero(){const a=state.selectedAffaire;if(!a){setHeroEmpty();return;}document.getElementById('heroTitle').textContent=a.display_name||'-';document.getElementById('heroSubtitle').textContent=`Client ${a.client||'-'} · ${(a.missions||[]).length} mission(s)`;document.getElementById('metaClient').textContent=a.client||'-';document.getElementById('metaProject').textContent=a.affaire||'-';document.getElementById('metaMissions').textContent=String((a.missions||[]).length||0);const hh=healthClass(a),el=document.getElementById('heroHealth');el.textContent=hh.label;el.className=`health ${hh.cls}`;document.getElementById('metaStatus').textContent=hh.cls==='ok'?'🟢 Stable':(hh.cls==='warn'?'🟠 Attention':'🔴 Risque');}
-function renderKpis(){const a=state.selectedAffaire||{commande_ht:0,anteriorite:0,facture_2026:0,facturation_totale:0,reste_a_facturer:0,taux_avancement_financier:0};
+function renderHero(){const a=state.selectedAffaire;if(!a){setHeroEmpty();return;}document.getElementById('heroTitle').textContent=a.display_name||'-';document.getElementById('heroSubtitle').textContent=`Client ${a.client||'-'} · ${(a.missions||[]).length} mission(s)`;document.getElementById('metaClient').textContent=a.client||'-';document.getElementById('metaProject').textContent=a.affaire||'-';document.getElementById('metaMissions').textContent=String((a.missions||[]).length||0);const hh=healthClass(a),el=document.getElementById('heroHealth');el.textContent=hh.label;el.className=`health ${hh.cls}`;const resteVal=Number(a.reste_a_facturer||0);const reste=euro(resteVal);const av=Number(a.taux_avancement_financier||0);let why='';if(av<0.5)why='Facturation encore faible vs commande';else if(resteVal>0)why='Reste significatif à facturer';else why='Objectif financier atteint';document.getElementById('metaStatus').textContent=(hh.cls==='ok'?`🟢 Stable · `:(hh.cls==='warn'?`🟠 À surveiller · `:`🔴 Risque · `))+why+` (${reste})`;}
+function renderKpis(){const a=state.selectedAffaire||{commande_ht:0,facturation_totale:0,reste_a_facturer:0,taux_avancement_financier:0};
 document.getElementById('kpiCommande').textContent=euro(a.commande_ht);
-document.getElementById('kpiAnteriorite').textContent=euro(a.anteriorite||0);
-document.getElementById('kpiFacture2026').textContent=euro(a.facture_2026||a.facturation_cumulee_2026||0);
-document.getElementById('kpiFacturationTotale').textContent=euro(a.facturation_totale||0);const facSub=document.querySelector('#kpiFacturationTotaleCard .sub');if(facSub){facSub.textContent=`Comparé au pointage: ${euro(a.pointage_progress_amount||0)}`;}
+document.getElementById('kpiFacture').textContent=euro(a.facturation_totale||0);
 document.getElementById('kpiReste').textContent=euro(a.reste_a_facturer);
 document.getElementById('kpiAvance').textContent=pct(a.taux_avancement_financier);const avSub=document.querySelector('#kpiAvanceCard .sub');if(avSub){avSub.textContent=`Écart facturation vs pointage: ${euro(a.pointage_vs_facturation_gap||0)}`;}
 cardTone('kpiCommandeCard','good');
-cardTone('kpiAnterioriteCard',(a.anteriorite||0)>0?'good':'warn');
-cardTone('kpiFacture2026Card',(a.facture_2026||0)>0?'good':'warn');
-cardTone('kpiFacturationTotaleCard',(a.facturation_totale||0)>0?'good':'warn');
+cardTone('kpiFactureCard',(a.facturation_totale||0)>0?'good':'warn');
 cardTone('kpiResteCard',a.reste_a_facturer<0?'bad':(a.reste_a_facturer>(a.commande_ht||0)*0.5?'warn':'good'));
 cardTone('kpiAvanceCard',a.taux_avancement_financier>0.85?'good':(a.taux_avancement_financier<0.35?'warn':''));}
-function renderProductionPilot(){const a=state.selectedAffaire||{};const fin=Number(a.taux_avancement_financier||0);const prod=Number(a.pointage_progress_ratio||0);const gapPct=(fin-prod)*100;const gapEur=Number(a.pointage_vs_facturation_gap||0);const e1=document.getElementById('prodFinPct');const e2=document.getElementById('prodPointagePct');const e3=document.getElementById('prodGapPct');const e4=document.getElementById('prodGapEur');if(e1)e1.textContent=pct(fin);if(e2)e2.textContent=pct(prod);if(e3)e3.textContent=`${gapPct>=0?'+':''}${gapPct.toFixed(1)} pt`;if(e4)e4.textContent=`${euro(gapEur)} · ${gapEur>=0?'facturation en avance':'production en avance'}`;}
-function renderFinanceChart(){const root=document.getElementById('monthlyChart');const a=state.selectedAffaire;if(!a){root.innerHTML=`<text x="490" y="160" text-anchor="middle" fill="#6e7a90" font-size="18">Sélectionnez une affaire</text>`;return;}const rows=MONTHS.map(m=>({label:MONTH_LABELS[m],pre:Number((((a.mensuel||{})[m]||{}).previsionnel)||0),fac:Number((((a.mensuel||{})[m]||{}).facture)||0)}));const maxVal=Math.max(1,...rows.flatMap(x=>[x.pre,x.fac]));const left=56,top=16,width=880,height=250,step=width/rows.length,groupW=Math.min(66,step*0.72),barW=Math.max(10,(groupW-8)/2);let grid='',bars='',labels='';for(let i=0;i<=4;i++){const y=top+(height/4)*i,val=Math.round(maxVal*(1-i/4));grid+=`<line x1="${left}" y1="${y}" x2="${left+width}" y2="${y}" stroke="#d8e1ef" stroke-width="1"/><text x="${left-10}" y="${y+4}" text-anchor="end" fill="#6f7f97" font-size="12">${fmt(val)}</text>`;}rows.forEach((it,i)=>{const gx=left+i*step+(step-groupW)/2;const preH=(it.pre/maxVal)*height;const facH=(it.fac/maxVal)*height;const preY=top+height-preH;const facY=top+height-facH;bars+=`<rect x="${gx}" y="${preY}" width="${barW}" height="${Math.max(preH,1)}" rx="6" fill="#cfdcf6" stroke="#b5c7eb" stroke-width="1"><title>${it.label} prévisionnel: ${euro(it.pre)}</title></rect>`;bars+=`<rect x="${gx+barW+8}" y="${facY}" width="${barW}" height="${Math.max(facH,1)}" rx="6" fill="#ef8d00" stroke="#d87800" stroke-width="1"><title>${it.label} facturation: ${euro(it.fac)}</title></rect>`;labels+=`<text x="${gx+groupW/2}" y="${top+height+22}" text-anchor="middle" fill="#5f6f88" font-size="12">${it.label}</text>`;});root.innerHTML=`${grid}<line x1="${left}" y1="${top+height}" x2="${left+width}" y2="${top+height}" stroke="#b8c3d4" stroke-width="1.2"/>${bars}${labels}`;}
-function renderCumulativeChart(){const root=document.getElementById('cumulativeChart');const a=state.selectedAffaire;if(!a){root.innerHTML="<div class='small'>Sélectionnez une affaire.</div>";return;}const pre=Number(a.total_previsionnel||0);const fac=Number(a.total_facture||0);const max=Math.max(1,pre,fac);const prePct=(pre/max)*100;const facPct=(fac/max)*100;const delta=fac-pre;root.innerHTML=`<div class='cum-row'><div><strong>Prévisionnel cumulé</strong><div class='small'>Base de comparaison</div></div><div class='cum-track'><div class='cum-fill cum-pre' style='width:${prePct}%'></div></div><div><strong>${euro(pre)}</strong></div></div><div class='cum-row'><div><strong>Facturation cumulée</strong><div class='small'>Écart: ${euro(delta)}</div></div><div class='cum-track'><div class='cum-fill cum-fac' style='width:${facPct}%'></div></div><div><strong>${euro(fac)}</strong></div></div>`;}
-function renderMonthlyTable(){const root=document.getElementById('monthlyTableWrap');const a=state.selectedAffaire;if(!a){root.innerHTML=`<div class='empty'>Sélectionnez une affaire pour afficher le détail mensuel.</div>`;return;}const ordered=[...MONTHS];const showAll=(state.monthlyExpanded===true);const visible=showAll?ordered:ordered.slice(0,6);let rows='';visible.forEach(m=>{const pre=Number((((a.mensuel||{})[m]||{}).previsionnel)||0),fac=Number((((a.mensuel||{})[m]||{}).facture)||0),ec=fac-pre;rows+=`<tr><td>${MONTH_LABELS[m]} 2026</td><td class='num'>${euro(pre)}</td><td class='num'>${euro(fac)}</td><td class='num delta ${ec>=0?'pos':'neg'}'>${euro(ec)}</td></tr>`;});rows+=`<tr><td><strong>Total 2026</strong></td><td class='num'><strong>${euro(a.total_previsionnel||0)}</strong></td><td class='num'><strong>${euro(a.total_facture||0)}</strong></td><td class='num delta ${Number(a.ecart_previsionnel_vs_facture||0)>=0?'pos':'neg'}'><strong>${euro(a.ecart_previsionnel_vs_facture||0)}</strong></td></tr>`;const btn=ordered.length>6?`<div style='padding:8px'><button id='btnToggleMonths' class='btn' type='button'>${showAll?'Voir moins':"Voir toute l'année 2026"}</button></div>`:'';root.innerHTML=`<table><thead><tr><th>Mois</th><th class='num'>Prévisionnel</th><th class='num'>Facturé</th><th class='num'>Écart</th></tr></thead><tbody>${rows}</tbody></table>${btn}`;const t=document.getElementById('btnToggleMonths');if(t)t.addEventListener('click',()=>{state.monthlyExpanded=!state.monthlyExpanded;renderMonthlyTable();});}
+function renderProductionPilot(){const a=state.selectedAffaire||{};const fin=Number(a.taux_avancement_financier||0);const prod=Number(a.pointage_progress_ratio||0);const gapPct=(fin-prod)*100;const gapEur=Number(a.pointage_vs_facturation_gap||0);const e1=document.getElementById('prodFinPct');const e2=document.getElementById('prodPointagePct');const e3=document.getElementById('prodGapPct');const e4=document.getElementById('prodGapEur');if(e1)e1.textContent=pct(fin);if(e2)e2.textContent=pct(prod);if(e3)e3.textContent=`${gapPct>=0?'+':''}${gapPct.toFixed(1)} pt`;if(e4)e4.textContent=`${euro(gapEur)} · ${gapEur>=0?'facturation en avance':'production en avance'}`;const t=(state.boondImputation||{}).totals||{};const r=document.getElementById('prodBoondRentability');const rs=document.getElementById('prodBoondRentabilitySub');if(r){const card=document.getElementById('prodBoondRentabilityCard');if((t.total_cost||0)>0 && (a.facturation_totale||0)>0){const rp=((Number(a.facturation_totale)-Number(t.total_cost))/Math.max(Number(t.total_cost),1))*100;r.textContent=`${fmt(rp)}%`;if(rs)rs.textContent='Calculé: (facturé - coût imputations) / coût imputations';if(card){card.style.borderColor=rp>=10?'#8fd5b0':rp>=0?'#f1c171':'#ee9a9a';card.style.background=rp>=10?'linear-gradient(180deg,#ffffff,#ebf9f1)':rp>=0?'linear-gradient(180deg,#ffffff,#fff4e1)':'linear-gradient(180deg,#ffffff,#ffe9e9)';}}else{r.textContent='-';if(rs)rs.textContent='Rentabilité indisponible (facturé ou coût imputé manquant)';if(card){card.style.borderColor='#dbe4f2';card.style.background='linear-gradient(180deg,#fff,#f3f7ff)';}}}}
+function renderFinanceChart(){const root=document.getElementById('monthlyChart');const a=state.selectedAffaire;const h=document.getElementById('historicalBilling');if(!a){if(h)h.textContent='Historique facturé (années antérieures): -';root.innerHTML=`<text x="490" y="160" text-anchor="middle" fill="#6e7a90" font-size="18">Sélectionnez une affaire</text>`;return;}const y2025=Number(a.facturation_cumulee_2025||0);const y2024=Number(a.facturation_cumulee_2024||0);const parts=[];if(y2025>0)parts.push(`2025: ${euro(y2025)}`);if(y2024>0)parts.push(`2024: ${euro(y2024)}`);if(h)h.textContent=`Historique facturé (années antérieures): ${parts.length?parts.join(' · '):'-'}`;const rows=MONTHS.map(m=>({label:MONTH_LABELS[m],pre:Number((((a.mensuel||{})[m]||{}).previsionnel)||0),fac:Number((((a.mensuel||{})[m]||{}).facture)||0)}));const maxVal=Math.max(1,...rows.flatMap(x=>[x.pre,x.fac]));const left=56,top=16,width=880,height=250,step=width/rows.length,groupW=Math.min(66,step*0.72),barW=Math.max(10,(groupW-8)/2);let grid='',bars='',labels='';for(let i=0;i<=4;i++){const y=top+(height/4)*i,val=Math.round(maxVal*(1-i/4));grid+=`<line x1="${left}" y1="${y}" x2="${left+width}" y2="${y}" stroke="#d8e1ef" stroke-width="1"/><text x="${left-10}" y="${y+4}" text-anchor="end" fill="#6f7f97" font-size="12">${fmt(val)}</text>`;}rows.forEach((it,i)=>{const gx=left+i*step+(step-groupW)/2;const preH=(it.pre/maxVal)*height;const facH=(it.fac/maxVal)*height;const preY=top+height-preH;const facY=top+height-facH;bars+=`<rect x="${gx}" y="${preY}" width="${barW}" height="${Math.max(preH,1)}" rx="6" fill="#cfdcf6" stroke="#b5c7eb" stroke-width="1"><title>${it.label} prévisionnel: ${euro(it.pre)}</title></rect>`;bars+=`<rect x="${gx+barW+8}" y="${facY}" width="${barW}" height="${Math.max(facH,1)}" rx="6" fill="#ef8d00" stroke="#d87800" stroke-width="1"><title>${it.label} facturation: ${euro(it.fac)}</title></rect>`;labels+=`<text x="${gx+groupW/2}" y="${top+height+22}" text-anchor="middle" fill="#5f6f88" font-size="12">${it.label}</text>`;});root.innerHTML=`${grid}<line x1="${left}" y1="${top+height}" x2="${left+width}" y2="${top+height}" stroke="#b8c3d4" stroke-width="1.2"/>${bars}${labels}`;}
+function renderCumulativeChart(){const root=document.getElementById('cumulativeChart');const a=state.selectedAffaire;if(!a){root.innerHTML="<div class='small'>Sélectionnez une affaire.</div>";return;}const pre=Number(a.reste_a_facturer||0);const fac=Number(a.facturation_totale||0);const max=Math.max(1,pre,fac);const prePct=(pre/max)*100;const facPct=(fac/max)*100;const delta=fac-pre;root.innerHTML=`<div class='cum-row'><div><strong>Prévisionnel cumulé</strong><div class='small'>Reste à facturer</div></div><div class='cum-track'><div class='cum-fill cum-pre' style='width:${prePct}%'></div></div><div><strong>${euro(pre)}</strong></div></div><div class='cum-row'><div><strong>Facturation cumulée</strong><div class='small'>Depuis le début · Écart: ${euro(delta)}</div></div><div class='cum-track'><div class='cum-fill cum-fac' style='width:${facPct}%'></div></div><div><strong>${euro(fac)}</strong></div></div>`;}
+function renderMonthlyTable(){const root=document.getElementById('monthlyTableWrap');const a=state.selectedAffaire;if(!a){root.innerHTML=`<div class='empty'>Sélectionnez une affaire pour afficher le détail mensuel.</div>`;return;}const ordered=[...MONTHS];const showAll=(state.monthlyExpanded===true);const visible=showAll?ordered:ordered.slice(0,6);let rows='';visible.forEach(m=>{const pre=Number((((a.mensuel||{})[m]||{}).previsionnel)||0),fac=Number((((a.mensuel||{})[m]||{}).facture)||0),ec=fac-pre;rows+=`<tr><td>${MONTH_LABELS[m]}</td><td class='num'>${euro(pre)}</td><td class='num'>${euro(fac)}</td><td class='num delta ${ec>=0?'pos':'neg'}'>${euro(ec)}</td></tr>`;});rows+=`<tr><td><strong>Total</strong></td><td class='num'><strong>${euro(a.total_previsionnel||0)}</strong></td><td class='num'><strong>${euro(a.total_facture||0)}</strong></td><td class='num delta ${Number(a.ecart_previsionnel_vs_facture||0)>=0?'pos':'neg'}'><strong>${euro(a.ecart_previsionnel_vs_facture||0)}</strong></td></tr>`;const btn=ordered.length>6?`<div style='padding:8px'><button id='btnToggleMonths' class='btn' type='button'>${showAll?'Voir moins':"Voir toute l'année"}</button></div>`:'';root.innerHTML=`<table><thead><tr><th>Mois</th><th class='num'>Prévisionnel</th><th class='num'>Facturé</th><th class='num'>Écart</th></tr></thead><tbody>${rows}</tbody></table>${btn}`;const t=document.getElementById('btnToggleMonths');if(t)t.addEventListener('click',()=>{state.monthlyExpanded=!state.monthlyExpanded;renderMonthlyTable();});}
 function renderMissions(){const root=document.getElementById('missionsTableWrap');const meta=document.getElementById('missionsMeta');if(!root||!meta)return;const a=state.selectedAffaire;if(!a){meta.textContent='0 mission';root.innerHTML=`<div class='empty'>Sélectionnez une affaire pour afficher les missions.</div>`;return;}const missions=a.missions||[];meta.textContent=`${missions.length} mission(s)`;if(!missions.length){root.innerHTML=`<div class='empty'>Aucune mission détaillée sur cette affaire.</div>`;return;}root.innerHTML=`<table><thead><tr><th>Tag</th><th>Mission</th><th>N°</th><th class='num'>Commande</th><th class='num'>🧾 Facturation totale</th><th class='num'>Reste</th><th class='num'>Prévisionnel</th><th class='num'>Facturé</th></tr></thead><tbody>${missions.map(m=>`<tr><td>${esc(m.tag||'')}</td><td>${esc(m.label||'')}</td><td>${esc(m.numero||'')}</td><td class='num'>${euro(m.commande_ht)}</td><td class='num'>${euro(m.facturation_totale||((m.anteriorite||0)+(m.facture_2026||m.facturation_cumulee_2026||0)))}</td><td class='num'>${euro(m.reste_a_facturer)}</td><td class='num'>${euro(m.total_previsionnel)}</td><td class='num'>${euro(m.total_facture)}</td></tr>`).join('')}</tbody></table>`;}
 function renderInsights(){const root=document.getElementById('insightsBox');const a=state.selectedAffaire;if(!a){root.innerHTML=`<div class='empty' style='width:100%'>Sélectionnez une affaire.</div>`;return;}const items=a.insights||[];root.innerHTML=items.map(x=>`<div class='insight'>${esc(x)}</div>`).join('');}
-function renderAll(){renderHero();renderKpis();renderProductionPilot();renderFinanceChart();renderCumulativeChart();renderMonthlyTable();renderMissions();renderInsights();document.getElementById('exportBtn').disabled=!state.selectedAffaireId;const dash=document.getElementById('dashboardBtn');dash.href=state.selectedAffaireId?`/dashboard?affaire_id=${encodeURIComponent(state.selectedAffaireId)}`:'/dashboard';const pm=document.getElementById('pmBtn');pm.href=state.selectedAffaireId?`/gestion-projet?affaire_id=${encodeURIComponent(state.selectedAffaireId)}`:'/gestion-projet';}
+function renderBoondImputation(){const root=document.getElementById('boondImputationBox');if(!root)return;const b=state.boondImputation;const a=state.selectedAffaire;if(!a){root.className='empty';root.textContent='Sélectionnez une affaire pour charger le coût cumulé BOOND.';return;}if(!b){root.className='empty';root.textContent='Chargement des données BOOND…';return;}if(!b.matched_project){root.className='empty';root.innerHTML=`<div>Aucun projet BOOND matché pour cette affaire.</div><div style='margin-top:8px' class='small'>Choisissez provisoirement un projet BOOND dans la liste :</div><div style='margin-top:8px;display:flex;gap:8px;align-items:center'><input id='boondProjectSearch' placeholder='Filtrer (ex: laffitte)' value='${esc(state.boondProjectSearch||'')}' style='padding:6px 8px;min-width:220px'><select id='boondProjectSelect' style='padding:6px 8px;min-width:520px'>${boondOptionsHtml(b)}</select><button id='boondProjectOverrideApply' class='btn' type='button'>Forcer</button><button id='boondProjectOverrideClear' class='btn' type='button'>Retirer</button></div>`;const search=document.getElementById('boondProjectSearch');if(search)search.addEventListener('input',()=>{state.boondProjectSearch=(search.value||'').trim();renderBoondImputation();});const apply=document.getElementById('boondProjectOverrideApply');if(apply)apply.addEventListener('click',async()=>{const sel=document.getElementById('boondProjectSelect');const v=(sel&&sel.value||'').trim();state.boondForcedProjectId=v;if(state.selectedAffaireId){if(v)localStorage.setItem(`boondForcedProjectId:${state.selectedAffaireId}`,v);else localStorage.removeItem(`boondForcedProjectId:${state.selectedAffaireId}`);await loadSelectedAffaire(state.selectedAffaireId);}});const clear=document.getElementById('boondProjectOverrideClear');if(clear)clear.addEventListener('click',async()=>{state.boondForcedProjectId='';if(state.selectedAffaireId){localStorage.removeItem(`boondForcedProjectId:${state.selectedAffaireId}`);await loadSelectedAffaire(state.selectedAffaireId);}});return;}const t=b.totals||{};const cost=(t.total_cost==null)?'-':euro(t.total_cost);const billed=Number((a&&a.facturation_totale)||0);const imputed=Number(t.total_cost||0);const calcMargin=(imputed>0||billed>0)?(billed-imputed):null;const calcRent=(imputed>0&&billed>0)?(((billed-imputed)/Math.max(imputed,1))*100):null;const margin=(calcMargin==null)?'-':euro(calcMargin);const prof=(calcRent==null)?'-':`${fmt(calcRent)}%`;const resources=(b.resources_imputation||[]);const selectedInfo=`<div style='padding:10px 12px' class='small'>Projet BOOND utilisé: <b>${esc((b.matched_project||{}).project_label||(b.matched_project||{}).project_reference||'-')}</b> (id: <code>${esc((b.matched_project||{}).project_id||'-')}</code>) · mode: ${esc((b.matched_project||{}).matched_on||'auto')}</div>`;const override=`<div style='padding:0 12px 10px;display:flex;gap:8px;align-items:center'><input id='boondProjectSearch' placeholder='Filtrer (ex: laffitte)' value='${esc(state.boondProjectSearch||'')}' style='padding:6px 8px;min-width:220px'><select id='boondProjectSelect' style='padding:6px 8px;min-width:520px'>${boondOptionsHtml(b)}</select><button id='boondProjectOverrideApply' class='btn' type='button'>Forcer</button><button id='boondProjectOverrideClear' class='btn' type='button'>Retirer</button></div>`;const maxCost=Math.max(1,...resources.map(x=>Number(x.cost||0)));const detail=resources.length?`<table style='margin-top:10px'><thead><tr><th>Ressource</th><th class='num'>Jours</th><th class='num'>Coût imputé</th></tr></thead><tbody>${resources.map(r=>`<tr><td>${esc(r.resource_name||r.resource_id||'-')}<div style='margin-top:6px;height:6px;background:#edf1f8;border-radius:999px;overflow:hidden'><div style='height:100%;width:${Math.min(100,(Number(r.cost||0)/maxCost)*100)}%;background:#ef8d00'></div></div></td><td class='num'>${fmt(r.days)}</td><td class='num'>${r.cost==null?'-':euro(r.cost)}</td></tr>`).join('')}</tbody></table>`:`<div style='padding:8px 12px' class='small'>Détail ressource indisponible.</div>`;root.className='table-wrap';root.innerHTML=`<table><thead><tr><th>Source</th><th class='num'>Coût imputé cumulé</th><th class='num'>Marge (facturé - imputé)</th><th class='num'>Rentabilité (facturé/imputé)</th></tr></thead><tbody><tr><td>${esc(t.cost_source||'projects_productivity')}</td><td class='num'><strong>${cost}</strong></td><td class='num'>${margin}</td><td class='num'>${prof}</td></tr></tbody></table>${selectedInfo}<div style='padding:10px 12px' class='small'>Coût global issu de la productivité projet BOOND.</div>${override}${detail}`;const search=document.getElementById('boondProjectSearch');if(search)search.addEventListener('input',()=>{state.boondProjectSearch=(search.value||'').trim();renderBoondImputation();});const apply=document.getElementById('boondProjectOverrideApply');if(apply)apply.addEventListener('click',async()=>{const sel=document.getElementById('boondProjectSelect');const v=(sel&&sel.value||'').trim();state.boondForcedProjectId=v;if(state.selectedAffaireId){if(v)localStorage.setItem(`boondForcedProjectId:${state.selectedAffaireId}`,v);else localStorage.removeItem(`boondForcedProjectId:${state.selectedAffaireId}`);await loadSelectedAffaire(state.selectedAffaireId);}});const clear=document.getElementById('boondProjectOverrideClear');if(clear)clear.addEventListener('click',async()=>{state.boondForcedProjectId='';if(state.selectedAffaireId){localStorage.removeItem(`boondForcedProjectId:${state.selectedAffaireId}`);await loadSelectedAffaire(state.selectedAffaireId);}});} 
+function renderAll(){renderHero();renderKpis();renderProductionPilot();renderFinanceChart();renderCumulativeChart();renderMonthlyTable();renderMissions();renderInsights();renderBoondImputation();document.getElementById('exportBtn').disabled=!state.selectedAffaireId;const dash=document.getElementById('dashboardBtn');dash.href=state.selectedAffaireId?`/dashboard?affaire_id=${encodeURIComponent(state.selectedAffaireId)}`:'/dashboard';const pm=document.getElementById('pmBtn');pm.href=state.selectedAffaireId?`/gestion-projet?affaire_id=${encodeURIComponent(state.selectedAffaireId)}`:'/gestion-projet';}
 async function rebuildCache(){clearError();showNotice('Reconstruction du cache en cours…');await api('/api/finance/rebuild-cache',{method:'POST'});await loadCacheStatus();await loadAffairesList(document.getElementById('searchInput').value||'');if(state.selectedAffaireId&&state.affaires.some(x=>x.affaire_id===state.selectedAffaireId)){await loadSelectedAffaire(state.selectedAffaireId);}else{state.selectedAffaireId='';state.selectedAffaire=null;renderAll();}showNotice('Cache reconstruit avec succès.');}
 async function initFinancePage(){clearError();try{await loadCacheStatus();await loadAffairesList('');const params=new URLSearchParams(window.location.search);const affairFromUrl=params.get('affaire_id');const affairFromStorage=localStorage.getItem('selectedAffaireId')||'';const preselected=affairFromUrl||affairFromStorage;if(preselected&&state.affaires.some(x=>x.affaire_id===preselected)){document.getElementById('affaireSelect').value=preselected;await loadSelectedAffaire(preselected);}else{renderAll();}}catch(err){showError(err.message||'Erreur de chargement');}
 document.getElementById('reloadBtn').addEventListener('click',async()=>{try{await rebuildCache();}catch(err){showError(err.message||'Erreur de reconstruction du cache');}});
@@ -2341,27 +4278,34 @@ def gestion_projet_html() -> str:
 :root{--line:#dfe5ef;--ink:#122033;--muted:#6e7a90;--accent:#ef8d00;--panel:#fff;--shadow:0 12px 34px rgba(18,32,51,.07)}
 *{box-sizing:border-box}body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:#f3f6fb;color:var(--ink)}
 .wrap{max-width:1480px;margin:20px auto;padding:0 16px}.top,.kpis,.section{background:var(--panel);border:1px solid var(--line);border-radius:22px;box-shadow:var(--shadow)}
-.top{padding:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}.search,.select{height:44px;border:1px solid var(--line);border-radius:12px;padding:0 12px;min-width:280px}.search.locked,.select.locked{background:#eef2f8;color:#6e7a90;pointer-events:none}
+.top{padding:14px;display:grid;grid-template-columns:auto 1fr;gap:12px;align-items:start}.logo-link{display:inline-flex;text-decoration:none}.brand-mini{display:inline-flex;align-items:center;justify-content:center;width:78px;height:78px;border:1px solid var(--line);border-radius:16px;background:#fff;box-shadow:0 8px 20px rgba(18,32,51,.08)}.brand-mini img{width:48px;height:48px;object-fit:contain}.top-main{display:flex;flex-direction:column;gap:10px}.menu-row,.project-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.search,.select{height:44px;border:1px solid var(--line);border-radius:12px;padding:0 12px;min-width:260px}.search.locked,.select.locked{background:#eef2f8;color:#6e7a90;pointer-events:none}
 .btn{height:44px;border-radius:12px;border:none;padding:0 14px;background:var(--accent);color:#fff;text-decoration:none;display:inline-flex;align-items:center;font-weight:800;cursor:pointer}
 .kpis{margin-top:12px;padding:14px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.k{border:1px solid var(--line);border-radius:14px;padding:14px;background:#fbfdff}.k .v{font-size:34px;font-weight:900;margin-top:6px}
-.section{margin-top:12px;padding:14px}.subgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:14px}table{width:100%;border-collapse:collapse}th,td{padding:10px 12px;border-bottom:1px solid var(--line);font-size:13px;text-align:left}th{background:#f7f9fc;font-size:12px;color:#5b6880;text-transform:uppercase}.small{color:var(--muted);font-size:13px}
+.section{margin-top:12px;padding:14px}.subgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:14px}table{width:100%;border-collapse:collapse}th,td{padding:10px 12px;border-bottom:1px solid var(--line);border-right:1px solid #e8edf5;font-size:13px;text-align:left}th:last-child,td:last-child{border-right:none}th{background:#f7f9fc;font-size:12px;color:#5b6880;text-transform:uppercase}.small{color:var(--muted);font-size:13px}
 .bar{height:10px;background:#edf1f8;border-radius:999px;overflow:hidden}.fill{height:100%;background:#ef8d00}
-.loading-wrap{margin-top:8px;padding:8px 10px;border:1px solid #d8e0ee;border-radius:12px;background:#fff}.loading-label{font-size:12px;color:#5b6880;margin-bottom:6px;font-weight:700}.loading-track{height:8px;border-radius:999px;background:#eef2f8;overflow:hidden}.loading-bar{height:100%;width:35%;background:linear-gradient(90deg,#ef8d00,#ffd08a);animation:loadmove 1.2s infinite ease-in-out}@keyframes loadmove{0%{margin-left:-35%}100%{margin-left:100%}}.match-box{margin-top:10px;border:1px solid var(--line);border-radius:10px;padding:8px;background:#fffaf2}.match-box.ok{border-color:#49a66a;background:#f4fcf6}.match-box.warn{border-color:#ef8d00;background:#fff7ec}.match-title{font-weight:700;margin-bottom:4px;font-size:13px}.conf-badge{display:inline-block;margin-left:8px;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:800;background:#eef2f8;color:#3b4f6f}.match-grid{display:none;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.match-box:hover .match-grid,.match-box:focus-within .match-grid{display:grid}.match-item{font-size:12px;color:#30425f}.match-item b{display:block;color:#6e7a90;font-size:11px;margin-bottom:2px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-word}.pilot-box{margin-top:12px;border:1px solid #cfd8e8;border-radius:18px;padding:16px;background:#f8fbff}.pilot-title{font-size:34px;font-weight:900;margin:4px 0 10px}.pilot-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.pilot-card{background:#fff;border:1px solid #d8e0ee;border-radius:18px;padding:14px}.pilot-card .t{font-size:15px;color:#4b5d7a;font-weight:800}.pilot-card .v{font-size:44px;font-weight:900;margin-top:8px}.pilot-list{margin-top:12px;border:1px solid #d8e0ee;border-radius:18px;background:#fff;padding:10px}.pilot-row{display:flex;justify-content:space-between;gap:12px;padding:12px;border:1px solid #e6ecf6;border-radius:12px;margin:8px 0;background:linear-gradient(180deg,#ffffff 0%,#f8fbff 100%)}.pilot-row:last-child{border-bottom:1px solid #e6ecf6}.pilot-row .name{font-weight:800}.pilot-row-btn{appearance:none;-webkit-appearance:none;width:100%;text-align:left;background:none;cursor:pointer;color:inherit;font:inherit}.company-cell{display:flex;align-items:center;gap:10px}.company-logo{width:28px;height:28px;border-radius:50%;border:1px solid #d8e0ee;background:#fff;object-fit:cover;display:inline-flex;align-items:center;justify-content:center;font-size:11px;color:#6e7a90;font-weight:800}.proj-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.progress-card{border:1px solid #d8e0ee;border-radius:14px;padding:12px;background:#fff}.progress-title{font-weight:800;margin-bottom:8px}.progress-row{display:grid;grid-template-columns:180px 1fr 70px;gap:10px;align-items:center;padding:6px 0}.progress-track{height:10px;border-radius:999px;background:#edf1f8;overflow:hidden}.progress-fill{height:100%;background:#1b6ef3}.curve-wrap{border:1px solid #d8e0ee;border-radius:14px;padding:12px;background:#fff}.project-head{display:flex;align-items:center;gap:14px}.project-cover{width:88px;height:64px;border-radius:10px;border:1px solid #d8e0ee;object-fit:cover;background:#fff}.project-title{font-size:30px;font-weight:900;margin:4px 0 2px}.project-desc{color:#6e7a90;margin:2px 0 0}.timeline-box{margin:10px 0;border:1px solid #d8e0ee;border-radius:14px;background:#fff;padding:10px}.timeline-row{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px}.timeline-track{height:12px;border-radius:999px;background:#edf1f8;overflow:hidden}.timeline-fill{height:100%;background:#1b6ef3}.timeline-fill.over{background:#d64545}.chart-controls{display:flex;gap:8px;align-items:center;margin-bottom:8px}.chart-select{height:36px;border:1px solid var(--line);border-radius:10px;padding:0 10px}.react-row{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px dashed #d8e0ee}.react-row:last-child{border-bottom:none}.pm-modal{position:fixed;inset:0;background:rgba(11,20,33,.45);display:flex;align-items:center;justify-content:center;padding:20px;z-index:50}.pm-modal-box{background:#fff;border-radius:14px;max-width:1100px;width:100%;max-height:82vh;overflow:auto;padding:14px;border:1px solid #d8e0ee}.lvl-row{background:#f7f9fd;font-weight:800}.task-late{background:#fff1f1}.task-soon{background:#fffaf0}
-@media (max-width:980px){.grid{grid-template-columns:repeat(2,1fr)}.subgrid{grid-template-columns:1fr}}@media (max-width:640px){.grid{grid-template-columns:1fr}}
+.loading-wrap{margin-top:8px;padding:8px 10px;border:1px solid #d8e0ee;border-radius:12px;background:#fff}.loading-label{font-size:12px;color:#5b6880;margin-bottom:6px;font-weight:700}.loading-track{height:8px;border-radius:999px;background:#eef2f8;overflow:hidden}.loading-bar{height:100%;width:35%;background:linear-gradient(90deg,#ef8d00,#ffd08a);animation:loadmove 1.2s infinite ease-in-out}@keyframes loadmove{0%{margin-left:-35%}100%{margin-left:100%}}.match-box{margin-top:10px;border:1px solid var(--line);border-radius:10px;padding:8px;background:#fffaf2}.match-box.ok{border-color:#49a66a;background:#f4fcf6}.match-box.warn{border-color:#ef8d00;background:#fff7ec}.match-title{font-weight:700;margin-bottom:4px;font-size:13px}.conf-badge{display:inline-block;margin-left:8px;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:800;background:#eef2f8;color:#3b4f6f}.match-grid{display:none;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.match-box:hover .match-grid,.match-box:focus-within .match-grid{display:grid}.match-item{font-size:12px;color:#30425f}.match-item b{display:block;color:#6e7a90;font-size:11px;margin-bottom:2px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-word}.pilot-box{margin-top:12px;border:1px solid #cfd8e8;border-radius:18px;padding:16px;background:#f8fbff}.pilot-title{font-size:34px;font-weight:900;margin:4px 0 10px}.pilot-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.pilot-card{background:#fff;border:1px solid #d8e0ee;border-radius:18px;padding:14px}.pilot-card .t{font-size:15px;color:#4b5d7a;font-weight:800}.pilot-card .v{font-size:44px;font-weight:900;margin-top:8px}.pilot-list{margin-top:12px;border:1px solid #d8e0ee;border-radius:18px;background:#fff;padding:10px}.pilot-row{display:flex;justify-content:space-between;gap:12px;padding:12px;border:1px solid #e6ecf6;border-radius:12px;margin:8px 0;background:linear-gradient(180deg,#ffffff 0%,#f8fbff 100%)}.pilot-row:last-child{border-bottom:1px solid #e6ecf6}.pilot-row .name{font-weight:800}.pilot-row-btn{appearance:none;-webkit-appearance:none;width:100%;text-align:left;background:none;cursor:pointer;color:inherit;font:inherit}.company-cell{display:flex;align-items:center;gap:10px}.company-logo{width:28px;height:28px;border-radius:50%;border:1px solid #d8e0ee;background:#fff;object-fit:cover;display:inline-flex;align-items:center;justify-content:center;font-size:11px;color:#6e7a90;font-weight:800}.proj-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.progress-card{border:1px solid #d8e0ee;border-radius:14px;padding:12px;background:#fff}.progress-title{font-weight:800;margin-bottom:8px}.progress-row{display:grid;grid-template-columns:180px 1fr 70px;gap:10px;align-items:center;padding:6px 0}.progress-track{height:10px;border-radius:999px;background:#edf1f8;overflow:hidden}.progress-fill{height:100%;background:#1b6ef3}.curve-wrap{border:1px solid #d8e0ee;border-radius:14px;padding:12px;background:#fff}.project-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.project-cover{width:220px;height:132px;border-radius:14px;border:1px solid #d8e0ee;object-fit:cover;background:#fff;box-shadow:0 10px 24px rgba(16,32,56,.12)}.project-logo{width:88px;height:88px;border-radius:16px;background:#fff;border:1px solid var(--line);padding:14px;box-shadow:0 8px 20px rgba(18,32,51,.08);object-fit:contain}.project-title{font-size:30px;font-weight:900;margin:4px 0 2px}.project-desc{color:#6e7a90;margin:2px 0 0}.timeline-box{margin:10px 0;border:1px solid #d8e0ee;border-radius:14px;background:#fff;padding:10px}.timeline-row{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px}.timeline-track{height:12px;border-radius:999px;background:#edf1f8;overflow:hidden}.timeline-fill{height:100%;background:#1b6ef3}.timeline-fill.over{background:#d64545}.chart-controls{display:flex;gap:8px;align-items:center;margin-bottom:8px}.chart-select{height:36px;border:1px solid var(--line);border-radius:10px;padding:0 10px}.react-row{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px dashed #d8e0ee}.react-row:last-child{border-bottom:none}.pm-modal{position:fixed;inset:0;background:rgba(11,20,33,.45);display:flex;align-items:center;justify-content:center;padding:20px;z-index:50}.pm-modal-box{background:#fff;border-radius:14px;max-width:1100px;width:100%;max-height:82vh;overflow:auto;padding:14px;border:1px solid #d8e0ee}.lvl-row{background:#f7f9fd;font-weight:800}.task-late{background:#fff1f1}.task-soon{background:#fffaf0}
+@media (max-width:980px){.top{grid-template-columns:1fr}.menu-row,.project-row{flex-direction:column;align-items:stretch}.grid{grid-template-columns:repeat(2,1fr)}.subgrid{grid-template-columns:1fr}}@media (max-width:640px){.grid{grid-template-columns:1fr}}
 </style></head>
 <body><div class='wrap'>
   <div class='top'>
-    <a class='btn' href='/'>Accueil</a>
-    <input id='searchInput' class='search locked' type='search' placeholder='Projet verrouillé (changer depuis Accueil)' readonly>
-    <select id='affaireSelect' class='select locked' disabled><option value=''>Projet verrouillé</option></select>
-    <a id='financeBtn' class='btn' href='/finance'>Finances</a>
-    <a id='dashboardBtn' class='btn' href='/dashboard'>Tableau de bord</a>
-    <a class='btn' href='/'>Changer de projet</a>
+    <a class='logo-link' href='/' aria-label='Retour accueil'><div class='brand-mini'><img src='/assets/logo-tempo' alt='Tempo'></div></a>
+    <div class='top-main'>
+      <div class='menu-row'>
+        <a class='btn' href='/'>Accueil</a>
+        <a id='financeBtn' class='btn' href='/finance'>Finances</a>
+        <a id='dashboardBtn' class='btn' href='/dashboard'>Tableau de bord</a>
+        <a class='btn' href='/'>Changer de projet</a>
+      </div>
+      <div class='project-row'>
+        <input id='searchInput' class='search locked' type='search' placeholder='Projet verrouillé (changer depuis Accueil)' readonly>
+        <select id='affaireSelect' class='select locked' disabled><option value=''>Projet verrouillé</option></select>
+      </div>
+    </div>
   </div>
   <div id='loadingWrap' class='loading-wrap' style='display:none'><div id='loadingLabel' class='loading-label'>Chargement des indicateurs projet…</div><div class='loading-track'><div class='loading-bar'></div></div></div>
 
   <div class='kpis'>
-    <div class='project-head'><img id='projectImage' class='project-cover' alt='Projet' src=''><div><div id='projectTitle' class='project-title'>-</div><div id='projectDesc' class='project-desc'>-</div></div></div>
+    <div class='project-head'><img id='projectImage' class='project-cover' alt='Projet' src=''><div style='flex:1'><div id='projectTitle' class='project-title'>-</div><div id='projectDesc' class='project-desc'>-</div></div><a class='logo-link' href='/' aria-label='Retour accueil'><img class='project-logo' src='/assets/logo-tempo' alt='Logo Tempo'></a></div>
     <div id='timelineBox' class='timeline-box'><div class='small'>Période projet indisponible</div></div>
     <div class='grid'>
       <div class='k'><div class='small'>Sujets ouverts</div><div id='kOpen' class='v'>0</div></div>
@@ -2387,7 +4331,7 @@ def gestion_projet_html() -> str:
     </div>
   </div>
 
-  <div class='section'>
+  <div id='sectionPilot' class='section'>
     <div class='pilot-box'>
       <h3 style='margin:0 0 10px'>KPI réunion sélectionnée</h3>
       <div class='pilot-grid'>
@@ -2400,7 +4344,7 @@ def gestion_projet_html() -> str:
     </div>
   </div>
 
-  <div class='section'>
+  <div id='sectionCompany' class='section'>
     <h3>Graphique par entreprise</h3>
     <div class='chart-controls'>
       <label for='companyMetric' class='small'>Afficher :</label>
@@ -2413,7 +4357,7 @@ def gestion_projet_html() -> str:
     <div id='companyChartList' class='pilot-list'><div class='small'>Aucune donnée</div></div>
   </div>
 
-  <div class='section'>
+  <div id='sectionReactivity' class='section'>
     <h3>Réactivité par entreprise (écart moyen échéance → clôture)</h3>
     <div id='reactivityList' class='pilot-list'><div class='small'>Aucune donnée</div></div>
   </div>
@@ -2467,7 +4411,7 @@ function showReminderModal(company,b){const p=(b&&b.kpis_pilotage)||{};const nor
 function hideReminderModal(){const modal=document.getElementById('reminderModal');if(modal)modal.style.display='none';}
 async function loadBoard(id){const requested=id||state.selectedId||'';if(!requested){state.selectedId='';state.selectedLabel='';state.board=null;renderBoard();return;}const selected=resolveAffaire(requested);const aid=(selected&&selected.affaire_id)||requested;state.selectedId=aid;const sel=document.getElementById('affaireSelect');if(sel)sel.value=aid;state.selectedLabel=(selected&&selected.display_name)||state.selectedLabel||'';localStorage.setItem('selectedAffaireId',aid);showLoading(true,'Chargement de la vue projet…');try{let b;try{b=await api(`/api/project-management/board?affaire_id=${encodeURIComponent(aid)}`);}catch(errById){const msg=String((errById&&errById.message)||'');if(state.selectedLabel&&(msg.includes('Affaire introuvable')||msg.includes('affaire_id ou affaire_name requis')||msg.includes('404'))){const alt=String(state.selectedLabel||'').split(' - ').slice(-1)[0]||state.selectedLabel;b=await api(`/api/project-management/board?affaire_name=${encodeURIComponent(alt)}`);}else{throw errById;}}state.board=b;renderBoard();}catch(err){console.error(err);state.board=null;renderBoard();showPageError(err);}finally{showLoading(false);}}
 function renderMatchDebug(b){const md=(b&&b.match_debug)||{};const box=document.getElementById('matchBox');const status=document.getElementById('matchStatus');const reason=document.getElementById('matchReason');if(box){box.className=`match-box ${(b&&b.warning)?'warn':'ok'}`;}if(status){const conf=(b&&b.confidence_level)||'low';status.innerHTML=`Diagnostic de matching METRONOME <span class='conf-badge'>${esc(conf)}</span>`;}if(reason){reason.textContent=(b&&b.warning_message)||((b&&b.project_name)?`Projet chargé : ${b.project_name}`:'Aucune affaire sélectionnée.');}setHtml('matchSearchName',`<b>Projet recherché</b>${esc(md.searched_project_name||'-')}`);setHtml('matchSearchSlug',`<b>Slug recherché</b><span class='mono'>${esc(md.searched_project_slug||'-')}</span>`);setHtml('matchFoundName',`<b>Projet matché</b>${esc(md.matched_project_name||'-')}`);setHtml('matchFoundSlug',`<b>Slug matché</b><span class='mono'>${esc(md.matched_project_slug||'-')}</span>`);setHtml('matchResolvedTitle',`<b>Projet résolu (title)</b>${esc(md.resolved_project_title||'-')}`);setHtml('matchResolutionMode',`<b>Mode de résolution</b>${esc(md.resolution_mode||'-')}`);setHtml('matchScore',`<b>Score de match</b>${esc(String(md.match_score??'-'))}`);setHtml('rowsByTitle',`<b>Lignes filtrées par titre</b>${esc(String(md.rows_filtered_by_title??'-'))}`);setHtml('rowsById',`<b>Lignes filtrées par ID</b>${esc(String(md.rows_filtered_by_id??'-'))}`);const miss=((b&&b.missing_files)||[]);setHtml('missingFiles',`<b>Fichiers CSV manquants</b>${esc(miss.length?miss.join(', '):'-')}`);} 
-function renderBoard(){const b=state.board||{};const p=(b&&b.kpis_pilotage)||{};const k=(b&&b.kpis)||{};setText('projectTitle',b.project_name||'-');setText('projectDesc',b.project_description||'-');const img=document.getElementById('projectImage');if(img){img.src=b.project_image||'';}renderMatchDebug(b);setText('kOpen',Number(k.open_topics||0));setText('kOverdue',Number(k.overdue_topics||0));setText('kTopRappels',Number(p.reminders_open_count||0));setText('kDateRef',p.date_reference||p.reference_date||'-');setText('kRappelsDate',Number(p.rappels_ouverts_a_date||p.reminders_open_count||0));setText('kASuivre',Number(p.a_suivre_ouverts||p.followups_open_count||0));renderBars('kByStatus',k.by_status||[]);renderTable(b.rows||[]);renderProjectTimeline(b);renderCompanyChart(b);renderReactivity(b);const companyRows=(p.rappels_cumules_par_entreprise||p.reminders_by_company||[]);setHtml('pilotByCompany',companyRows.length?companyRows.map(r=>{const nm=r.name||r.company||'';return `<button class='pilot-row-btn pilot-row' data-company='${esc(nm)}'><span class='company-cell'>${companyLogoHtml({name:nm,logo:r.logo||''})}<span class='name'>${esc(nm)}</span></span><span><strong>${Number(r.count||0)}</strong> rappels</span></button>`;}).join(''):"<div class='small'>Aucune donnée</div>");Array.from(document.querySelectorAll('.pilot-row-btn')).forEach(btn=>btn.addEventListener('click',()=>showReminderModal(btn.getAttribute('data-company')||'',b)));}
+function renderBoard(){const b=state.board||{};const p=(b&&b.kpis_pilotage)||{};const k=(b&&b.kpis)||{};const hasMatch=!!((b&&b.match_debug&&((b.match_debug.matched_project_name||'')||(Number(b.match_debug.match_score||0)>0)))&&!b.warning);const secPilot=document.getElementById('sectionPilot');const secCompany=document.getElementById('sectionCompany');const secReact=document.getElementById('sectionReactivity');if(secPilot)secPilot.style.display=hasMatch?'block':'none';if(secCompany)secCompany.style.display=hasMatch?'block':'none';if(secReact)secReact.style.display=hasMatch?'block':'none';setText('projectTitle',b.project_name||'-');setText('projectDesc',b.project_description||'-');const img=document.getElementById('projectImage');if(img){const src=String(b.project_image||'').trim();if(src){img.src=src;img.style.display='block';}else{img.removeAttribute('src');img.style.display='none';}}renderMatchDebug(b);setText('kOpen',Number(k.open_topics||0));setText('kOverdue',Number(k.overdue_topics||0));setText('kTopRappels',Number(p.reminders_open_count||0));setText('kDateRef',p.date_reference||p.reference_date||'-');setText('kRappelsDate',Number(p.rappels_ouverts_a_date||p.reminders_open_count||0));setText('kASuivre',Number(p.a_suivre_ouverts||p.followups_open_count||0));renderBars('kByStatus',k.by_status||[]);renderTable(b.rows||[]);renderProjectTimeline(b);renderCompanyChart(b);renderReactivity(b);const companyRows=(p.rappels_cumules_par_entreprise||p.reminders_by_company||[]);setHtml('pilotByCompany',companyRows.length?companyRows.map(r=>{const nm=r.name||r.company||'';return `<button class='pilot-row-btn pilot-row' data-company='${esc(nm)}'><span class='company-cell'>${companyLogoHtml({name:nm,logo:r.logo||''})}<span class='name'>${esc(nm)}</span></span><span><strong>${Number(r.count||0)}</strong> rappels</span></button>`;}).join(''):"<div class='small'>Aucune donnée</div>");Array.from(document.querySelectorAll('.pilot-row-btn')).forEach(btn=>btn.addEventListener('click',()=>showReminderModal(btn.getAttribute('data-company')||'',b)));}
 function showPageError(err){const root=document.getElementById('boardTable');if(root)root.innerHTML=`<div class='small' style='padding:12px;color:#b42318'>${esc(err?.message||'Erreur de chargement')}</div>`;}
 async function loadAffaires(q){const data=await api(`/api/finance/affaires?search=${encodeURIComponent(q||'')}`);state.affaires=data.items||[];const sel=document.getElementById('affaireSelect');if(!sel)return;sel.innerHTML=`<option value=''>Sélectionner une affaire…</option>${state.affaires.map(a=>`<option value='${esc(a.affaire_id)}'>${esc(a.display_name||a.affaire_id)}</option>`).join('')}`;if(state.selectedId){const selected=state.affaires.find(a=>String(a.affaire_id||'')===String(state.selectedId||''));if(selected){state.selectedLabel=selected.display_name||state.selectedLabel||'';sel.value=selected.affaire_id;}}}
 function getProjectKey(){return state.selectedId?`id::${state.selectedId}`:'';}
@@ -2525,34 +4469,39 @@ def dashboard_html() -> str:
 :root{--line:#dfe5ef;--ink:#122033;--muted:#6e7a90;--accent:#ef8d00;--panel:#fff;--shadow:0 12px 34px rgba(18,32,51,.07)}
 *{box-sizing:border-box}body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:#f3f6fb;color:var(--ink)}
 .wrap{max-width:1320px;margin:22px auto;padding:0 16px}.top,.hero,.kpis,.chart{background:var(--panel);border:1px solid var(--line);border-radius:22px;box-shadow:var(--shadow)}
-.top{padding:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}.search,.select{height:44px;border:1px solid var(--line);border-radius:12px;padding:0 12px;min-width:280px}
+.top{padding:14px;display:grid;grid-template-columns:auto 1fr;gap:12px;align-items:start}.logo-link{display:inline-flex;text-decoration:none}.brand-mini{display:inline-flex;align-items:center;justify-content:center;width:78px;height:78px;border:1px solid var(--line);border-radius:16px;background:#fff;box-shadow:0 8px 20px rgba(18,32,51,.08)}.brand-mini img{width:48px;height:48px;object-fit:contain}.top-main{display:flex;flex-direction:column;gap:10px}.menu-row,.project-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.search,.select{height:44px;border:1px solid var(--line);border-radius:12px;padding:0 12px;min-width:260px}
 .btn{height:44px;border-radius:12px;border:none;padding:0 14px;background:var(--accent);color:#fff;text-decoration:none;display:inline-flex;align-items:center;font-weight:800;cursor:pointer}
-.hero{padding:18px;margin-top:14px}.eyeb{font-size:12px;font-weight:800;letter-spacing:.12em;color:var(--accent);text-transform:uppercase}.title{font-size:36px;font-weight:900;margin:6px 0}.muted{color:var(--muted)}
+.hero{padding:18px;margin-top:14px}.hero-row{display:flex;justify-content:space-between;gap:18px;align-items:flex-start}.hero-media{display:none}.hero-media.show{display:block}.hero-media img{width:280px;max-width:32vw;height:170px;object-fit:cover;border-radius:16px;border:1px solid #d6dfed;box-shadow:0 10px 24px rgba(16,32,56,.12)}.hero-logo{width:88px;height:88px;border-radius:16px;background:#fff;border:1px solid var(--line);padding:14px;box-shadow:0 8px 20px rgba(18,32,51,.08);object-fit:contain}.hero-aside{display:flex;gap:12px;align-items:flex-start}.eyeb{font-size:12px;font-weight:800;letter-spacing:.12em;color:var(--accent);text-transform:uppercase}.title{font-size:36px;font-weight:900;margin:6px 0}.muted{color:var(--muted)}
 .kpis{padding:14px;margin-top:14px}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.k{border:1px solid var(--line);border-radius:14px;padding:14px;background:#fbfdff}.k .v{font-size:36px;font-weight:900;margin-top:6px}
 .chart{padding:16px;margin-top:14px}.chart h3{margin:0 0 12px;font-size:28px}.chart-wrap{height:360px;border:1px solid #d5deec;border-radius:16px;padding:12px;background:linear-gradient(180deg,#fbfcff 0%,#f4f7fd 100%)}
-@media (max-width:900px){.grid{grid-template-columns:1fr}.title{font-size:28px}}
+@media (max-width:900px){.top{grid-template-columns:1fr}.menu-row,.project-row{flex-direction:column;align-items:stretch}.grid{grid-template-columns:1fr}.title{font-size:28px}}
 </style></head>
 <body>
 <div class='wrap'>
   <div class='top'>
-    <a class='btn' href='/'>Accueil</a>
-    <input id='searchInput' class='search' type='search' placeholder='Rechercher une affaire'>
-    <select id='affaireSelect' class='select locked' disabled><option value=''>Projet verrouillé</option></select>
-    <a id='financeBtn' class='btn' href='/finance'>Finances</a>
-    <a id='pmBtn' class='btn' href='/gestion-projet'>Gestion de projet</a>
-    <button id='exportBtn' class='btn' disabled>Exporter CSV</button>
+    <a class='logo-link' href='/' aria-label='Retour accueil'><div class='brand-mini'><img src='/assets/logo-tempo' alt='Tempo'></div></a>
+    <div class='top-main'>
+      <div class='menu-row'>
+        <a class='btn' href='/'>Accueil</a>
+        <a id='financeBtn' class='btn' href='/finance'>Finances</a>
+        <a id='pmBtn' class='btn' href='/gestion-projet'>Gestion de projet</a>
+        <button id='exportBtn' class='btn' disabled>Exporter CSV</button>
+      </div>
+      <div class='project-row'>
+        <input id='searchInput' class='search' type='search' placeholder='Rechercher une affaire'>
+        <select id='affaireSelect' class='select locked' disabled><option value=''>Projet verrouillé</option></select>
+      </div>
+    </div>
   </div>
   <div class='hero'>
-    <div class='eyeb'>Tableau de bord</div>
-    <div id='title' class='title'>Sélectionnez une affaire</div>
-    <div id='subtitle' class='muted'>Synthèse principale : client, commande, antériorité, facturé 2026, facturation totale et reste à facturer.</div>
+    <div class='hero-row'><div><div class='eyeb'>Tableau de bord</div><div id='title' class='title'>Sélectionnez une affaire</div><div id='subtitle' class='muted'>Synthèse principale : client, commande, antériorité, facturé 2026, facturation totale et reste à facturer.</div></div><div class='hero-aside'><div id='projectImageBox' class='hero-media'><img id='projectImage' alt='Projet'></div><a class='logo-link' href='/' aria-label='Retour accueil'><img class='hero-logo' src='/assets/logo-tempo' alt='Logo Tempo'></a></div></div>
   </div>
   <div class='kpis'><div class='grid'>
     <div class='k'><div class='muted'>💰 Commandes achetées</div><div id='kCommande' class='v'>0 €</div></div>
     <div class='k'><div class='muted'>Facturation cumulée</div><div id='kFacture' class='v'>0 €</div></div>
     <div class='k'><div class='muted'>⚠ Reste à facturer</div><div id='kReste' class='v'>0 €</div></div>
   </div></div>
-  <div class='chart'><h3>Prévisionnel vs facturation (année complète)</h3><div class='chart-wrap'><svg id='chart' width='100%' height='320' viewBox='0 0 980 320' preserveAspectRatio='none'></svg></div></div>
+  <div class='chart'><h3>Prévisionnel vs facturation</h3><div class='chart-wrap'><svg id='chart' width='100%' height='320' viewBox='0 0 980 320' preserveAspectRatio='xMidYMid meet'></svg></div><div id='kRentMini' class='small' style='margin-top:10px;font-weight:700'></div></div>
 </div>
 <script>
 const MONTHS=['janvier','fevrier','mars','avril','mai','juin','juillet','aout','septembre','octobre','novembre','decembre'];
@@ -2564,7 +4513,7 @@ async function api(u){const r=await fetch(u);const d=await r.json();if(!r.ok) th
 async function loadAffairesList(search=''){const d=await api(`/api/finance/affaires?search=${encodeURIComponent(search)}`);state.affaires=d.items||[];const sel=document.getElementById('affaireSelect');sel.innerHTML=`<option value=''>Sélectionnez une affaire</option>`+state.affaires.map(x=>`<option value="${esc(x.affaire_id)}">${esc(x.display_name)}</option>`).join('');if(state.selectedId&&state.affaires.some(x=>x.affaire_id===state.selectedId)){sel.value=state.selectedId;}}
 async function loadSelectedAffaire(id){if(!id){state.selectedId='';state.selected=null;render();return;}const d=await api(`/api/finance/affaire/${encodeURIComponent(id)}`);state.selectedId=id;state.selected=d.affaire;localStorage.setItem('selectedAffaireId',id);render();}
 function renderChart(){const root=document.getElementById('chart');const a=state.selected;if(!a){root.innerHTML='';return;}const data=MONTHS.map(m=>({label:MONTH_LABELS[m],pre:Number(((a.mensuel||{})[m]||{}).previsionnel||0),fac:Number(((a.mensuel||{})[m]||{}).facture||0)}));const max=Math.max(1,...data.flatMap(x=>[x.pre,x.fac]));const left=56,top=20,width=880,height=250,step=width/Math.max(1,data.length),bw=Math.min(60,step*0.5);let out='';for(let i=0;i<=4;i++){const y=top+(height/4)*i;out+=`<line x1="${left}" y1="${y}" x2="${left+width}" y2="${y}" stroke="#dde5f2"/><text x="${left-8}" y="${y+4}" text-anchor="end" fill="#6b7c98" font-size="12">${Math.round(max*(1-i/4))}</text>`;}const pts=[];data.forEach((d,i)=>{const x=left+i*step+(step-bw)/2;const h=(d.pre/max)*height;const y=top+height-h;const py=top+height-(d.fac/max)*height;out+=`<rect x="${x}" y="${y}" width="${bw}" height="${Math.max(h,1)}" rx="8" fill="#f5d6a8"><title>${d.label} prévisionnel: ${d.pre.toFixed(0)} €</title></rect><text x="${x+bw/2}" y="${top+height+18}" text-anchor="middle" fill="#5f6f88" font-size="12">${d.label}</text>`;pts.push(`${x+bw/2},${py}`);});out+=`<polyline points="${pts.join(' ')}" fill="none" stroke="#ef8d00" stroke-width="4"/>`;root.innerHTML=out;}
-function render(){const a=state.selected;document.getElementById('financeBtn').href=state.selectedId?`/finance?affaire_id=${encodeURIComponent(state.selectedId)}`:'/finance';document.getElementById('pmBtn').href=state.selectedId?`/gestion-projet?affaire_id=${encodeURIComponent(state.selectedId)}`:'/gestion-projet';document.getElementById('exportBtn').disabled=!state.selectedId;document.getElementById('title').textContent=a?(a.display_name||'-'):'Sélectionnez une affaire';document.getElementById('subtitle').textContent=a?`Client ${a.client||'-'} · ${a.affaire||'-'}`:'Synthèse principale : client, commande, antériorité, facturé 2026, facturation totale et reste à facturer.';document.getElementById('kCommande').textContent=euro(a?a.commande_ht:0);document.getElementById('kFacture').textContent=euro(a?(a.facturation_totale||((a.anteriorite||0)+(a.facture_2026||a.facturation_cumulee_2026||0))):0);document.getElementById('kReste').textContent=euro(a?a.reste_a_facturer:0);renderChart();}
+function render(){const a=state.selected;document.getElementById('financeBtn').href=state.selectedId?`/finance?affaire_id=${encodeURIComponent(state.selectedId)}`:'/finance';document.getElementById('pmBtn').href=state.selectedId?`/gestion-projet?affaire_id=${encodeURIComponent(state.selectedId)}`:'/gestion-projet';document.getElementById('exportBtn').disabled=!state.selectedId;document.getElementById('title').textContent=a?(a.display_name||'-'):'Sélectionnez une affaire';document.getElementById('subtitle').textContent=a?`Client ${a.client||'-'} · ${a.affaire||'-'}`:'Synthèse principale : client, commande, antériorité, facturé 2026, facturation totale et reste à facturer.';const imgUrl=String((a&& (a.project_image||a.image_url||a.image||''))||'').trim();const imgBox=document.getElementById('projectImageBox');const img=document.getElementById('projectImage');if(imgBox&&img){if(imgUrl){img.src=imgUrl;imgBox.classList.add('show');}else{img.removeAttribute('src');imgBox.classList.remove('show');}}document.getElementById('kCommande').textContent=euro(a?a.commande_ht:0);document.getElementById('kFacture').textContent=euro(a?(a.facturation_totale||((a.anteriorite||0)+(a.facture_2026||a.facturation_cumulee_2026||0))):0);document.getElementById('kReste').textContent=euro(a?a.reste_a_facturer:0);renderChart();const minRent=(a&&Number(a.commande_ht||0)>0)?(Number(a.commande_ht||0)*0.10):0;const kr=document.getElementById('kRentMini');if(kr)kr.textContent=a?`Rentabilité programmée minimale (10% commande): ${euro(minRent)}`:'';}
 async function init(){await loadAffairesList('');const params=new URLSearchParams(window.location.search);const pre=params.get('affaire_id')||localStorage.getItem('selectedAffaireId')||'';if(pre&&state.affaires.some(x=>x.affaire_id===pre)){document.getElementById('affaireSelect').value=pre;await loadSelectedAffaire(pre);}else{render();}document.getElementById('searchInput').addEventListener('input',async e=>{await loadAffairesList(e.target.value||'');});document.getElementById('affaireSelect').addEventListener('change',async e=>loadSelectedAffaire(e.target.value||''));document.getElementById('exportBtn').addEventListener('click',()=>{if(state.selectedId)window.location.href=`/api/finance/affaire/${encodeURIComponent(state.selectedId)}/export-csv`;});}
 init();
 </script>
