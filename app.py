@@ -4071,7 +4071,7 @@ def landing_html() -> str:
 .grid{margin-top:18px;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.card{padding:20px;display:flex;flex-direction:column;justify-content:space-between;min-height:220px}.card h3{margin:0;font-size:21px}.card p{margin:10px 0 18px;color:var(--muted);font-size:14px;min-height:44px}.card .btn{width:100%}
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;height:44px;padding:0 16px;border-radius:12px;text-decoration:none;border:none;font-weight:800;cursor:pointer}
 .btn.primary,.btn.dark{background:var(--accent);color:#fff}.btn.disabled{background:#ecf0f7;color:#8a94a8;cursor:not-allowed}
-.state{margin-top:14px;padding:14px 16px;border-radius:14px;background:#f8faff;border:1px solid var(--line);color:#4f5d78;font-weight:600}
+.state{margin-top:14px;padding:14px 16px;border-radius:14px;background:#f8faff;border:1px solid var(--line);color:#4f5d78;font-weight:600}.hero-top a{display:inline-flex;text-decoration:none}
 @media (max-width:980px){.grid{grid-template-columns:repeat(2,1fr)}.selector{grid-template-columns:1fr}}@media (max-width:640px){h1{font-size:34px}.grid{grid-template-columns:1fr}}
 </style>
 </head>
@@ -4080,7 +4080,7 @@ def landing_html() -> str:
     <section class='hero'>
       <div class='hero-top'>
         <div><div class='eyebrow'>Gestion affaire</div><h1>Gestion d'affaires</h1></div>
-        <img class='logo' src='/assets/logo-tempo' alt='Logo Tempo'>
+        <a href='/' aria-label='Retour accueil'><img class='logo' src='/assets/logo-tempo' alt='Logo Tempo'></a>
       </div>
       <div class='sub'>Choisissez une affaire en saisissant ses premières lettres, puis accédez directement aux modules disponibles.</div>
       <div class='selector'>
@@ -4130,9 +4130,9 @@ def finance_html() -> str:
 :root{--bg:#eef2f7;--panel:#fff;--panel2:#f7f9fc;--line:#dfe5ef;--ink:#122033;--muted:#6e7a90;--blue:#ef8d00;--green:#1d9a5b;--amber:#c48716;--red:#c84c4c;--shadow:0 14px 40px rgba(19,31,53,.08)}
 *{box-sizing:border-box}body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:linear-gradient(180deg,#f5f7fb 0%,#eef2f7 100%);color:var(--ink)}
 .container{max-width:1440px;margin:22px auto 36px;padding:0 18px}.topbar,.hero,.section,.kpis{background:var(--panel);border:1px solid rgba(22,34,51,.04);box-shadow:var(--shadow);border-radius:24px}
-.topbar{display:grid;grid-template-columns:auto 1fr;gap:14px;align-items:start;padding:16px 18px;background:rgba(255,255,255,.96);backdrop-filter:blur(6px)}.brand-mini{display:inline-flex;align-items:center;justify-content:center;width:78px;height:78px;border:1px solid var(--line);border-radius:16px;background:#fff;box-shadow:0 8px 20px rgba(18,32,51,.08)}.brand-mini img{width:48px;height:48px;object-fit:contain}
+.topbar{display:grid;grid-template-columns:auto 1fr;gap:14px;align-items:start;padding:16px 18px;background:rgba(255,255,255,.96);backdrop-filter:blur(6px)}.logo-link{display:inline-flex;text-decoration:none}.brand-mini{display:inline-flex;align-items:center;justify-content:center;width:78px;height:78px;border:1px solid var(--line);border-radius:16px;background:#fff;box-shadow:0 8px 20px rgba(18,32,51,.08)}.brand-mini img{width:48px;height:48px;object-fit:contain}
 .controls{display:flex;flex-direction:column;gap:10px;flex:1}.menu-row,.project-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.search,.select{height:48px;border-radius:14px;border:1px solid var(--line);background:#fff;padding:0 14px;color:var(--ink);font-size:15px}.search{min-width:260px;flex:1}.select{min-width:300px;flex:1}
-.btn{height:48px;border:none;border-radius:14px;padding:0 16px;font-weight:700;cursor:pointer}.btn.primary{background:var(--blue);color:#fff}.btn.dark{background:#ef8d00;color:#fff;box-shadow:inset 0 -2px 0 rgba(0,0,0,.08)}
+.btn{height:44px;border:none;border-radius:12px;padding:0 14px;background:var(--accent);color:#fff;font-weight:800;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center}.btn:disabled{opacity:.65;cursor:not-allowed}
 .badge{display:inline-flex;align-items:center;gap:8px;padding:10px 12px;border-radius:999px;background:var(--panel2);color:var(--muted);font-size:13px;font-weight:700}.dot{width:10px;height:10px;border-radius:50%}.dot.ready{background:var(--green)}.dot.building{background:var(--amber)}.dot.error{background:var(--red)}.dot.idle{background:#9aa6b8}
 .hero{margin-top:18px;padding:26px 28px}.hero-top{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap}.hero h2{margin:8px 0 4px;font-size:42px;line-height:1.02}.eyebrow{font-size:12px;font-weight:800;color:var(--blue);letter-spacing:.14em;text-transform:uppercase}.hero-side{display:flex;align-items:center;gap:12px}.hero-logo{width:88px;height:88px;border-radius:16px;background:#fff;border:1px solid var(--line);padding:14px;box-shadow:0 8px 20px rgba(18,32,51,.08);object-fit:contain}
 .meta-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:18px}.meta-pill{background:var(--panel2);border:1px solid var(--line);border-radius:18px;padding:14px 16px}.meta-pill .label{font-size:12px;color:var(--muted);text-transform:uppercase;font-weight:800;letter-spacing:.08em}.meta-pill .value{margin-top:6px;font-size:16px;font-weight:700}
@@ -4151,14 +4151,14 @@ def finance_html() -> str:
 <body>
 <div class='container'>
   <div class='topbar'>
-    <div class='brand-mini'><img src='/assets/logo-tempo' alt='Logo Tempo'></div>
+    <a class='logo-link' href='/' aria-label='Retour accueil'><div class='brand-mini'><img src='/assets/logo-tempo' alt='Logo Tempo'></div></a>
     <div class='controls'>
       <div class='menu-row'>
-        <a class='btn dark' href='/'>Accueil</a>
-        <a id='dashboardBtn' class='btn dark' href='/dashboard'>Tableau de bord</a>
-        <a id='pmBtn' class='btn dark' href='/gestion-projet'>Gestion de projet</a>
-        <button id='reloadBtn' class='btn primary'>Reconstruire le cache</button>
-        <button id='exportBtn' class='btn dark' disabled>Exporter CSV</button>
+        <a class='btn' href='/'>Accueil</a>
+        <a id='dashboardBtn' class='btn' href='/dashboard'>Tableau de bord</a>
+        <a id='pmBtn' class='btn' href='/gestion-projet'>Gestion de projet</a>
+        <button id='reloadBtn' class='btn'>Reconstruire le cache</button>
+        <button id='exportBtn' class='btn' disabled>Exporter CSV</button>
         <div id='cacheBadge' class='badge'><span class='dot idle'></span><span>Cache : attente</span></div>
       </div>
       <div class='project-row'>
@@ -4178,7 +4178,7 @@ def finance_html() -> str:
         <h2 id='heroTitle'>Sélectionnez une affaire</h2>
         <div id='heroSubtitle' class='small'>Le cockpit se remplit à partir du cache du tableau activité.</div>
       </div>
-      <div class='hero-side'><div id='heroHealth' class='health warn'>En attente</div><img class='hero-logo' src='/assets/logo-tempo' alt='Logo Tempo'></div>
+      <div class='hero-side'><div id='heroHealth' class='health warn'>En attente</div><a class='logo-link' href='/' aria-label='Retour accueil'><img class='hero-logo' src='/assets/logo-tempo' alt='Logo Tempo'></a></div>
     </div>
     <div class='meta-grid'>
       <div class='meta-pill'><div class='label'>CLIENT</div><div class='value' id='metaClient'>-</div></div>
@@ -4278,7 +4278,7 @@ def gestion_projet_html() -> str:
 :root{--line:#dfe5ef;--ink:#122033;--muted:#6e7a90;--accent:#ef8d00;--panel:#fff;--shadow:0 12px 34px rgba(18,32,51,.07)}
 *{box-sizing:border-box}body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:#f3f6fb;color:var(--ink)}
 .wrap{max-width:1480px;margin:20px auto;padding:0 16px}.top,.kpis,.section{background:var(--panel);border:1px solid var(--line);border-radius:22px;box-shadow:var(--shadow)}
-.top{padding:14px;display:grid;grid-template-columns:auto 1fr;gap:12px;align-items:start}.brand-mini{display:inline-flex;align-items:center;justify-content:center;width:78px;height:78px;border:1px solid var(--line);border-radius:16px;background:#fff;box-shadow:0 8px 20px rgba(18,32,51,.08)}.brand-mini img{width:48px;height:48px;object-fit:contain}.top-main{display:flex;flex-direction:column;gap:10px}.menu-row,.project-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.search,.select{height:44px;border:1px solid var(--line);border-radius:12px;padding:0 12px;min-width:260px}.search.locked,.select.locked{background:#eef2f8;color:#6e7a90;pointer-events:none}
+.top{padding:14px;display:grid;grid-template-columns:auto 1fr;gap:12px;align-items:start}.logo-link{display:inline-flex;text-decoration:none}.brand-mini{display:inline-flex;align-items:center;justify-content:center;width:78px;height:78px;border:1px solid var(--line);border-radius:16px;background:#fff;box-shadow:0 8px 20px rgba(18,32,51,.08)}.brand-mini img{width:48px;height:48px;object-fit:contain}.top-main{display:flex;flex-direction:column;gap:10px}.menu-row,.project-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.search,.select{height:44px;border:1px solid var(--line);border-radius:12px;padding:0 12px;min-width:260px}.search.locked,.select.locked{background:#eef2f8;color:#6e7a90;pointer-events:none}
 .btn{height:44px;border-radius:12px;border:none;padding:0 14px;background:var(--accent);color:#fff;text-decoration:none;display:inline-flex;align-items:center;font-weight:800;cursor:pointer}
 .kpis{margin-top:12px;padding:14px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.k{border:1px solid var(--line);border-radius:14px;padding:14px;background:#fbfdff}.k .v{font-size:34px;font-weight:900;margin-top:6px}
 .section{margin-top:12px;padding:14px}.subgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:14px}table{width:100%;border-collapse:collapse}th,td{padding:10px 12px;border-bottom:1px solid var(--line);border-right:1px solid #e8edf5;font-size:13px;text-align:left}th:last-child,td:last-child{border-right:none}th{background:#f7f9fc;font-size:12px;color:#5b6880;text-transform:uppercase}.small{color:var(--muted);font-size:13px}
@@ -4288,7 +4288,7 @@ def gestion_projet_html() -> str:
 </style></head>
 <body><div class='wrap'>
   <div class='top'>
-    <div class='brand-mini'><img src='/assets/logo-tempo' alt='Tempo'></div>
+    <a class='logo-link' href='/' aria-label='Retour accueil'><div class='brand-mini'><img src='/assets/logo-tempo' alt='Tempo'></div></a>
     <div class='top-main'>
       <div class='menu-row'>
         <a class='btn' href='/'>Accueil</a>
@@ -4305,7 +4305,7 @@ def gestion_projet_html() -> str:
   <div id='loadingWrap' class='loading-wrap' style='display:none'><div id='loadingLabel' class='loading-label'>Chargement des indicateurs projet…</div><div class='loading-track'><div class='loading-bar'></div></div></div>
 
   <div class='kpis'>
-    <div class='project-head'><img id='projectImage' class='project-cover' alt='Projet' src=''><div style='flex:1'><div id='projectTitle' class='project-title'>-</div><div id='projectDesc' class='project-desc'>-</div></div><img class='project-logo' src='/assets/logo-tempo' alt='Logo Tempo'></div>
+    <div class='project-head'><img id='projectImage' class='project-cover' alt='Projet' src=''><div style='flex:1'><div id='projectTitle' class='project-title'>-</div><div id='projectDesc' class='project-desc'>-</div></div><a class='logo-link' href='/' aria-label='Retour accueil'><img class='project-logo' src='/assets/logo-tempo' alt='Logo Tempo'></a></div>
     <div id='timelineBox' class='timeline-box'><div class='small'>Période projet indisponible</div></div>
     <div class='grid'>
       <div class='k'><div class='small'>Sujets ouverts</div><div id='kOpen' class='v'>0</div></div>
@@ -4469,7 +4469,7 @@ def dashboard_html() -> str:
 :root{--line:#dfe5ef;--ink:#122033;--muted:#6e7a90;--accent:#ef8d00;--panel:#fff;--shadow:0 12px 34px rgba(18,32,51,.07)}
 *{box-sizing:border-box}body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:#f3f6fb;color:var(--ink)}
 .wrap{max-width:1320px;margin:22px auto;padding:0 16px}.top,.hero,.kpis,.chart{background:var(--panel);border:1px solid var(--line);border-radius:22px;box-shadow:var(--shadow)}
-.top{padding:14px;display:grid;grid-template-columns:auto 1fr;gap:12px;align-items:start}.brand-mini{display:inline-flex;align-items:center;justify-content:center;width:78px;height:78px;border:1px solid var(--line);border-radius:16px;background:#fff;box-shadow:0 8px 20px rgba(18,32,51,.08)}.brand-mini img{width:48px;height:48px;object-fit:contain}.top-main{display:flex;flex-direction:column;gap:10px}.menu-row,.project-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.search,.select{height:44px;border:1px solid var(--line);border-radius:12px;padding:0 12px;min-width:260px}
+.top{padding:14px;display:grid;grid-template-columns:auto 1fr;gap:12px;align-items:start}.logo-link{display:inline-flex;text-decoration:none}.brand-mini{display:inline-flex;align-items:center;justify-content:center;width:78px;height:78px;border:1px solid var(--line);border-radius:16px;background:#fff;box-shadow:0 8px 20px rgba(18,32,51,.08)}.brand-mini img{width:48px;height:48px;object-fit:contain}.top-main{display:flex;flex-direction:column;gap:10px}.menu-row,.project-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.search,.select{height:44px;border:1px solid var(--line);border-radius:12px;padding:0 12px;min-width:260px}
 .btn{height:44px;border-radius:12px;border:none;padding:0 14px;background:var(--accent);color:#fff;text-decoration:none;display:inline-flex;align-items:center;font-weight:800;cursor:pointer}
 .hero{padding:18px;margin-top:14px}.hero-row{display:flex;justify-content:space-between;gap:18px;align-items:flex-start}.hero-media{display:none}.hero-media.show{display:block}.hero-media img{width:280px;max-width:32vw;height:170px;object-fit:cover;border-radius:16px;border:1px solid #d6dfed;box-shadow:0 10px 24px rgba(16,32,56,.12)}.hero-logo{width:88px;height:88px;border-radius:16px;background:#fff;border:1px solid var(--line);padding:14px;box-shadow:0 8px 20px rgba(18,32,51,.08);object-fit:contain}.hero-aside{display:flex;gap:12px;align-items:flex-start}.eyeb{font-size:12px;font-weight:800;letter-spacing:.12em;color:var(--accent);text-transform:uppercase}.title{font-size:36px;font-weight:900;margin:6px 0}.muted{color:var(--muted)}
 .kpis{padding:14px;margin-top:14px}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.k{border:1px solid var(--line);border-radius:14px;padding:14px;background:#fbfdff}.k .v{font-size:36px;font-weight:900;margin-top:6px}
@@ -4479,7 +4479,7 @@ def dashboard_html() -> str:
 <body>
 <div class='wrap'>
   <div class='top'>
-    <div class='brand-mini'><img src='/assets/logo-tempo' alt='Tempo'></div>
+    <a class='logo-link' href='/' aria-label='Retour accueil'><div class='brand-mini'><img src='/assets/logo-tempo' alt='Tempo'></div></a>
     <div class='top-main'>
       <div class='menu-row'>
         <a class='btn' href='/'>Accueil</a>
@@ -4494,7 +4494,7 @@ def dashboard_html() -> str:
     </div>
   </div>
   <div class='hero'>
-    <div class='hero-row'><div><div class='eyeb'>Tableau de bord</div><div id='title' class='title'>Sélectionnez une affaire</div><div id='subtitle' class='muted'>Synthèse principale : client, commande, antériorité, facturé 2026, facturation totale et reste à facturer.</div></div><div class='hero-aside'><div id='projectImageBox' class='hero-media'><img id='projectImage' alt='Projet'></div><img class='hero-logo' src='/assets/logo-tempo' alt='Logo Tempo'></div></div>
+    <div class='hero-row'><div><div class='eyeb'>Tableau de bord</div><div id='title' class='title'>Sélectionnez une affaire</div><div id='subtitle' class='muted'>Synthèse principale : client, commande, antériorité, facturé 2026, facturation totale et reste à facturer.</div></div><div class='hero-aside'><div id='projectImageBox' class='hero-media'><img id='projectImage' alt='Projet'></div><a class='logo-link' href='/' aria-label='Retour accueil'><img class='hero-logo' src='/assets/logo-tempo' alt='Logo Tempo'></a></div></div>
   </div>
   <div class='kpis'><div class='grid'>
     <div class='k'><div class='muted'>💰 Commandes achetées</div><div id='kCommande' class='v'>0 €</div></div>
