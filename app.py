@@ -3350,6 +3350,13 @@ class PointageService:
         return ""
 
     @staticmethod
+    def _get_col_by_position(row: Dict[str, Any], position: int) -> str:
+        keys = list(row.keys())
+        if 0 <= position < len(keys):
+            return keys[position]
+        return ""
+
+    @staticmethod
     def _parse_outline_level(raw_value: Any) -> Optional[int]:
         text = clean_text(raw_value)
         if not text:
@@ -3388,8 +3395,8 @@ class PointageService:
         first = rows[0]
         c_id = self._find_col(first, ["id", "task id", "id tache", "uid"])
         c_name = self._find_col(first, ["task name", "nom", "name", "tache"])
-        c_start = self._find_col(first, ["start", "start date", "start1", "début (f)", "debut (f)", "debut", "début", "date debut", "date début"])
-        c_end = self._find_col(first, ["finish", "finish date", "finish1", "fin (g)", "fin", "date fin", "end", "end date"])
+        c_start = self._get_col_by_position(first, 5) or self._find_col(first, ["start", "start date", "start1", "début (f)", "debut (f)", "debut", "début", "date debut", "date début"])
+        c_end = self._get_col_by_position(first, 6) or self._find_col(first, ["finish", "finish date", "finish1", "fin (g)", "fin", "date fin", "end", "end date"])
         c_work = self._find_col(first, ["work", "charge", "planned hours", "travail", "duree", "durée", "duration"])
         c_duration = self._find_col(first, ["duration", "duree", "durée", "planned duration"])
         c_owner = self._find_col(first, ["owner", "resource", "nom de ressources", "nom de ressource", "responsable", "ressource"])
@@ -3397,7 +3404,7 @@ class PointageService:
         c_outline = self._find_col(first, ["outline level", "outline", "niveau", "level", "wbs", "indent"])
         c_summary = self._find_col(first, ["summary", "is summary", "recap", "récap"])
         c_pred = self._find_col(first, ["predecessors", "pred", "predecesseurs", "prédécesseurs"])
-        c_unit_cost = self._find_col(first, ["variation_de_cout", "variation de cout", "variation_de_coût", "variation de coût", "variation_de_coût (p)", "variation de coût (p)", "unit cost", "cout unitaire", "coût unitaire", "rate"])
+        c_unit_cost = self._get_col_by_position(first, 8) or self._find_col(first, ["variation_de_cout", "variation de cout", "variation_de_coût", "variation de coût", "variation_de_coût (p)", "variation de coût (p)", "unit cost", "cout unitaire", "coût unitaire", "rate"])
 
         tasks: List[Dict[str, Any]] = []
         outlines: List[int] = []
