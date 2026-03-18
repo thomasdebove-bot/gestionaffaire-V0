@@ -2202,7 +2202,7 @@ class MetronomeService:
         # Nettoie les préfixes type jour abrégé: "Mar 09/12/25" -> "09/12/25"
         txt = re.sub(r"^(?:lun|mar|mer|jeu|ven|sam|dim|mon|tue|wed|thu|fri|sat|sun)\.?\s+", "", txt, flags=re.IGNORECASE)
         for fmt in (
-            "%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d", "%m/%d/%Y", "%m/%d/%y",
+            "%Y-%m-%d", "%d/%m/%Y", "%d/%m/%y", "%Y/%m/%d", "%m/%d/%Y", "%m/%d/%y",
             "%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S",
             "%Y-%m-%dT%H:%M:%S", "%m/%d/%Y %H:%M", "%m/%d/%Y %H:%M:%S", "%m/%d/%y %H:%M",
             "%m/%d/%Y %I:%M %p", "%m/%d/%y %I:%M %p", "%d/%m/%y %H:%M:%S"
@@ -3452,12 +3452,12 @@ class PointageService:
         if not rows:
             return []
         first = rows[0]
-        c_id = self._find_col(first, ["id", "task id", "id tache", "uid"])
-        c_name = self._find_col(first, ["task name", "nom", "name", "tache"])
+        c_id = self._get_col_by_position(first, 0) or self._find_col(first, ["id", "task id", "id tache", "uid", "n°", "numero"])
+        c_name = self._get_col_by_position(first, 3) or self._find_col(first, ["task name", "nom", "name", "tache"])
         c_start = self._get_col_by_position(first, 5) or self._find_col(first, ["start", "start date", "start1", "début (f)", "debut (f)", "debut", "début", "date debut", "date début"])
         c_end = self._get_col_by_position(first, 6) or self._find_col(first, ["finish", "finish date", "finish1", "fin (g)", "fin", "date fin", "end", "end date"])
-        c_work = self._find_col(first, ["work", "charge", "planned hours", "travail", "duree", "durée", "duration"])
-        c_duration = self._find_col(first, ["duration", "duree", "durée", "planned duration"])
+        c_work = self._get_col_by_position(first, 7) or self._find_col(first, ["work", "charge", "planned hours", "travail_planif", "travail", "duree", "durée", "duration"])
+        c_duration = self._get_col_by_position(first, 4) or self._find_col(first, ["duration", "duree", "durée", "planned duration"])
         c_owner = self._find_col(first, ["owner", "resource", "nom de ressources", "nom de ressource", "responsable", "ressource"])
         c_pct = self._find_col(first, ["%", "% acheve", "% achevé", "% complete", "percent", "percentage complete", "percent complete", "acheve", "achevé", "avancement", "pourcentage_acheve", "pourcentage acheve"])
         c_outline = self._find_col(first, ["outline level", "outline", "niveau", "level", "wbs", "indent"])
