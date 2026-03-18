@@ -3611,6 +3611,40 @@ class PointageService:
         cst_rate = clean_number(pointage.get("__cstRate", 80))
         today = datetime.now().date()
         out: List[Dict[str, Any]] = []
+
+        def compute_schedule_status(end: Optional[date], progress_value: float, actual_end_value: Optional[date]) -> Dict[str, Any]:
+            if actual_end_value and end:
+                delay_days_value = max(0, (actual_end_value - end).days)
+            elif (not actual_end_value) and end and progress_value < 100 and today > end:
+                delay_days_value = (today - end).days
+            else:
+                delay_days_value = 0
+
+            delay_weeks_value = int((delay_days_value + 6) // 7) if delay_days_value > 0 else 0
+            days_until_end_value = (end - today).days if end else None
+
+            if progress_value >= 100 or actual_end_value:
+                status_value = "past"
+                status_label_value = "Terminé"
+            elif delay_days_value > 0:
+                status_value = "late"
+                status_label_value = f"En retard, {delay_weeks_value} semaine{'s' if delay_weeks_value > 1 else ''}"
+            elif days_until_end_value is not None and 0 <= days_until_end_value <= 14:
+                status_value = "soon"
+                status_label_value = "À venir"
+            else:
+                status_value = ""
+                status_label_value = ""
+
+            return {
+                "delay_days": int(delay_days_value),
+                "delay_weeks": int(delay_weeks_value),
+                "status": status_value,
+                "status_label": status_label_value,
+                "is_late": bool(delay_days_value > 0),
+                "is_soon": bool(status_value == "soon"),
+            }
+
         for t in planning_tasks:
             rec = pointage.get(t["task_id"], {}) if isinstance(pointage.get(t["task_id"]), dict) else {}
             progress = clean_number(rec.get("progress", t.get("csv_progress", 0)))
@@ -3618,6 +3652,9 @@ class PointageService:
             cet_map = rec.get("cet", {}) if isinstance(rec.get("cet"), dict) else {}
             cet_progress_vals = []
             cet_dates: List[date] = []
+            cet_render_map: Dict[str, Dict[str, Any]] = {}
+            start = MetronomeService._parse_date_only(t.get("start", ""))
+            end = MetronomeService._parse_date_only(t.get("end", ""))
             if t.get("is_cet") and cet_members:
                 for m in cet_members:
                     cm = cet_map.get(m, {}) if isinstance(cet_map.get(m), dict) else {}
@@ -3627,6 +3664,18 @@ class PointageService:
                         cp = 100.0
                         cet_dates.append(ca)
                     cet_progress_vals.append(max(0.0, min(100.0, cp)))
+                    member_status = compute_schedule_status(end, max(0.0, min(100.0, cp)), ca)
+                    cet_render_map[m] = {
+                        **cm,
+                        "progress": max(0.0, min(100.0, cp)),
+                        "actualEnd": ca.isoformat() if ca else clean_text(cm.get("actualEnd")),
+                        "delayDays": member_status["delay_days"],
+                        "delayWeeks": member_status["delay_weeks"],
+                        "status": member_status["status"],
+                        "statusLabel": member_status["status_label"],
+                        "isLate": member_status["is_late"],
+                        "isSoon": member_status["is_soon"],
+                    }
                 if not rec.get("progress") and cet_progress_vals:
                     progress = sum(cet_progress_vals) / len(cet_progress_vals)
                 if not actual_end and cet_dates:
@@ -3634,28 +3683,7 @@ class PointageService:
             if actual_end:
                 progress = 100.0
             progress = max(0.0, min(100.0, progress))
-            start = MetronomeService._parse_date_only(t.get("start", ""))
-            end = MetronomeService._parse_date_only(t.get("end", ""))
-            if actual_end and end:
-                delay_days = max(0, (actual_end - end).days)
-            elif (not actual_end) and end and progress < 100 and today > end:
-                delay_days = (today - end).days
-            else:
-                delay_days = 0
-            delay_weeks = int((delay_days + 6) // 7) if delay_days > 0 else 0
-            days_until_end = (end - today).days if end else None
-            if progress >= 100 or actual_end:
-                status = "past"
-                status_label = "Terminé"
-            elif delay_days > 0:
-                status = "late"
-                status_label = "En retard"
-            elif days_until_end is not None and 0 <= days_until_end <= 14:
-                status = "soon"
-                status_label = "À venir"
-            else:
-                status = ""
-                status_label = ""
+            task_status = compute_schedule_status(end, progress, actual_end)
             planned_hours = clean_number(t.get("planned_hours"))
             cost_variation = clean_number(t.get("cost_variation"))
             planned_cost = cost_variation if cost_variation != 0 else (planned_hours * cst_rate if t.get("is_cst") else 0.0)
@@ -3664,18 +3692,18 @@ class PointageService:
                 **t,
                 "progress": round(progress, 1),
                 "actualEnd": actual_end.isoformat() if actual_end else clean_text(rec.get("actualEnd")),
-                "cet": cet_map,
+                "cet": cet_render_map if cet_render_map else cet_map,
                 "cetMembers": cet_members,
-                "status": status,
-                "statusLabel": status_label,
-                "delayDays": int(delay_days),
-                "delayWeeks": int(delay_weeks),
+                "status": task_status["status"],
+                "statusLabel": task_status["status_label"],
+                "delayDays": task_status["delay_days"],
+                "delayWeeks": task_status["delay_weeks"],
                 "plannedCostCst": round(planned_cost, 2),
                 "actualCostCst": round(actual_cost, 2),
                 "plannedHours": round(planned_hours, 2),
                 "cstRate": cst_rate,
-                "isLate": bool(delay_days > 0),
-                "isSoon": bool(status == "soon"),
+                "isLate": task_status["is_late"],
+                "isSoon": task_status["is_soon"],
             })
 
         children_by_parent: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
@@ -3700,7 +3728,7 @@ class PointageService:
 
             if max_delay_days > 0:
                 task["status"] = "late"
-                task["statusLabel"] = "En retard"
+                task["statusLabel"] = f"En retard, {max_delay_weeks} semaine{'s' if max_delay_weeks > 1 else ''}"
             elif any(child.get("status") == "soon" for child in children):
                 task["status"] = "soon"
                 task["statusLabel"] = "À venir"
@@ -4568,7 +4596,7 @@ function getProjectKey(){return state.selectedId?`id::${state.selectedId}`:'';}
 async function pointageApi(url,opts){const r=await fetch(url,opts);const d=await r.json();if(!r.ok) throw new Error(d.detail||'Erreur pointage');return d;}
 async function loadPointage(){if(!state.selectedId)return;try{const d=await pointageApi(`/api/project-management/pointage?affaire_id=${encodeURIComponent(state.selectedId)}`);state.pointage=d;renderPointage();}catch(e){console.warn(e);}}
 function levelGroups(tasks){const g={};for(const t of (tasks||[])){const lvl=t.level_label||t.level||'Général';(g[lvl]=g[lvl]||[]).push(t);}return g;}
-function renderPointage(){const root=document.getElementById('pointageWrap');const d=state.pointage||{};const tasks=d.tasks||[];if(!root)return;if(!tasks.length){root.innerHTML="<div class='small' style='padding:10px'>Aucun planning importé.</div>";return;}const expanded=new Set((d.workState&&d.workState.expanded_levels)||[]);const groups=levelGroups(tasks);let html=`<table><thead><tr><th>Tâche</th><th>Ressource</th><th>Début</th><th>Fin</th><th>% achevé</th><th>Réception réelle</th><th>Retard</th><th>Coût planifié CST</th><th>Coût pointé CST</th><th>Statut</th></tr></thead><tbody>`;for(const lvl of Object.keys(groups)){const open=expanded.has(lvl);html+=`<tr class='lvl-row'><td colspan='10'><button type='button' data-lvl='${esc(lvl)}' class='btn' style='height:28px'>${open?'−':'+'}</button> ${esc(lvl)}</td></tr>`;if(open){for(const t of groups[lvl]){const isSummary=Boolean(t.is_summary);const rowCls=isSummary?'lvl-row':(t.isLate?'task-late':(t.isSoon?'task-soon':''));const label=t.name;const start=fmtDateFrShort(t.start||'');const end=fmtDateFrShort(t.end||'');const depth=Math.max(0,Number(t.depth||0));const pad=12+(depth*14);const delayTxt=Number(t.delayWeeks||0)>0?`${Number(t.delayWeeks||0)} sem.`:'0 sem.';const statusHtml=t.status==='past'?'<span class=\"status-badge done\">Terminé</span>':(t.status==='late'?'<span class=\"status-badge late\">En retard</span>':(t.status==='soon'?'<span class=\"status-badge soon\">À venir</span>':''));if(isSummary){html+=`<tr class='${rowCls}'><td style='padding-left:${pad}px;font-weight:800'>${esc(t.name)}</td><td colspan='8'></td><td>${statusHtml}</td></tr>`;continue;}html+=`<tr class='${rowCls}'><td style='padding-left:${pad}px'>${esc(label)}</td><td>${esc((t.owner==='Non attribué'?'':t.owner))}</td><td>${esc(start)}</td><td>${esc(end)}</td><td><input data-task='${esc(t.task_id)}' data-field='progress' type='number' min='0' max='100' value='${Number(t.progress||0)}' style='width:70px'></td><td><input data-task='${esc(t.task_id)}' data-field='actualEnd' type='date' value='${esc(t.actualEnd||'')}'></td><td>${delayTxt}</td><td style='color:#b45f06;font-weight:800'>${Number(t.plannedCostCst||0)>0?Number(t.plannedCostCst||0).toFixed(0)+' €':''}</td><td>${Number(t.actualCostCst||0)>0?Number(t.actualCostCst||0).toFixed(0)+' €':''}</td><td>${statusHtml}</td></tr>`;if(t.is_cet&&t.cetMembers&&t.cetMembers.length){for(const m of t.cetMembers){const cm=((t.cet||{})[m]||{});html+=`<tr><td style='padding-left:${pad+16}px'>↳ ${esc(m)}</td><td>CET</td><td></td><td></td><td><input data-task='${esc(t.task_id)}' data-cet='${esc(m)}' data-field='progress' type='number' min='0' max='100' value='${Number(cm.progress||0)}' style='width:70px'></td><td><input data-task='${esc(t.task_id)}' data-cet='${esc(m)}' data-field='actualEnd' type='date' value='${esc(cm.actualEnd||'')}'></td><td colspan='4'></td></tr>`;}}}}}html+='</tbody></table>';root.innerHTML=html;Array.from(root.querySelectorAll('button[data-lvl]')).forEach(b=>b.addEventListener('click',async()=>{const lvl=b.getAttribute('data-lvl')||'';const ws={...(d.workState||{}),expanded_levels:[...new Set([...(d.workState?.expanded_levels||[])]) ]};const set=new Set(ws.expanded_levels);if(set.has(lvl))set.delete(lvl);else set.add(lvl);ws.expanded_levels=[...set];await savePointage({},ws);}));Array.from(root.querySelectorAll('input[data-task]')).forEach(inp=>inp.addEventListener('change',async()=>{const task=inp.getAttribute('data-task')||'';const field=inp.getAttribute('data-field')||'';const cet=inp.getAttribute('data-cet')||'';const patch={};if(cet){patch[task]={cet:{[cet]:{[field]:inp.value}}};}else{patch[task]={[field]:inp.value};}await savePointage(patch,d.workState||{});}));}
+function renderPointage(){const root=document.getElementById('pointageWrap');const d=state.pointage||{};const tasks=d.tasks||[];if(!root)return;if(!tasks.length){root.innerHTML="<div class='small' style='padding:10px'>Aucun planning importé.</div>";return;}const expanded=new Set((d.workState&&d.workState.expanded_levels)||[]);const groups=levelGroups(tasks);let html=`<table><thead><tr><th>Tâche</th><th>Ressource</th><th>Début</th><th>Fin</th><th>% achevé</th><th>Réception réelle</th><th>Retard</th><th>Coût planifié CST</th><th>Coût pointé CST</th><th>Statut</th></tr></thead><tbody>`;for(const lvl of Object.keys(groups)){const open=expanded.has(lvl);html+=`<tr class='lvl-row'><td colspan='10'><button type='button' data-lvl='${esc(lvl)}' class='btn' style='height:28px'>${open?'−':'+'}</button> ${esc(lvl)}</td></tr>`;if(open){for(const t of groups[lvl]){const isSummary=Boolean(t.is_summary);const rowCls=isSummary?'lvl-row':(t.isLate?'task-late':(t.isSoon?'task-soon':''));const label=t.name;const start=fmtDateFrShort(t.start||'');const end=fmtDateFrShort(t.end||'');const depth=Math.max(0,Number(t.depth||0));const pad=12+(depth*14);const delayTxt=`${Number(t.delayDays||0)} j`;const statusLabel=String(t.statusLabel||'');const statusHtml=t.status==='past'?'<span class=\"status-badge done\">Terminé</span>':(t.status==='late'?`<span class=\"status-badge late\">${esc(statusLabel)}</span>`:(t.status==='soon'?`<span class=\"status-badge soon\">${esc(statusLabel)}</span>`:''));if(isSummary){html+=`<tr class='${rowCls}'><td style='padding-left:${pad}px;font-weight:800'>${esc(t.name)}</td><td colspan='8'></td><td>${statusHtml}</td></tr>`;continue;}html+=`<tr class='${rowCls}'><td style='padding-left:${pad}px'>${esc(label)}</td><td>${esc((t.owner==='Non attribué'?'':t.owner))}</td><td>${esc(start)}</td><td>${esc(end)}</td><td><input data-task='${esc(t.task_id)}' data-field='progress' type='number' min='0' max='100' value='${Number(t.progress||0)}' style='width:70px'></td><td><input data-task='${esc(t.task_id)}' data-field='actualEnd' type='date' value='${esc(t.actualEnd||'')}'></td><td>${delayTxt}</td><td style='color:#b45f06;font-weight:800'>${Number(t.plannedCostCst||0)>0?Number(t.plannedCostCst||0).toFixed(0)+' €':''}</td><td>${Number(t.actualCostCst||0)>0?Number(t.actualCostCst||0).toFixed(0)+' €':''}</td><td>${statusHtml}</td></tr>`;if(t.is_cet&&t.cetMembers&&t.cetMembers.length){for(const m of t.cetMembers){const cm=((t.cet||{})[m]||{});const cmDelayTxt=`${Number(cm.delayDays||0)} j`;const cmStatusLabel=String(cm.statusLabel||'');const cmStatusHtml=cm.status==='past'?'<span class=\"status-badge done\">Terminé</span>':(cm.status==='late'?`<span class=\"status-badge late\">${esc(cmStatusLabel)}</span>`:(cm.status==='soon'?`<span class=\"status-badge soon\">${esc(cmStatusLabel)}</span>`:''));html+=`<tr><td style='padding-left:${pad+16}px'>↳ ${esc(m)}</td><td>CET</td><td></td><td></td><td><input data-task='${esc(t.task_id)}' data-cet='${esc(m)}' data-field='progress' type='number' min='0' max='100' value='${Number(cm.progress||0)}' style='width:70px'></td><td><input data-task='${esc(t.task_id)}' data-cet='${esc(m)}' data-field='actualEnd' type='date' value='${esc(cm.actualEnd||'')}'></td><td>${cmDelayTxt}</td><td></td><td></td><td>${cmStatusHtml}</td></tr>`;}}}}}html+='</tbody></table>';root.innerHTML=html;Array.from(root.querySelectorAll('button[data-lvl]')).forEach(b=>b.addEventListener('click',async()=>{const lvl=b.getAttribute('data-lvl')||'';const ws={...(d.workState||{}),expanded_levels:[...new Set([...(d.workState?.expanded_levels||[])]) ]};const set=new Set(ws.expanded_levels);if(set.has(lvl))set.delete(lvl);else set.add(lvl);ws.expanded_levels=[...set];await savePointage({},ws);}));Array.from(root.querySelectorAll('input[data-task]')).forEach(inp=>inp.addEventListener('change',async()=>{const task=inp.getAttribute('data-task')||'';const field=inp.getAttribute('data-field')||'';const cet=inp.getAttribute('data-cet')||'';const patch={};if(cet){patch[task]={cet:{[cet]:{[field]:inp.value}}};}else{patch[task]={[field]:inp.value};}await savePointage(patch,d.workState||{});}));}
 async function savePointage(pointagePatch,workState){if(!state.selectedId)return;const cetMembers=(document.getElementById('cetMembersInput')||{}).value||'';const payload={pointage_patch:{...pointagePatch,__cetMembers:cetMembers},work_state:workState||{}};const d=await pointageApi(`/api/project-management/pointage/save?affaire_id=${encodeURIComponent(state.selectedId)}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});state.pointage=d;renderPointage();}
 async function importPlanningFile(file){if(!state.selectedId||!file)return;const fd=new FormData();fd.append('file',file);const d=await fetch(`/api/project-management/pointage/planning/import?affaire_id=${encodeURIComponent(state.selectedId)}`,{method:'POST',body:fd});const j=await d.json();if(!d.ok)throw new Error(j.detail||'Import planning impossible');state.pointage=j;renderPointage();}
 async function importSuiviFile(file){if(!state.selectedId||!file)return;const fd=new FormData();fd.append('file',file);const d=await fetch(`/api/project-management/pointage/import-suivi?affaire_id=${encodeURIComponent(state.selectedId)}`,{method:'POST',body:fd});const j=await d.json();if(!d.ok)throw new Error(j.detail||'Import suivi impossible');state.pointage=j;renderPointage();}
