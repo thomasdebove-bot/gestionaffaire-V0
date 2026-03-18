@@ -2202,7 +2202,7 @@ class MetronomeService:
         # Nettoie les préfixes type jour abrégé: "Mar 09/12/25" -> "09/12/25"
         txt = re.sub(r"^(?:lun|mar|mer|jeu|ven|sam|dim|mon|tue|wed|thu|fri|sat|sun)\.?\s+", "", txt, flags=re.IGNORECASE)
         for fmt in (
-            "%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d", "%m/%d/%Y", "%m/%d/%y",
+            "%Y-%m-%d", "%d/%m/%Y", "%d/%m/%y", "%Y/%m/%d", "%m/%d/%Y", "%m/%d/%y",
             "%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S",
             "%Y-%m-%dT%H:%M:%S", "%m/%d/%Y %H:%M", "%m/%d/%Y %H:%M:%S", "%m/%d/%y %H:%M",
             "%m/%d/%Y %I:%M %p", "%m/%d/%y %I:%M %p", "%d/%m/%y %H:%M:%S"
@@ -3339,7 +3339,28 @@ class PointageService:
     def _csv_rows(text: str) -> List[Dict[str, str]]:
         first = text.splitlines()[0] if text.splitlines() else ""
         delimiter = ";" if first.count(";") >= first.count(",") and first.count(";") > 0 else ("	" if "	" in first else ",")
-        return list(csv.DictReader(io.StringIO(text), delimiter=delimiter))
+        reader = csv.reader(io.StringIO(text), delimiter=delimiter)
+        rows = list(reader)
+        if not rows:
+            return []
+
+        raw_headers = rows[0]
+        headers: List[str] = []
+        seen: Dict[str, int] = {}
+        for idx, header in enumerate(raw_headers):
+            base = clean_text(header) or f"__col_{idx}"
+            count = seen.get(base, 0)
+            seen[base] = count + 1
+            headers.append(base if count == 0 else f"{base}__{count}")
+
+        normalized_rows: List[Dict[str, str]] = []
+        for raw_row in rows[1:]:
+            padded = list(raw_row) + [""] * max(0, len(headers) - len(raw_row))
+            normalized_rows.append({
+                headers[idx]: padded[idx] if idx < len(padded) else ""
+                for idx in range(len(headers))
+            })
+        return normalized_rows
 
     @staticmethod
     def _find_col(row: Dict[str, Any], names: List[str]) -> str:
@@ -3347,6 +3368,13 @@ class PointageService:
             for k in row.keys():
                 if slugify(k) == slugify(n) or slugify(n) in slugify(k):
                     return k
+        return ""
+
+    @staticmethod
+    def _get_col_by_position(row: Dict[str, Any], position: int) -> str:
+        keys = list(row.keys())
+        if 0 <= position < len(keys):
+            return keys[position]
         return ""
 
     @staticmethod
@@ -3380,24 +3408,71 @@ class PointageService:
             return value, value, "hours"
         return value, value, "hours"
 
+    @staticmethod
+    def _normalize_task_dates(tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        children_by_parent: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for task in tasks:
+            parent_task_id = clean_text(task.get("parent_task_id"))
+            if parent_task_id:
+                children_by_parent[parent_task_id].append(task)
+
+        for task in reversed(tasks):
+            start_date = MetronomeService._parse_date_only(clean_text(task.get("start")))
+            end_date = MetronomeService._parse_date_only(clean_text(task.get("end")))
+
+            child_start_dates: List[date] = []
+            child_end_dates: List[date] = []
+            for child in children_by_parent.get(clean_text(task.get("task_id")), []):
+                child_start = MetronomeService._parse_date_only(clean_text(child.get("start")))
+                child_end = MetronomeService._parse_date_only(clean_text(child.get("end")))
+                if child_start:
+                    child_start_dates.append(child_start)
+                if child_end:
+                    child_end_dates.append(child_end)
+
+            if not start_date and child_start_dates:
+                start_date = min(child_start_dates)
+            if not end_date and child_end_dates:
+                end_date = max(child_end_dates)
+            if not start_date and end_date:
+                start_date = end_date
+            if not end_date and start_date:
+                end_date = start_date
+
+            if start_date:
+                task["start"] = start_date.isoformat()
+            if end_date:
+                task["end"] = end_date.isoformat()
+
+        return tasks
+
+    @staticmethod
+    def _deep_merge_dicts(base: Any, patch: Any) -> Any:
+        if not isinstance(base, dict) or not isinstance(patch, dict):
+            return patch
+        merged = dict(base)
+        for key, value in patch.items():
+            merged[key] = PointageService._deep_merge_dicts(merged.get(key), value)
+        return merged
+
     def parse_planning(self, raw: bytes) -> List[Dict[str, Any]]:
         text = self._decode_csv(raw)
         rows = self._csv_rows(text)
         if not rows:
             return []
         first = rows[0]
-        c_id = self._find_col(first, ["id", "task id", "id tache", "uid"])
-        c_name = self._find_col(first, ["task name", "nom", "name", "tache"])
-        c_start = self._find_col(first, ["start", "start date", "start1", "début (f)", "debut (f)", "debut", "début", "date debut", "date début"])
-        c_end = self._find_col(first, ["finish", "finish date", "finish1", "fin (g)", "fin", "date fin", "end", "end date"])
-        c_work = self._find_col(first, ["work", "charge", "planned hours", "travail", "duree", "durée", "duration"])
-        c_duration = self._find_col(first, ["duration", "duree", "durée", "planned duration"])
+        c_id = self._get_col_by_position(first, 0) or self._find_col(first, ["id", "task id", "id tache", "uid", "n°", "numero"])
+        c_name = self._get_col_by_position(first, 3) or self._find_col(first, ["task name", "nom", "name", "tache"])
+        c_start = self._get_col_by_position(first, 5) or self._find_col(first, ["start", "start date", "start1", "début (f)", "debut (f)", "debut", "début", "date debut", "date début"])
+        c_end = self._get_col_by_position(first, 6) or self._find_col(first, ["finish", "finish date", "finish1", "fin (g)", "fin", "date fin", "end", "end date"])
+        c_work = self._get_col_by_position(first, 7) or self._find_col(first, ["work", "charge", "planned hours", "travail_planif", "travail", "duree", "durée", "duration"])
+        c_duration = self._get_col_by_position(first, 4) or self._find_col(first, ["duration", "duree", "durée", "planned duration"])
         c_owner = self._find_col(first, ["owner", "resource", "nom de ressources", "nom de ressource", "responsable", "ressource"])
         c_pct = self._find_col(first, ["%", "% acheve", "% achevé", "% complete", "percent", "percentage complete", "percent complete", "acheve", "achevé", "avancement", "pourcentage_acheve", "pourcentage acheve"])
         c_outline = self._find_col(first, ["outline level", "outline", "niveau", "level", "wbs", "indent"])
         c_summary = self._find_col(first, ["summary", "is summary", "recap", "récap"])
         c_pred = self._find_col(first, ["predecessors", "pred", "predecesseurs", "prédécesseurs"])
-        c_unit_cost = self._find_col(first, ["variation_de_cout", "variation de cout", "variation_de_coût", "variation de coût", "variation_de_coût (p)", "variation de coût (p)", "unit cost", "cout unitaire", "coût unitaire", "rate"])
+        c_unit_cost = self._get_col_by_position(first, 8) or self._find_col(first, ["variation_de_cout", "variation de cout", "variation_de_coût", "variation de coût", "variation_de_coût (p)", "variation de coût (p)", "unit cost", "cout unitaire", "coût unitaire", "rate"])
 
         tasks: List[Dict[str, Any]] = []
         outlines: List[int] = []
@@ -3474,7 +3549,7 @@ class PointageService:
                 task["is_summary"] = True
                 task["is_actionable"] = False
 
-        return tasks
+        return self._normalize_task_dates(tasks)
 
     def _ensure_project(self, key: str) -> Dict[str, Any]:
         data = self._load()
@@ -3511,7 +3586,10 @@ class PointageService:
             proj = data["projects"][project_key]
             p = proj.setdefault("pointage", {"__cetMembers": "", "__cstRate": 80})
             for k, v in pointage_patch.items():
-                p[k] = v
+                if k.startswith("__"):
+                    p[k] = v
+                else:
+                    p[k] = self._deep_merge_dicts(p.get(k, {}), v)
             if work_state is not None:
                 proj["workState"] = work_state
             proj["updated_at"] = now_iso()
@@ -3533,6 +3611,43 @@ class PointageService:
         cst_rate = clean_number(pointage.get("__cstRate", 80))
         today = datetime.now().date()
         out: List[Dict[str, Any]] = []
+
+        def compute_schedule_status(end: Optional[date], progress_value: float, actual_end_value: Optional[date]) -> Dict[str, Any]:
+            if actual_end_value and end:
+                delay_days_value = max(0, (actual_end_value - end).days)
+            elif (not actual_end_value) and end and progress_value < 100 and today > end:
+                delay_days_value = (today - end).days
+            else:
+                delay_days_value = 0
+
+            delay_weeks_value = int(delay_days_value // 7) if delay_days_value >= 7 else 0
+            days_until_end_value = (end - today).days if end else None
+
+            if progress_value >= 100 or actual_end_value:
+                status_value = "past"
+                status_label_value = "Terminé"
+            elif delay_days_value > 0:
+                status_value = "late"
+                if delay_days_value < 7:
+                    status_label_value = f"En retard, {delay_days_value} jour{'s' if delay_days_value > 1 else ''}"
+                else:
+                    status_label_value = f"En retard, {delay_weeks_value} semaine{'s' if delay_weeks_value > 1 else ''}"
+            elif days_until_end_value is not None and 0 <= days_until_end_value <= 14:
+                status_value = "soon"
+                status_label_value = "À venir"
+            else:
+                status_value = ""
+                status_label_value = ""
+
+            return {
+                "delay_days": int(delay_days_value),
+                "delay_weeks": int(delay_weeks_value),
+                "status": status_value,
+                "status_label": status_label_value,
+                "is_late": bool(delay_days_value > 0),
+                "is_soon": bool(status_value == "soon"),
+            }
+
         for t in planning_tasks:
             rec = pointage.get(t["task_id"], {}) if isinstance(pointage.get(t["task_id"]), dict) else {}
             progress = clean_number(rec.get("progress", t.get("csv_progress", 0)))
@@ -3540,6 +3655,9 @@ class PointageService:
             cet_map = rec.get("cet", {}) if isinstance(rec.get("cet"), dict) else {}
             cet_progress_vals = []
             cet_dates: List[date] = []
+            cet_render_map: Dict[str, Dict[str, Any]] = {}
+            start = MetronomeService._parse_date_only(t.get("start", ""))
+            end = MetronomeService._parse_date_only(t.get("end", ""))
             if t.get("is_cet") and cet_members:
                 for m in cet_members:
                     cm = cet_map.get(m, {}) if isinstance(cet_map.get(m), dict) else {}
@@ -3549,6 +3667,18 @@ class PointageService:
                         cp = 100.0
                         cet_dates.append(ca)
                     cet_progress_vals.append(max(0.0, min(100.0, cp)))
+                    member_status = compute_schedule_status(end, max(0.0, min(100.0, cp)), ca)
+                    cet_render_map[m] = {
+                        **cm,
+                        "progress": max(0.0, min(100.0, cp)),
+                        "actualEnd": ca.isoformat() if ca else clean_text(cm.get("actualEnd")),
+                        "delayDays": member_status["delay_days"],
+                        "delayWeeks": member_status["delay_weeks"],
+                        "status": member_status["status"],
+                        "statusLabel": member_status["status_label"],
+                        "isLate": member_status["is_late"],
+                        "isSoon": member_status["is_soon"],
+                    }
                 if not rec.get("progress") and cet_progress_vals:
                     progress = sum(cet_progress_vals) / len(cet_progress_vals)
                 if not actual_end and cet_dates:
@@ -3556,20 +3686,7 @@ class PointageService:
             if actual_end:
                 progress = 100.0
             progress = max(0.0, min(100.0, progress))
-            start = MetronomeService._parse_date_only(t.get("start", ""))
-            end = MetronomeService._parse_date_only(t.get("end", ""))
-            if actual_end and end:
-                delay_days = max(0, (actual_end - end).days)
-            elif (not actual_end) and end and progress < 100 and today > end:
-                delay_days = (today - end).days
-            else:
-                delay_days = 0
-            if progress >= 100 or actual_end:
-                status = "past"
-            elif start and today < start:
-                status = "future"
-            else:
-                status = "current"
+            task_status = compute_schedule_status(end, progress, actual_end)
             planned_hours = clean_number(t.get("planned_hours"))
             cost_variation = clean_number(t.get("cost_variation"))
             planned_cost = cost_variation if cost_variation != 0 else (planned_hours * cst_rate if t.get("is_cst") else 0.0)
@@ -3578,22 +3695,69 @@ class PointageService:
                 **t,
                 "progress": round(progress, 1),
                 "actualEnd": actual_end.isoformat() if actual_end else clean_text(rec.get("actualEnd")),
-                "cet": cet_map,
+                "cet": cet_render_map if cet_render_map else cet_map,
                 "cetMembers": cet_members,
-                "status": status,
-                "delayDays": int(delay_days),
+                "status": task_status["status"],
+                "statusLabel": task_status["status_label"],
+                "delayDays": task_status["delay_days"],
+                "delayWeeks": task_status["delay_weeks"],
                 "plannedCostCst": round(planned_cost, 2),
                 "actualCostCst": round(actual_cost, 2),
                 "plannedHours": round(planned_hours, 2),
                 "cstRate": cst_rate,
-                "isLate": bool(delay_days > 0),
+                "isLate": task_status["is_late"],
+                "isSoon": task_status["is_soon"],
             })
+
+        children_by_parent: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for task in out:
+            parent_task_id = clean_text(task.get("parent_task_id"))
+            if parent_task_id:
+                children_by_parent[parent_task_id].append(task)
+
+        for task in reversed(out):
+            if not task.get("is_summary"):
+                continue
+            children = children_by_parent.get(clean_text(task.get("task_id")), [])
+            if not children:
+                continue
+            max_delay_days = max(int(clean_number(child.get("delayDays"))) for child in children)
+            max_delay_weeks = max(int(clean_number(child.get("delayWeeks"))) for child in children)
+            latest_actual_end = None
+            for child in children:
+                child_actual_end = MetronomeService._parse_date_only(clean_text(child.get("actualEnd")))
+                if child_actual_end and (latest_actual_end is None or child_actual_end > latest_actual_end):
+                    latest_actual_end = child_actual_end
+
+            if all(child.get("status") == "past" for child in children):
+                task["status"] = "past"
+                task["statusLabel"] = "Terminé"
+            elif max_delay_days > 0:
+                task["status"] = "late"
+                if max_delay_days < 7:
+                    task["statusLabel"] = f"En retard, {max_delay_days} jour{'s' if max_delay_days > 1 else ''}"
+                else:
+                    task["statusLabel"] = f"En retard, {max_delay_weeks} semaine{'s' if max_delay_weeks > 1 else ''}"
+            elif any(child.get("status") == "soon" for child in children):
+                task["status"] = "soon"
+                task["statusLabel"] = "À venir"
+            else:
+                task["status"] = ""
+                task["statusLabel"] = ""
+
+            task["delayDays"] = max_delay_days
+            task["delayWeeks"] = max_delay_weeks
+            task["isLate"] = bool(max_delay_days > 0)
+            task["isSoon"] = bool(task.get("status") == "soon")
+            if latest_actual_end:
+                task["actualEnd"] = latest_actual_end.isoformat()
         return out
 
     def get_project_data(self, project_key: str) -> Dict[str, Any]:
         data = self._load()
         proj = data.get("projects", {}).get(project_key, {"planning_tasks": [], "pointage": {"__cetMembers": "", "__cstRate": 80}, "workState": {"expanded_levels": []}})
-        tasks = self.compute_tasks(proj.get("planning_tasks", []), proj.get("pointage", {}))
+        normalized_planning_tasks = self._normalize_task_dates(list(proj.get("planning_tasks", [])))
+        tasks = self.compute_tasks(normalized_planning_tasks, proj.get("pointage", {}))
         return {
             "project_key": project_key,
             "tasks": tasks,
@@ -3618,11 +3782,31 @@ def pointage_finance_summary(affaire_id: str, commande_ht: float) -> Dict[str, f
     actionable = [t for t in tasks if not bool(t.get("is_summary"))]
     planned = sum(clean_number(t.get("plannedCostCst")) for t in actionable)
     actual = sum(clean_number(t.get("actualCostCst")) for t in actionable)
+
+    production_by_month: Dict[str, float] = {m: 0.0 for m in MONTHS}
+    for t in actionable:
+        anchor = (
+            MetronomeService._parse_date_only(clean_text(t.get("end")))
+            or MetronomeService._parse_date_only(clean_text(t.get("start")))
+        )
+        if not anchor:
+            continue
+        month_key = MONTHS[max(0, min(11, anchor.month - 1))]
+        production_by_month[month_key] += clean_number(t.get("plannedCostCst"))
+
+    cumulative = 0.0
+    production_cumulative_by_month: Dict[str, float] = {}
+    for month_key in MONTHS:
+        cumulative += production_by_month.get(month_key, 0.0)
+        production_cumulative_by_month[month_key] = round(cumulative, 2)
+
     progress_ratio = (actual / planned) if planned > 0 else 0.0
     progress_amount = clean_number(commande_ht) * progress_ratio if clean_number(commande_ht) > 0 else 0.0
     return {
         "pointage_cost_planned_cst": round(planned, 2),
         "pointage_cost_actual_cst": round(actual, 2),
+        "production_cumulee_estimee": round(cumulative, 2),
+        "production_cumulee_mensuelle": production_cumulative_by_month,
         "pointage_progress_ratio": round(progress_ratio, 4),
         "pointage_progress_amount": round(progress_amount, 2),
     }
@@ -4228,6 +4412,7 @@ function euro(v){return new Intl.NumberFormat('fr-FR',{style:'currency',currency
 function pct(v){return new Intl.NumberFormat('fr-FR',{style:'percent',maximumFractionDigits:1}).format(Number(v||0));}
 function fmt(v){return new Intl.NumberFormat('fr-FR',{maximumFractionDigits:0}).format(Number(v||0));}
 function esc(v){return String(v??'').replace(/[&<>]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[ch]||ch));}
+function cleanText(v){return String(v||'').trim();}
 function boondOptionsHtml(b){const opts=(b&&b.project_options)||[];const q=String(state.boondProjectSearch||'').trim().toLowerCase();const visible=opts.filter(o=>{if(!q)return true;const txt=`${o.project_label||o.project_reference||''} ${o.project_id||''}`.toLowerCase();return txt.includes(q);});const current=String(state.boondForcedProjectId||(((b||{}).matched_project||{}).project_id||''));return [`<option value=''>-- Choisir un projet BOOND --</option>`].concat(visible.map(o=>`<option value='${esc(o.project_id)}' ${String(o.project_id)===current?'selected':''}>${esc(o.project_label||o.project_reference||o.project_id)} [${esc(String(o.project_id))}] (score ${esc(String(o.score||0))})</option>`)).join('');}
 function showError(msg){const b=document.getElementById('errorBox');b.textContent=msg||'Erreur';b.style.display='block';}
 function clearError(){document.getElementById('errorBox').style.display='none';}
@@ -4283,7 +4468,7 @@ def gestion_projet_html() -> str:
 .kpis{margin-top:12px;padding:14px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.k{border:1px solid var(--line);border-radius:14px;padding:14px;background:#fbfdff}.k .v{font-size:34px;font-weight:900;margin-top:6px}
 .section{margin-top:12px;padding:14px}.subgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:14px}table{width:100%;border-collapse:collapse}th,td{padding:10px 12px;border-bottom:1px solid var(--line);border-right:1px solid #e8edf5;font-size:13px;text-align:left}th:last-child,td:last-child{border-right:none}th{background:#f7f9fc;font-size:12px;color:#5b6880;text-transform:uppercase}.small{color:var(--muted);font-size:13px}
 .bar{height:10px;background:#edf1f8;border-radius:999px;overflow:hidden}.fill{height:100%;background:#ef8d00}
-.loading-wrap{margin-top:8px;padding:8px 10px;border:1px solid #d8e0ee;border-radius:12px;background:#fff}.loading-label{font-size:12px;color:#5b6880;margin-bottom:6px;font-weight:700}.loading-track{height:8px;border-radius:999px;background:#eef2f8;overflow:hidden}.loading-bar{height:100%;width:35%;background:linear-gradient(90deg,#ef8d00,#ffd08a);animation:loadmove 1.2s infinite ease-in-out}@keyframes loadmove{0%{margin-left:-35%}100%{margin-left:100%}}.match-box{margin-top:10px;border:1px solid var(--line);border-radius:10px;padding:8px;background:#fffaf2}.match-box.ok{border-color:#49a66a;background:#f4fcf6}.match-box.warn{border-color:#ef8d00;background:#fff7ec}.match-title{font-weight:700;margin-bottom:4px;font-size:13px}.conf-badge{display:inline-block;margin-left:8px;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:800;background:#eef2f8;color:#3b4f6f}.match-grid{display:none;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.match-box:hover .match-grid,.match-box:focus-within .match-grid{display:grid}.match-item{font-size:12px;color:#30425f}.match-item b{display:block;color:#6e7a90;font-size:11px;margin-bottom:2px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-word}.pilot-box{margin-top:12px;border:1px solid #cfd8e8;border-radius:18px;padding:16px;background:#f8fbff}.pilot-title{font-size:34px;font-weight:900;margin:4px 0 10px}.pilot-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.pilot-card{background:#fff;border:1px solid #d8e0ee;border-radius:18px;padding:14px}.pilot-card .t{font-size:15px;color:#4b5d7a;font-weight:800}.pilot-card .v{font-size:44px;font-weight:900;margin-top:8px}.pilot-list{margin-top:12px;border:1px solid #d8e0ee;border-radius:18px;background:#fff;padding:10px}.pilot-row{display:flex;justify-content:space-between;gap:12px;padding:12px;border:1px solid #e6ecf6;border-radius:12px;margin:8px 0;background:linear-gradient(180deg,#ffffff 0%,#f8fbff 100%)}.pilot-row:last-child{border-bottom:1px solid #e6ecf6}.pilot-row .name{font-weight:800}.pilot-row-btn{appearance:none;-webkit-appearance:none;width:100%;text-align:left;background:none;cursor:pointer;color:inherit;font:inherit}.company-cell{display:flex;align-items:center;gap:10px}.company-logo{width:28px;height:28px;border-radius:50%;border:1px solid #d8e0ee;background:#fff;object-fit:cover;display:inline-flex;align-items:center;justify-content:center;font-size:11px;color:#6e7a90;font-weight:800}.proj-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.progress-card{border:1px solid #d8e0ee;border-radius:14px;padding:12px;background:#fff}.progress-title{font-weight:800;margin-bottom:8px}.progress-row{display:grid;grid-template-columns:180px 1fr 70px;gap:10px;align-items:center;padding:6px 0}.progress-track{height:10px;border-radius:999px;background:#edf1f8;overflow:hidden}.progress-fill{height:100%;background:#1b6ef3}.curve-wrap{border:1px solid #d8e0ee;border-radius:14px;padding:12px;background:#fff}.project-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.project-cover{width:220px;height:132px;border-radius:14px;border:1px solid #d8e0ee;object-fit:cover;background:#fff;box-shadow:0 10px 24px rgba(16,32,56,.12)}.project-logo{width:88px;height:88px;border-radius:16px;background:#fff;border:1px solid var(--line);padding:14px;box-shadow:0 8px 20px rgba(18,32,51,.08);object-fit:contain}.project-title{font-size:30px;font-weight:900;margin:4px 0 2px}.project-desc{color:#6e7a90;margin:2px 0 0}.timeline-box{margin:10px 0;border:1px solid #d8e0ee;border-radius:14px;background:#fff;padding:10px}.timeline-row{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px}.timeline-track{height:12px;border-radius:999px;background:#edf1f8;overflow:hidden}.timeline-fill{height:100%;background:#1b6ef3}.timeline-fill.over{background:#d64545}.chart-controls{display:flex;gap:8px;align-items:center;margin-bottom:8px}.chart-select{height:36px;border:1px solid var(--line);border-radius:10px;padding:0 10px}.react-row{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px dashed #d8e0ee}.react-row:last-child{border-bottom:none}.pm-modal{position:fixed;inset:0;background:rgba(11,20,33,.45);display:flex;align-items:center;justify-content:center;padding:20px;z-index:50}.pm-modal-box{background:#fff;border-radius:14px;max-width:1100px;width:100%;max-height:82vh;overflow:auto;padding:14px;border:1px solid #d8e0ee}.lvl-row{background:#f7f9fd;font-weight:800}.task-late{background:#fff1f1}.task-soon{background:#fffaf0}
+.loading-wrap{margin-top:8px;padding:8px 10px;border:1px solid #d8e0ee;border-radius:12px;background:#fff}.loading-label{font-size:12px;color:#5b6880;margin-bottom:6px;font-weight:700}.loading-track{height:8px;border-radius:999px;background:#eef2f8;overflow:hidden}.loading-bar{height:100%;width:35%;background:linear-gradient(90deg,#ef8d00,#ffd08a);animation:loadmove 1.2s infinite ease-in-out}@keyframes loadmove{0%{margin-left:-35%}100%{margin-left:100%}}.match-box{margin-top:10px;border:1px solid var(--line);border-radius:10px;padding:8px;background:#fffaf2}.match-box.ok{border-color:#49a66a;background:#f4fcf6}.match-box.warn{border-color:#ef8d00;background:#fff7ec}.match-title{font-weight:700;margin-bottom:4px;font-size:13px}.conf-badge{display:inline-block;margin-left:8px;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:800;background:#eef2f8;color:#3b4f6f}.match-grid{display:none;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.match-box:hover .match-grid,.match-box:focus-within .match-grid{display:grid}.match-item{font-size:12px;color:#30425f}.match-item b{display:block;color:#6e7a90;font-size:11px;margin-bottom:2px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-word}.pilot-box{margin-top:12px;border:1px solid #cfd8e8;border-radius:18px;padding:16px;background:#f8fbff}.pilot-title{font-size:34px;font-weight:900;margin:4px 0 10px}.pilot-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.pilot-card{background:#fff;border:1px solid #d8e0ee;border-radius:18px;padding:14px}.pilot-card .t{font-size:15px;color:#4b5d7a;font-weight:800}.pilot-card .v{font-size:44px;font-weight:900;margin-top:8px}.pilot-list{margin-top:12px;border:1px solid #d8e0ee;border-radius:18px;background:#fff;padding:10px}.pilot-row{display:flex;justify-content:space-between;gap:12px;padding:12px;border:1px solid #e6ecf6;border-radius:12px;margin:8px 0;background:linear-gradient(180deg,#ffffff 0%,#f8fbff 100%)}.pilot-row:last-child{border-bottom:1px solid #e6ecf6}.pilot-row .name{font-weight:800}.pilot-row-btn{appearance:none;-webkit-appearance:none;width:100%;text-align:left;background:none;cursor:pointer;color:inherit;font:inherit}.company-cell{display:flex;align-items:center;gap:10px}.company-logo{width:28px;height:28px;border-radius:50%;border:1px solid #d8e0ee;background:#fff;object-fit:cover;display:inline-flex;align-items:center;justify-content:center;font-size:11px;color:#6e7a90;font-weight:800}.proj-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.progress-card{border:1px solid #d8e0ee;border-radius:14px;padding:12px;background:#fff}.progress-title{font-weight:800;margin-bottom:8px}.progress-row{display:grid;grid-template-columns:180px 1fr 70px;gap:10px;align-items:center;padding:6px 0}.progress-track{height:10px;border-radius:999px;background:#edf1f8;overflow:hidden}.progress-fill{height:100%;background:#1b6ef3}.curve-wrap{border:1px solid #d8e0ee;border-radius:14px;padding:12px;background:#fff}.project-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.project-cover{width:220px;height:132px;border-radius:14px;border:1px solid #d8e0ee;object-fit:cover;background:#fff;box-shadow:0 10px 24px rgba(16,32,56,.12)}.project-logo{width:88px;height:88px;border-radius:16px;background:#fff;border:1px solid var(--line);padding:14px;box-shadow:0 8px 20px rgba(18,32,51,.08);object-fit:contain}.project-title{font-size:30px;font-weight:900;margin:4px 0 2px}.project-desc{color:#6e7a90;margin:2px 0 0}.timeline-box{margin:10px 0;border:1px solid #d8e0ee;border-radius:14px;background:#fff;padding:10px}.timeline-row{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px}.timeline-track{height:12px;border-radius:999px;background:#edf1f8;overflow:hidden}.timeline-fill{height:100%;background:#1b6ef3}.timeline-fill.over{background:#d64545}.chart-controls{display:flex;gap:8px;align-items:center;margin-bottom:8px}.chart-select{height:36px;border:1px solid var(--line);border-radius:10px;padding:0 10px}.react-row{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px dashed #d8e0ee}.react-row:last-child{border-bottom:none}.pm-modal{position:fixed;inset:0;background:rgba(11,20,33,.45);display:flex;align-items:center;justify-content:center;padding:20px;z-index:50}.pm-modal-box{background:#fff;border-radius:14px;max-width:1100px;width:100%;max-height:82vh;overflow:auto;padding:14px;border:1px solid #d8e0ee}.lvl-row{background:#f7f9fd;font-weight:800}.task-late{background:#fff1f1}.task-soon{background:#fffaf0}.task-cst td:first-child,.task-cst td:nth-child(2){font-weight:900;color:#9a5a00}.status-badge{display:inline-flex;align-items:center;justify-content:center;padding:4px 10px;border-radius:999px;font-weight:900;font-size:12px;min-width:96px}.status-badge.done{color:#1f7a3f;background:#eaf8ef}.status-badge.late{color:#b42318;background:#ffeded;animation:statuspulse 1s infinite}.status-badge.soon{color:#9a6700;background:#fff4e5;animation:statuspulse 1.4s infinite}@keyframes statuspulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.55;transform:scale(1.03)}}
 @media (max-width:980px){.top{grid-template-columns:1fr}.menu-row,.project-row{flex-direction:column;align-items:stretch}.grid{grid-template-columns:repeat(2,1fr)}.subgrid{grid-template-columns:1fr}}@media (max-width:640px){.grid{grid-template-columns:1fr}}
 </style></head>
 <body><div class='wrap'>
@@ -4358,8 +4543,19 @@ def gestion_projet_html() -> str:
   </div>
 
   <div id='sectionReactivity' class='section'>
-    <h3>Niveau 2 — Réactivité par entreprise (écart moyen échéance → clôture)</h3>
-    <div id='reactivityList' class='pilot-list'><div class='small'>Aucune donnée</div></div>
+    <h3>Niveau 2 — Analyse entreprise et pointage opérationnel</h3>
+    <div class='chart-controls'>
+      <label for='level2Metric' class='small'>Graphique :</label>
+      <select id='level2Metric' class='chart-select'>
+        <option value='reactivity'>Réactivité par entreprise suivant réunion MÉTRONOME</option>
+        <option value='resourceDelay'>Retard moyen par ressource issu du pointage opérationnel</option>
+        <option value='zoneTrigger'>Lot déclencheur du retard par niveau / zone</option>
+        <option value='cstGap'>Écart coût planifié CST vs coût pointé CST</option>
+        <option value='zoneProgress'>Avancement pointé par niveau / zone</option>
+      </select>
+    </div>
+    <div id='level2AnalyticsInfo' class='small' style='margin-bottom:10px'>Choisissez un graphique de niveau 2.</div>
+    <div id='level2AnalyticsChart' class='pilot-list'><div class='small'>Aucune donnée</div></div>
   </div>
 
   <div class='section'>
@@ -4389,9 +4585,10 @@ def gestion_projet_html() -> str:
 
 </div>
 <script>
-const state={affaires:[],selectedId:'',selectedLabel:'',board:null,pointage:null};
+const state={affaires:[],selectedId:'',selectedLabel:'',selectedMeta:null,board:null,pointage:null};
 function resolveAffaire(input){const raw=String(input||'').trim();if(!raw)return null;const low=raw.toLowerCase();const slug=raw.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g,'').replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'');return (state.affaires||[]).find(a=>String(a.affaire_id||'')===raw)|| (state.affaires||[]).find(a=>String(a.display_name||'').toLowerCase()===low)|| (state.affaires||[]).find(a=>String(a.display_name||'').toLowerCase().startsWith(low))|| (state.affaires||[]).find(a=>String((a.display_name||'').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g,'').replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,''))===slug)||null;}
 function esc(v){return String(v??'').replace(/[&<>]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[ch]||ch));}
+function cleanText(v){return String(v||'').trim();}
 async function api(u){const r=await fetch(u);const d=await r.json();if(!r.ok) throw new Error(d.detail||'Erreur API');return d;}
 function renderBars(id,items){const root=document.getElementById(id);if(!root)return;if(!items||!items.length){root.innerHTML="<div class='small'>Aucune donnée</div>";return;}const max=Math.max(1,...items.map(x=>Number(x.count||0)));root.innerHTML=items.map(x=>`<div style='margin:8px 0'><div style='display:flex;justify-content:space-between;gap:8px'><span>${esc(x.label)}</span><strong>${x.count}</strong></div><div class='bar'><div class='fill' style='width:${(Number(x.count||0)/max)*100}%'></div></div></div>`).join('');}
 function renderTable(rows){const root=document.getElementById('boardTable');if(!root)return;if(!rows||!rows.length){root.innerHTML="<div class='small' style='padding:12px'>Aucun sujet ouvert.</div>";return;}root.innerHTML=`<table><thead><tr><th>Zone</th><th>Lot</th><th>Sujet</th><th>Entreprise</th><th>Responsable</th><th>Statut</th><th>Date échéance</th><th>Réunion origine</th><th>Commentaire</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${esc(r.zone)}</td><td>${esc(r.lot)}</td><td>${esc(r.sujet)}</td><td>${esc(r.entreprise)}</td><td>${esc(r.responsable)}</td><td>${esc(r.statut)}</td><td>${esc(r.date_echeance)}</td><td>${esc(r.reunion_origine)}</td><td>${esc(r.commentaire)}</td></tr>`).join('')}</tbody></table>`;}
@@ -4404,24 +4601,44 @@ function parseDateOnly(v){const raw=String(v||'').trim();if(!raw)return null;con
 function reminderWeeks(deadline){const d=parseDateOnly(deadline);if(!d)return 0;const now=new Date();const today=new Date(now.getFullYear(),now.getMonth(),now.getDate());const diff=Math.floor((today-d)/(1000*60*60*24));if(diff<=0)return 0;return Math.floor(diff/7)+1;}
 function renderProjectTimeline(b){const p=((b&&b.analytics)||{}).kpi_project_progress||{};const root=document.getElementById('timelineBox');if(!root)return;const total=Number(p.total_days||0);if(!total){root.innerHTML="<div class='small'>Période projet indisponible</div>";return;}const elapsedRaw=Number(p.elapsed_days_raw||0);const over=Number(p.overrun_days||0);const overPct=Number(p.overrun_pct||0);const basePct=Math.max(0,Math.min(100,Number(p.calendar_progress_pct||0)));const fillClass=(p.is_overrun?'timeline-fill over':'timeline-fill');const extra= p.is_overrun ? ` · Dépassement: <strong>${over} jours (${overPct}%)</strong>` : '';root.innerHTML=`<div class='timeline-row'><span><strong>Progression temporelle</strong></span><span><strong>${basePct.toFixed(0)}%</strong></span></div><div class='timeline-track'><div class='${fillClass}' style='width:${basePct}%'></div></div><div class='small' style='margin-top:6px'>Commencé le ${esc(fmtDateFr(p.start_date))}.<br>Fin prévue le ${esc(fmtDateFr(p.end_date))}.<br>${elapsedRaw}/${total} jours écoulés${extra}</div>`;}
 function renderCompanyChart(b){const p=(b&&b.kpis_pilotage)||{};const metricEl=document.getElementById('companyMetric');const metric=(metricEl&&metricEl.value)||'open';const views=p.project_company_views||{};const items=views[metric]||[];const root=document.getElementById('companyChartList');if(!root)return;if(!items.length){root.innerHTML="<div class='small'>Aucune donnée</div>";return;}const max=Math.max(1,...items.map(x=>Number(x.count||0)));root.innerHTML=items.map(x=>{const val=Number(x.count||0);return `<div class='pilot-row' style='display:block;border:1px solid #e7edf7;border-radius:12px;margin:8px 0;padding:10px;background:#fff'><div style='display:flex;justify-content:space-between;align-items:center;gap:8px'><span class='company-cell'>${companyLogoHtml(x)}<span class='name'>${esc(x.name)}</span></span><strong>${val}</strong></div><div class='bar' style='margin-top:6px'><div class='fill' style='width:${(val/max)*100}%'></div></div></div>`;}).join('');}
-function renderReactivity(b){const p=(b&&b.kpis_pilotage)||{};const items=p.reactivity_by_company||[];const root=document.getElementById('reactivityList');if(!root)return;if(!items.length){root.innerHTML="<div class='small'>Pas assez de tâches clôturées avec échéance.</div>";return;}const vals=items.map(x=>Math.abs(Number(x.avg_gap_days||0)));const max=Math.max(1,...vals);root.innerHTML=`<div style='display:flex;align-items:flex-end;gap:14px;height:240px;padding:10px 0'>${items.map(x=>{const v=Number(x.avg_gap_days||0);const h=Math.max(8,(Math.abs(v)/max)*190);const color=v>0?'#d64545':'#1b6ef3';return `<div style='flex:1;min-width:60px;text-align:center'><div title='${esc(x.name)}: ${v} j' style='margin:0 auto;width:34px;height:${h}px;background:${color};border-radius:8px 8px 0 0'></div><div style='font-size:11px;margin-top:6px;font-weight:700'>${esc(x.name)}</div><div style='font-size:11px;color:#6e7a90'>${v} j</div></div>`;}).join('')}</div>`;}
 function initials(v){const parts=String(v||'').trim().split(/\s+/).slice(0,2);return parts.map(x=>x[0]||'').join('').toUpperCase()||'?';}
 function companyLogoHtml(item){const name=item.name||item.label||'';const logo=item.logo||'';if(logo){return `<img class='company-logo' src='${esc(logo)}' alt='${esc(name)}'>`;}return `<span class='company-logo'>${esc(initials(name))}</span>`;}
 function showReminderModal(company,b){const p=(b&&b.kpis_pilotage)||{};const norm=v=>String(v||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').trim();const items=(p.reminders_open_items||[]).filter(x=>norm(x.company)===norm(company)).filter(x=>reminderWeeks(x.deadline)>0);const body=document.getElementById('reminderModalBody');const title=document.getElementById('reminderModalTitle');if(title)title.textContent=`Rappels ouverts - ${company}`;if(!body)return;if(!items.length){body.innerHTML="<div class='small' style='padding:10px'>Aucun rappel ouvert.</div>";}else{const byPer={};for(const it of items){const k=it.perimetre||'Général';(byPer[k]=byPer[k]||[]).push(it);}let html='';for(const per of Object.keys(byPer).sort()){html+=`<h4 style='margin:10px 0 6px'>${esc(per)}</h4><table><thead><tr><th>Tâche</th><th>Échéance</th><th>Rappel</th></tr></thead><tbody>${byPer[per].map(r=>{const w=reminderWeeks(r.deadline);const warn=`<span style='color:#d64545;font-weight:800'>Rappel ${w}</span>`;return `<tr><td>${esc(r.task||'')}</td><td>${esc(fmtDateFrShort(r.deadline||''))}</td><td>${warn}</td></tr>`;}).join('')}</tbody></table>`;}body.innerHTML=html;}const modal=document.getElementById('reminderModal');if(modal)modal.style.display='flex';}
 function hideReminderModal(){const modal=document.getElementById('reminderModal');if(modal)modal.style.display='none';}
-async function loadBoard(id){const requested=id||state.selectedId||'';if(!requested){state.selectedId='';state.selectedLabel='';state.board=null;renderBoard();return;}const selected=resolveAffaire(requested);const aid=(selected&&selected.affaire_id)||requested;state.selectedId=aid;const sel=document.getElementById('affaireSelect');if(sel)sel.value=aid;state.selectedLabel=(selected&&selected.display_name)||state.selectedLabel||'';localStorage.setItem('selectedAffaireId',aid);showLoading(true,'Chargement de la vue projet…');try{let b;try{b=await api(`/api/project-management/board?affaire_id=${encodeURIComponent(aid)}`);}catch(errById){const msg=String((errById&&errById.message)||'');if(state.selectedLabel&&(msg.includes('Affaire introuvable')||msg.includes('affaire_id ou affaire_name requis')||msg.includes('404'))){const alt=String(state.selectedLabel||'').split(' - ').slice(-1)[0]||state.selectedLabel;b=await api(`/api/project-management/board?affaire_name=${encodeURIComponent(alt)}`);}else{throw errById;}}state.board=b;renderBoard();}catch(err){console.error(err);state.board=null;renderBoard();showPageError(err);}finally{showLoading(false);}}
+async function loadBoard(id){const requested=id||state.selectedId||'';if(!requested){state.selectedId='';state.selectedLabel='';state.selectedMeta=null;state.board=null;syncProjectSelectionUi();renderBoard();return;}const selected=resolveAffaire(requested);const aid=(selected&&selected.affaire_id)||requested;state.selectedId=aid;state.selectedLabel=(selected&&selected.display_name)||state.selectedLabel||'';if(selected)state.selectedMeta=selected;localStorage.setItem('selectedAffaireId',aid);const affairMeta=await ensureSelectedAffaireContext(aid,!state.selectedMeta);syncProjectSelectionUi();showLoading(true,'Chargement de la vue projet…');try{let b;try{b=await api(`/api/project-management/board?affaire_id=${encodeURIComponent(aid)}`);}catch(errById){const msg=String((errById&&errById.message)||'');const candidates=[cleanText(((affairMeta||{}).affaire)||''),cleanText(((affairMeta||{}).display_name)||''),cleanText(state.selectedLabel||''),cleanText(requested||'')].filter(Boolean);if(msg.includes('Affaire introuvable')||msg.includes('affaire_id ou affaire_name requis')||msg.includes('404')){let boardErr=errById;for(const candidate of candidates){try{const alt=String(candidate).split(' - ').slice(-1)[0]||candidate;b=await api(`/api/project-management/board?affaire_name=${encodeURIComponent(alt)}`);boardErr=null;break;}catch(innerErr){boardErr=innerErr;}}if(boardErr)throw boardErr;}else{throw errById;}}state.board=b;renderBoard();}catch(err){console.error(err);state.board=null;renderBoard();showPageError(err);}finally{showLoading(false);}}
 function renderMatchDebug(b){const md=(b&&b.match_debug)||{};const box=document.getElementById('matchBox');const status=document.getElementById('matchStatus');const reason=document.getElementById('matchReason');if(box){box.className=`match-box ${(b&&b.warning)?'warn':'ok'}`;}if(status){const conf=(b&&b.confidence_level)||'low';status.innerHTML=`Diagnostic de matching METRONOME <span class='conf-badge'>${esc(conf)}</span>`;}if(reason){reason.textContent=(b&&b.warning_message)||((b&&b.project_name)?`Projet chargé : ${b.project_name}`:'Aucune affaire sélectionnée.');}setHtml('matchSearchName',`<b>Projet recherché</b>${esc(md.searched_project_name||'-')}`);setHtml('matchSearchSlug',`<b>Slug recherché</b><span class='mono'>${esc(md.searched_project_slug||'-')}</span>`);setHtml('matchFoundName',`<b>Projet matché</b>${esc(md.matched_project_name||'-')}`);setHtml('matchFoundSlug',`<b>Slug matché</b><span class='mono'>${esc(md.matched_project_slug||'-')}</span>`);setHtml('matchResolvedTitle',`<b>Projet résolu (title)</b>${esc(md.resolved_project_title||'-')}`);setHtml('matchResolutionMode',`<b>Mode de résolution</b>${esc(md.resolution_mode||'-')}`);setHtml('matchScore',`<b>Score de match</b>${esc(String(md.match_score??'-'))}`);setHtml('rowsByTitle',`<b>Lignes filtrées par titre</b>${esc(String(md.rows_filtered_by_title??'-'))}`);setHtml('rowsById',`<b>Lignes filtrées par ID</b>${esc(String(md.rows_filtered_by_id??'-'))}`);const miss=((b&&b.missing_files)||[]);setHtml('missingFiles',`<b>Fichiers CSV manquants</b>${esc(miss.length?miss.join(', '):'-')}`);} 
-function renderBoard(){const b=state.board||{};const p=(b&&b.kpis_pilotage)||{};const k=(b&&b.kpis)||{};const hasMatch=!!((b&&b.match_debug&&((b.match_debug.matched_project_name||'')||(Number(b.match_debug.match_score||0)>0)))&&!b.warning);const secPilot=document.getElementById('sectionPilot');const secCompany=document.getElementById('sectionCompany');const secReact=document.getElementById('sectionReactivity');if(secPilot)secPilot.style.display=hasMatch?'block':'none';if(secCompany)secCompany.style.display=hasMatch?'block':'none';if(secReact)secReact.style.display=hasMatch?'block':'none';setText('projectTitle',b.project_name||'-');setText('projectDesc',b.project_description||'-');const img=document.getElementById('projectImage');if(img){const src=String(b.project_image||'').trim();if(src){img.src=src;img.style.display='block';}else{img.removeAttribute('src');img.style.display='none';}}renderMatchDebug(b);setText('kOpen',Number(k.open_topics||0));setText('kOverdue',Number(k.overdue_topics||0));setText('kTopRappels',Number(p.reminders_open_count||0));setText('kDateRef',p.date_reference||p.reference_date||'-');setText('kRappelsDate',Number(p.rappels_ouverts_a_date||p.reminders_open_count||0));setText('kASuivre',Number(p.a_suivre_ouverts||p.followups_open_count||0));renderBars('kByStatus',k.by_status||[]);renderTable(b.rows||[]);renderProjectTimeline(b);renderCompanyChart(b);renderReactivity(b);const companyRows=(p.rappels_cumules_par_entreprise||p.reminders_by_company||[]);setHtml('pilotByCompany',companyRows.length?companyRows.map(r=>{const nm=r.name||r.company||'';return `<button class='pilot-row-btn pilot-row' data-company='${esc(nm)}'><span class='company-cell'>${companyLogoHtml({name:nm,logo:r.logo||''})}<span class='name'>${esc(nm)}</span></span><span><strong>${Number(r.count||0)}</strong> rappels</span></button>`;}).join(''):"<div class='small'>Aucune donnée</div>");Array.from(document.querySelectorAll('.pilot-row-btn')).forEach(btn=>btn.addEventListener('click',()=>showReminderModal(btn.getAttribute('data-company')||'',b)));}
+function renderBoard(){const b=state.board||{};const p=(b&&b.kpis_pilotage)||{};const k=(b&&b.kpis)||{};const hasMatch=!!((b&&b.match_debug&&((b.match_debug.matched_project_name||'')||(Number(b.match_debug.match_score||0)>0)))&&!b.warning);const secPilot=document.getElementById('sectionPilot');const secCompany=document.getElementById('sectionCompany');const secReact=document.getElementById('sectionReactivity');if(secPilot)secPilot.style.display=hasMatch?'block':'none';if(secCompany)secCompany.style.display=hasMatch?'block':'none';if(secReact)secReact.style.display=hasMatch?'block':'none';setText('projectTitle',b.project_name||'-');setText('projectDesc',b.project_description||'-');const img=document.getElementById('projectImage');if(img){const src=String(b.project_image||'').trim();if(src){img.src=src;img.style.display='block';}else{img.removeAttribute('src');img.style.display='none';}}renderMatchDebug(b);setText('kOpen',Number(k.open_topics||0));setText('kOverdue',Number(k.overdue_topics||0));setText('kTopRappels',Number(p.reminders_open_count||0));setText('kDateRef',p.date_reference||p.reference_date||'-');setText('kRappelsDate',Number(p.rappels_ouverts_a_date||p.reminders_open_count||0));setText('kASuivre',Number(p.a_suivre_ouverts||p.followups_open_count||0));renderBars('kByStatus',k.by_status||[]);renderTable(b.rows||[]);renderProjectTimeline(b);renderCompanyChart(b);renderLevel2Analytics();const companyRows=(p.rappels_cumules_par_entreprise||p.reminders_by_company||[]);setHtml('pilotByCompany',companyRows.length?companyRows.map(r=>{const nm=r.name||r.company||'';return `<button class='pilot-row-btn pilot-row' data-company='${esc(nm)}'><span class='company-cell'>${companyLogoHtml({name:nm,logo:r.logo||''})}<span class='name'>${esc(nm)}</span></span><span><strong>${Number(r.count||0)}</strong> rappels</span></button>`;}).join(''):"<div class='small'>Aucune donnée</div>");Array.from(document.querySelectorAll('.pilot-row-btn')).forEach(btn=>btn.addEventListener('click',()=>showReminderModal(btn.getAttribute('data-company')||'',b)));}
 function showPageError(err){const root=document.getElementById('boardTable');if(root)root.innerHTML=`<div class='small' style='padding:12px;color:#b42318'>${esc(err?.message||'Erreur de chargement')}</div>`;}
-async function loadAffaires(q){const data=await api(`/api/finance/affaires?search=${encodeURIComponent(q||'')}`);state.affaires=data.items||[];const sel=document.getElementById('affaireSelect');if(!sel)return;sel.innerHTML=`<option value=''>Sélectionner une affaire…</option>${state.affaires.map(a=>`<option value='${esc(a.affaire_id)}'>${esc(a.display_name||a.affaire_id)}</option>`).join('')}`;if(state.selectedId){const selected=state.affaires.find(a=>String(a.affaire_id||'')===String(state.selectedId||''));if(selected){state.selectedLabel=selected.display_name||state.selectedLabel||'';sel.value=selected.affaire_id;}}}
+function syncProjectSelectionUi(){const search=document.getElementById('searchInput');if(search)search.value=state.selectedLabel||'';const sel=document.getElementById('affaireSelect');if(!sel)return;const currentId=String(state.selectedId||'').trim();const currentLabel=String(state.selectedLabel||((state.selectedMeta||{}).display_name)||currentId||'').trim();if(currentId&&!Array.from(sel.options).some(opt=>String(opt.value||'')===currentId)){const opt=document.createElement('option');opt.value=currentId;opt.textContent=currentLabel||currentId;sel.appendChild(opt);}sel.value=currentId||'';}
+async function ensureSelectedAffaireContext(id,force=false){const affairId=String(id||state.selectedId||'').trim();if(!affairId)return null;if(!force&&state.selectedMeta&&String(state.selectedId||'')===affairId)return state.selectedMeta;try{const detail=await api(`/api/finance/affaire/${encodeURIComponent(affairId)}`);const affaire=(detail&&detail.affaire)||{};state.selectedId=affairId;state.selectedMeta=affaire;state.selectedLabel=String(affaire.display_name||affaire.affaire||state.selectedLabel||affairId).trim();localStorage.setItem('selectedAffaireId',affairId);syncProjectSelectionUi();return affaire;}catch(err){console.warn('Impossible de réhydrater le contexte affaire', err);if(!state.selectedLabel)state.selectedLabel=affairId;syncProjectSelectionUi();return state.selectedMeta||null;}}
+async function loadAffaires(q){const data=await api(`/api/finance/affaires?search=${encodeURIComponent(q||'')}`);state.affaires=data.items||[];const sel=document.getElementById('affaireSelect');if(!sel)return;sel.innerHTML=`<option value=''>Sélectionner une affaire…</option>${state.affaires.map(a=>`<option value='${esc(a.affaire_id)}'>${esc(a.display_name||a.affaire_id)}</option>`).join('')}`;if(state.selectedId){const selected=state.affaires.find(a=>String(a.affaire_id||'')===String(state.selectedId||''));if(selected){state.selectedLabel=selected.display_name||state.selectedLabel||'';}}syncProjectSelectionUi();}
 function getProjectKey(){return state.selectedId?`id::${state.selectedId}`:'';}
 async function pointageApi(url,opts){const r=await fetch(url,opts);const d=await r.json();if(!r.ok) throw new Error(d.detail||'Erreur pointage');return d;}
-async function loadPointage(){if(!state.selectedId)return;try{const d=await pointageApi(`/api/project-management/pointage?affaire_id=${encodeURIComponent(state.selectedId)}`);state.pointage=d;renderPointage();}catch(e){console.warn(e);}}
+async function loadPointage(){if(!state.selectedId)return;try{const d=await pointageApi(`/api/project-management/pointage?affaire_id=${encodeURIComponent(state.selectedId)}`);state.pointage=d;renderPointage();renderPointageAnalytics();}catch(e){console.warn(e);}}
 function levelGroups(tasks){const g={};for(const t of (tasks||[])){const lvl=t.level_label||t.level||'Général';(g[lvl]=g[lvl]||[]).push(t);}return g;}
-function renderPointage(){const root=document.getElementById('pointageWrap');const d=state.pointage||{};const tasks=d.tasks||[];if(!root)return;if(!tasks.length){root.innerHTML="<div class='small' style='padding:10px'>Aucun planning importé.</div>";return;}const expanded=new Set((d.workState&&d.workState.expanded_levels)||[]);const groups=levelGroups(tasks);let html=`<table><thead><tr><th>Tâche</th><th>Zone</th><th>Ressource</th><th>Début</th><th>Fin</th><th>% achevé</th><th>Réception réelle</th><th>Retard</th><th>Coût planifié CST</th><th>Coût pointé CST</th><th>Statut</th></tr></thead><tbody>`;for(const lvl of Object.keys(groups)){const open=expanded.has(lvl);html+=`<tr class='lvl-row'><td colspan='11'><button type='button' data-lvl='${esc(lvl)}' class='btn' style='height:28px'>${open?'−':'+'}</button> ${esc(lvl)}</td></tr>`;if(open){for(const t of groups[lvl]){const isSummary=Boolean(t.is_summary);const rowCls=isSummary?'lvl-row':(t.isLate?'task-late':(((t.status==='future')&&t.start)?'task-soon':''));const label=t.name;const start=fmtDateFrShort(t.start||'');const end=fmtDateFrShort(t.end||'');const depth=Math.max(0,Number(t.depth||0));const pad=12+(depth*14);if(isSummary){html+=`<tr class='${rowCls}'><td style='padding-left:${pad}px;font-weight:800'>${esc(t.name)}</td><td>${esc(t.level_label||t.level||'')}</td><td>${esc(t.owner||'')}</td><td>${esc(start)}</td><td>${esc(end)}</td><td>${Number(t.progress||0).toFixed(0)}%</td><td></td><td></td><td></td><td></td><td>summary</td></tr>`;continue;}html+=`<tr class='${rowCls}'><td style='padding-left:${pad}px'>${esc(label)}</td><td>${esc(t.level_label||t.level||'')}</td><td>${esc((t.owner==='Non attribué'?'':t.owner))}</td><td>${esc(start)}</td><td>${esc(end)}</td><td><input data-task='${esc(t.task_id)}' data-field='progress' type='number' min='0' max='100' value='${Number(t.progress||0)}' style='width:70px'></td><td><input data-task='${esc(t.task_id)}' data-field='actualEnd' type='date' value='${esc(t.actualEnd||'')}'></td><td>${Number(t.delayDays||0)} j</td><td style='color:#b45f06;font-weight:800'>${Number(t.plannedCostCst||0)>0?Number(t.plannedCostCst||0).toFixed(0)+' €':''}</td><td>${Number(t.actualCostCst||0)>0?Number(t.actualCostCst||0).toFixed(0)+' €':''}</td><td>${t.status==='past'?'<span style="color:#1f7a3f;font-weight:800">Terminé</span>':(t.status==='future'?'<span style="color:#8a94a8;font-weight:800">À venir</span>':'<span style="color:#1b6ef3;font-weight:800">En cours</span>')}</td></tr>`;if(t.is_cet&&t.cetMembers&&t.cetMembers.length){for(const m of t.cetMembers){const cm=((t.cet||{})[m]||{});html+=`<tr><td style='padding-left:${pad+16}px'>↳ ${esc(m)}</td><td>${esc(t.level||'')}</td><td>CET</td><td></td><td></td><td><input data-task='${esc(t.task_id)}' data-cet='${esc(m)}' data-field='progress' type='number' min='0' max='100' value='${Number(cm.progress||0)}' style='width:70px'></td><td><input data-task='${esc(t.task_id)}' data-cet='${esc(m)}' data-field='actualEnd' type='date' value='${esc(cm.actualEnd||'')}'></td><td colspan='4'></td></tr>`;}}}}}html+='</tbody></table>';root.innerHTML=html;Array.from(root.querySelectorAll('button[data-lvl]')).forEach(b=>b.addEventListener('click',async()=>{const lvl=b.getAttribute('data-lvl')||'';const ws={...(d.workState||{}),expanded_levels:[...new Set([...(d.workState?.expanded_levels||[])]) ]};const set=new Set(ws.expanded_levels);if(set.has(lvl))set.delete(lvl);else set.add(lvl);ws.expanded_levels=[...set];await savePointage({},ws);}));Array.from(root.querySelectorAll('input[data-task]')).forEach(inp=>inp.addEventListener('change',async()=>{const task=inp.getAttribute('data-task')||'';const field=inp.getAttribute('data-field')||'';const cet=inp.getAttribute('data-cet')||'';const patch={};if(cet){patch[task]={cet:{[cet]:{[field]:inp.value}}};}else{patch[task]={[field]:inp.value};}await savePointage(patch,d.workState||{});}));}
-async function savePointage(pointagePatch,workState){if(!state.selectedId)return;const cetMembers=(document.getElementById('cetMembersInput')||{}).value||'';const payload={pointage_patch:{...pointagePatch,__cetMembers:cetMembers},work_state:workState||{}};const d=await pointageApi(`/api/project-management/pointage/save?affaire_id=${encodeURIComponent(state.selectedId)}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});state.pointage=d;renderPointage();}
-async function importPlanningFile(file){if(!state.selectedId||!file)return;const fd=new FormData();fd.append('file',file);const d=await fetch(`/api/project-management/pointage/planning/import?affaire_id=${encodeURIComponent(state.selectedId)}`,{method:'POST',body:fd});const j=await d.json();if(!d.ok)throw new Error(j.detail||'Import planning impossible');state.pointage=j;renderPointage();}
-async function importSuiviFile(file){if(!state.selectedId||!file)return;const fd=new FormData();fd.append('file',file);const d=await fetch(`/api/project-management/pointage/import-suivi?affaire_id=${encodeURIComponent(state.selectedId)}`,{method:'POST',body:fd});const j=await d.json();if(!d.ok)throw new Error(j.detail||'Import suivi impossible');state.pointage=j;renderPointage();}
+function analyticsColor(name, fallback){const key=String(name||'').trim().toLowerCase();if(key==='cst' || key==='tempo')return '#ef8d00';return fallback||'#d64545';}
+function toTs(v){const d=parseDateOnly(v);return d?d.getTime():null;}
+function pointageLeafEntries(tasks){const out=[];for(const t of (tasks||[])){if(t.is_summary)continue;const base={task:t,zoneKey:cleanZoneKey(t),zoneLabel:cleanZoneLabel(t)};if(t.is_cet&&Array.isArray(t.cetMembers)&&t.cetMembers.length){for(const m of t.cetMembers){const cm=((t.cet||{})[m]||{});out.push({...base,resource:String(m||'').trim(),progress:Number(cm.progress||0),actualEnd:cm.actualEnd||'',delayDays:Number(cm.delayDays||0),status:cm.status||'',plannedCostCst:Number(t.plannedCostCst||0),actualCostCst:Number(t.actualCostCst||0),plannedHours:Number(t.plannedHours||0),label:`${t.name} — ${m}`});}continue;}out.push({...base,resource:String(t.owner||'').trim(),progress:Number(t.progress||0),actualEnd:t.actualEnd||'',delayDays:Number(t.delayDays||0),status:t.status||'',plannedCostCst:Number(t.plannedCostCst||0),actualCostCst:Number(t.actualCostCst||0),plannedHours:Number(t.plannedHours||0),label:t.name||''});}return out;}
+function cleanZoneLabel(task){const raw=String(task.zone_summary_name||task.level_zone_label||task.level_label||task.level||'Général').trim();return raw||'Général';}
+function cleanZoneKey(task){return String(task.zone_summary_id||task.level_zone_key||task.level_label||task.level||task.task_id||'general').trim()||'general';}
+function buildZoneSummaryMap(tasks){const summaries=[];for(const t of (tasks||[])){if(!t.is_summary)continue;const slug=String(t.name||'').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g,'').replace(/[^a-z0-9]+/g,'-');if(slug.includes('synthese-technique'))summaries.push(t);}const byId=new Map(summaries.map(t=>[String(t.task_id),t]));const summaryIds=new Set(byId.keys());const cache=new Map();const resolveTask=task=>{const key=String(task.task_id||'');if(cache.has(key))return cache.get(key);let parentId=String(task.parent_task_id||'').trim();while(parentId){if(summaryIds.has(parentId)){const summary=byId.get(parentId);const res={zone_summary_id:String(summary.task_id||''),zone_summary_name:String(summary.name||'').trim()||cleanZoneLabel(summary)};cache.set(key,res);return res;}const parent=(tasks||[]).find(x=>String(x.task_id||'')===parentId);parentId=parent?String(parent.parent_task_id||'').trim():'';}const fallback={zone_summary_id:'',zone_summary_name:''};cache.set(key,fallback);return fallback;};for(const t of (tasks||[])){const resolved=resolveTask(t);t.zone_summary_id=resolved.zone_summary_id;t.zone_summary_name=resolved.zone_summary_name;}return tasks;}
+function renderVerticalBars(items, opts={}){if(!items.length)return "<div class='small'>Aucune donnée</div>";const max=Math.max(1,...items.map(x=>Math.abs(Number(x.value||0))));const height=Number(opts.height||260);return `<div style='display:flex;align-items:flex-end;gap:14px;height:${height}px;padding:10px 0'>${items.map(x=>{const v=Number(x.value||0);const h=Math.max(10,(Math.abs(v)/max)*(height-70));const color=x.color||'#d64545';const meta=x.meta?`<div style='font-size:11px;color:#8a94a8'>${esc(x.meta)}</div>`:'';return `<div style='flex:1;min-width:${opts.minWidth||90}px;text-align:center'><div title='${esc(x.title||`${x.label}: ${v}`)}' style='margin:0 auto;width:${opts.barWidth||42}px;height:${h}px;background:${color};border-radius:10px 10px 0 0'></div><div style='font-size:12px;margin-top:8px;font-weight:800'>${esc(x.label)}</div><div style='font-size:12px;color:#6e7a90'>${esc(x.display||String(v))}</div>${meta}</div>`;}).join('')}</div>`;}
+function renderHorizontalGauge(items, opts={}){if(!items.length)return "<div class='small'>Aucune donnée</div>";return items.map(x=>{const pct=Math.max(0,Math.min(100,Number(x.value||0)));const meta=x.meta?`<div class='small' style='margin-top:4px'>${esc(x.meta)}</div>`:'';return `<div class='pilot-row' style='display:block'><div style='display:flex;justify-content:space-between;gap:8px;align-items:center'><strong>${esc(x.label)}</strong><strong>${pct.toFixed(1)}%</strong></div><div style='margin-top:8px;height:14px;background:#edf1f8;border-radius:999px;overflow:hidden'><div style='height:100%;width:${pct}%;background:${x.color||'#1b6ef3'}'></div></div>${meta}</div>`;}).join('');}
+function computePointageAnalytics(tasks){const enriched=buildZoneSummaryMap([...(tasks||[])]);const entries=pointageLeafEntries(enriched);const finishedPointed=entries.filter(e=>(Number(e.progress||0)>0 || !!e.actualEnd) && (e.status==='past' || !!e.actualEnd));const byResource={};for(const e of finishedPointed){const key=String(e.resource||'').trim();if(!key || key==='Non attribué' || key.includes('+'))continue;const rec=byResource[key]||(byResource[key]={sum:0,count:0});rec.sum+=Number(e.delayDays||0);rec.count+=1;}
+const resourceDelay=Object.entries(byResource).map(([name,v])=>({label:name,value:v.count?(v.sum/v.count):0,display:`${(v.count?(v.sum/v.count):0).toFixed(1)} j`,meta:`${v.count} tâche(s)`,title:`${name}: ${v.count?(v.sum/v.count).toFixed(1):'0.0'} j de retard moyen`,color:analyticsColor(name,'#d64545')})).filter(x=>x.meta!=='0 tâche(s)').sort((a,b)=>b.value-a.value||a.label.localeCompare(b.label,'fr'));
+const byZone=new Map();for(const e of entries){const zoneKey=e.zoneKey||'general';const zone=byZone.get(zoneKey)||{label:e.zoneLabel||'Général',planned:0,actual:0,weight:0,progressWeighted:0,total:0,finishedPointedLate:[]};zone.planned+=Number(e.plannedCostCst||0);zone.actual+=Number(e.actualCostCst||0);const weight=Math.max(Number(e.plannedHours||0), Number(e.plannedCostCst||0), 1);zone.weight+=weight;zone.progressWeighted+=Math.max(0,Math.min(100,Number(e.progress||0)))*weight;zone.total+=1;if((Number(e.progress||0)>0 || !!e.actualEnd) && (e.status==='past' || !!e.actualEnd) && Number(e.delayDays||0)>0){zone.finishedPointedLate.push(e);}byZone.set(zoneKey,zone);} 
+const zoneTrigger=[];const cstGap=[];const zoneProgress=[];for(const zone of byZone.values()){const late=zone.finishedPointedLate.sort((a,b)=>{const aKey=toTs(a.task.end)||toTs(a.actualEnd)||toTs(a.task.start)||Number.MAX_SAFE_INTEGER;const bKey=toTs(b.task.end)||toTs(b.actualEnd)||toTs(b.task.start)||Number.MAX_SAFE_INTEGER;return aKey-bKey || (Number(b.delayDays||0)-Number(a.delayDays||0)) || String(a.resource||'').localeCompare(String(b.resource||''),'fr');})[0];if(late){zoneTrigger.push({label:zone.label,value:Number(late.delayDays||0),display:`${late.resource||late.task.owner||'—'} · ${Number(late.delayDays||0).toFixed(0)} j`,meta:(late.task.name||'').slice(0,72),title:`${zone.label}: ${late.resource||late.task.owner||'—'} a déclenché ${Number(late.delayDays||0).toFixed(0)} j de retard`,color:analyticsColor(late.resource||late.task.owner,'#d64545')});}
+if(zone.planned>0 || zone.actual>0){const gap=zone.actual-zone.planned;cstGap.push({label:zone.label,value:Math.abs(gap),display:`${gap>=0?'+':''}${gap.toFixed(0)} €`,meta:`Planifié ${zone.planned.toFixed(0)} € · Pointé ${zone.actual.toFixed(0)} €`,title:`${zone.label}: écart CST ${gap>=0?'+':''}${gap.toFixed(0)} €`,color:gap>0?'#d64545':'#1b6ef3'});}const progress=zone.weight>0?(zone.progressWeighted/zone.weight):0;zoneProgress.push({label:zone.label,value:progress,meta:`${zone.total} tâche(s) analysée(s)`,color:progress>=100?'#1f7a3f':'#ef8d00'});} 
+zoneTrigger.sort((a,b)=>b.value-a.value||a.label.localeCompare(b.label,'fr'));cstGap.sort((a,b)=>Math.abs(b.value)-Math.abs(a.value)||a.label.localeCompare(b.label,'fr'));zoneProgress.sort((a,b)=>b.value-a.value||a.label.localeCompare(b.label,'fr'));
+return {resourceDelay,zoneTrigger,cstGap,zoneProgress};}
+function renderReactivity(b){const p=(b&&b.kpis_pilotage)||{};const items=p.reactivity_by_company||[];if(!items.length)return {html:"<div class='small'>Pas assez de tâches clôturées avec échéance.</div>",info:"Moyenne des écarts entre échéance et clôture des tâches issues des réunions MÉTRONOME."};const vals=items.map(x=>Math.abs(Number(x.avg_gap_days||0)));const max=Math.max(1,...vals);const html=`<div style='display:flex;align-items:flex-end;gap:14px;height:240px;padding:10px 0'>${items.map(x=>{const v=Number(x.avg_gap_days||0);const h=Math.max(8,(Math.abs(v)/max)*190);const color=analyticsColor(x.name,v>0?'#d64545':'#1b6ef3');return `<div style='flex:1;min-width:60px;text-align:center'><div title='${esc(x.name)}: ${v} j' style='margin:0 auto;width:34px;height:${h}px;background:${color};border-radius:8px 8px 0 0'></div><div style='font-size:11px;margin-top:6px;font-weight:700'>${esc(x.name)}</div><div style='font-size:11px;color:#6e7a90'>${v} j</div></div>`;}).join('')}</div>`;return {html,info:"Lecture réunion MÉTRONOME : Tempo et CST sont mis en évidence en orange."};}
+function renderLevel2Analytics(){const root=document.getElementById('level2AnalyticsChart');const info=document.getElementById('level2AnalyticsInfo');const select=document.getElementById('level2Metric');const sec=document.getElementById('sectionReactivity');if(!root||!info||!select||!sec)return;const metric=select.value||'reactivity';const pointageTasks=((state.pointage||{}).tasks||[]);const board=state.board||{};const analytics=computePointageAnalytics(pointageTasks);const views={reactivity:()=>renderReactivity(board),resourceDelay:()=>analytics.resourceDelay.length?{html:renderVerticalBars(analytics.resourceDelay,{height:260,minWidth:90,barWidth:42}),info:"Calculé uniquement sur les tâches pointées et terminées. Tempo et CST sont affichés en orange."}:{html:"<div class='small'>Aucune tâche pointée terminée exploitable.</div>",info:"Le graphique nécessite des tâches pointées puis terminées."},zoneTrigger:()=>analytics.zoneTrigger.length?{html:renderVerticalBars(analytics.zoneTrigger,{height:280,minWidth:120,barWidth:50}),info:"Détection du premier lot terminé et en retard dans chaque synthèse technique niveau / zone."}:{html:"<div class='small'>Aucun lot retardataire terminé détecté par niveau / zone.</div>",info:"Le graphique nécessite des tâches pointées terminées avec retard sous une synthèse technique."},cstGap:()=>analytics.cstGap.length?{html:renderHorizontalGauge(analytics.cstGap.map(x=>({...x,value:Math.min(100,Math.abs(x.value)/(Math.max(...analytics.cstGap.map(y=>Math.abs(y.value)),1))*100),meta:`${x.display} · ${x.meta}`} ),{}),info:"Écart à date entre coût planifié CST et coût pointé CST, par niveau / zone."}:{html:"<div class='small'>Aucun coût CST exploitable.</div>",info:"Le graphique nécessite des tâches avec coût CST planifié ou pointé."},zoneProgress:()=>analytics.zoneProgress.length?{html:renderHorizontalGauge(analytics.zoneProgress),info:"Avancement pointé pondéré par charge planifiée pour chaque niveau / zone."}:{html:"<div class='small'>Aucune donnée de progression par niveau / zone.</div>",info:"Le graphique nécessite un planning pointé rattaché à une synthèse technique."}};
+const view=(views[metric]||views.reactivity)();root.innerHTML=view.html;info.textContent=view.info;const hasBoard=!!((board&&board.match_debug&&((board.match_debug.matched_project_name||'')||(Number(board.match_debug.match_score||0)>0)))&&!board.warning);const hasPointage=pointageTasks.length>0;sec.style.display=(hasBoard||hasPointage)?'block':'none';}
+function renderPointageAnalytics(){renderLevel2Analytics();}
+function renderPointage(){const root=document.getElementById('pointageWrap');const d=state.pointage||{};const tasks=d.tasks||[];if(!root)return;if(!tasks.length){root.innerHTML="<div class='small' style='padding:10px'>Aucun planning importé.</div>";return;}const expanded=new Set((d.workState&&d.workState.expanded_levels)||[]);const groups=levelGroups(tasks);let html=`<table><thead><tr><th>Tâche</th><th>Ressource</th><th>Début</th><th>Fin</th><th>% achevé</th><th>Réception réelle</th><th>Retard</th><th>Coût planifié CST</th><th>Coût pointé CST</th><th>Statut</th></tr></thead><tbody>`;for(const lvl of Object.keys(groups)){const open=expanded.has(lvl);html+=`<tr class='lvl-row'><td colspan='10'><button type='button' data-lvl='${esc(lvl)}' class='btn' style='height:28px'>${open?'−':'+'}</button> ${esc(lvl)}</td></tr>`;if(open){for(const t of groups[lvl]){const isSummary=Boolean(t.is_summary);const toneClass=t.isLate?'task-late':(t.isSoon?'task-soon':'');const cstClass=t.is_cst?' task-cst':'';const rowCls=isSummary?'lvl-row':`${toneClass}${cstClass}`.trim();const label=t.name;const start=fmtDateFrShort(t.start||'');const end=fmtDateFrShort(t.end||'');const depth=Math.max(0,Number(t.depth||0));const pad=12+(depth*14);const delayTxt=`${Number(t.delayDays||0)} j`;const statusLabel=String(t.statusLabel||'');const statusHtml=t.status==='past'?'<span class=\"status-badge done\">Terminé</span>':(t.status==='late'?`<span class=\"status-badge late\">${esc(statusLabel)}</span>`:(t.status==='soon'?`<span class=\"status-badge soon\">${esc(statusLabel)}</span>`:''));if(isSummary){html+=`<tr class='${rowCls}'><td style='padding-left:${pad}px;font-weight:800'>${esc(t.name)}</td><td colspan='8'></td><td>${statusHtml}</td></tr>`;continue;}html+=`<tr class='${rowCls}'><td style='padding-left:${pad}px'>${esc(label)}</td><td>${esc((t.owner==='Non attribué'?'':t.owner))}</td><td>${esc(start)}</td><td>${esc(end)}</td><td><input data-task='${esc(t.task_id)}' data-field='progress' type='number' min='0' max='100' value='${Number(t.progress||0)}' style='width:70px'></td><td><input data-task='${esc(t.task_id)}' data-field='actualEnd' type='date' value='${esc(t.actualEnd||'')}'></td><td>${delayTxt}</td><td style='color:#b45f06;font-weight:800'>${Number(t.plannedCostCst||0)>0?Number(t.plannedCostCst||0).toFixed(0)+' €':''}</td><td>${Number(t.actualCostCst||0)>0?Number(t.actualCostCst||0).toFixed(0)+' €':''}</td><td>${statusHtml}</td></tr>`;if(t.is_cet&&t.cetMembers&&t.cetMembers.length){for(const m of t.cetMembers){const cm=((t.cet||{})[m]||{});const cmDelayTxt=`${Number(cm.delayDays||0)} j`;const cmStatusLabel=String(cm.statusLabel||'');const cmStatusHtml=cm.status==='past'?'<span class=\"status-badge done\">Terminé</span>':(cm.status==='late'?`<span class=\"status-badge late\">${esc(cmStatusLabel)}</span>`:(cm.status==='soon'?`<span class=\"status-badge soon\">${esc(cmStatusLabel)}</span>`:''));html+=`<tr><td style='padding-left:${pad+16}px'>↳ ${esc(m)}</td><td>CET</td><td></td><td></td><td><input data-task='${esc(t.task_id)}' data-cet='${esc(m)}' data-field='progress' type='number' min='0' max='100' value='${Number(cm.progress||0)}' style='width:70px'></td><td><input data-task='${esc(t.task_id)}' data-cet='${esc(m)}' data-field='actualEnd' type='date' value='${esc(cm.actualEnd||'')}'></td><td>${cmDelayTxt}</td><td></td><td></td><td>${cmStatusHtml}</td></tr>`;}}}}}html+='</tbody></table>';root.innerHTML=html;Array.from(root.querySelectorAll('button[data-lvl]')).forEach(b=>b.addEventListener('click',async()=>{const lvl=b.getAttribute('data-lvl')||'';const ws={...(d.workState||{}),expanded_levels:[...new Set([...(d.workState?.expanded_levels||[])]) ]};const set=new Set(ws.expanded_levels);if(set.has(lvl))set.delete(lvl);else set.add(lvl);ws.expanded_levels=[...set];await savePointage({},ws);}));Array.from(root.querySelectorAll('input[data-task]')).forEach(inp=>inp.addEventListener('change',async()=>{const task=inp.getAttribute('data-task')||'';const field=inp.getAttribute('data-field')||'';const cet=inp.getAttribute('data-cet')||'';const patch={};if(cet){patch[task]={cet:{[cet]:{[field]:inp.value}}};}else{patch[task]={[field]:inp.value};}await savePointage(patch,d.workState||{});}));}
+async function savePointage(pointagePatch,workState){if(!state.selectedId)return;const cetMembers=(document.getElementById('cetMembersInput')||{}).value||'';const payload={pointage_patch:{...pointagePatch,__cetMembers:cetMembers},work_state:workState||{}};const d=await pointageApi(`/api/project-management/pointage/save?affaire_id=${encodeURIComponent(state.selectedId)}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});state.pointage=d;renderPointage();renderPointageAnalytics();}
+async function importPlanningFile(file){if(!state.selectedId||!file)return;const fd=new FormData();fd.append('file',file);const d=await fetch(`/api/project-management/pointage/planning/import?affaire_id=${encodeURIComponent(state.selectedId)}`,{method:'POST',body:fd});const j=await d.json();if(!d.ok)throw new Error(j.detail||'Import planning impossible');state.pointage=j;renderPointage();renderPointageAnalytics();}
+async function importSuiviFile(file){if(!state.selectedId||!file)return;const fd=new FormData();fd.append('file',file);const d=await fetch(`/api/project-management/pointage/import-suivi?affaire_id=${encodeURIComponent(state.selectedId)}`,{method:'POST',body:fd});const j=await d.json();if(!d.ok)throw new Error(j.detail||'Import suivi impossible');state.pointage=j;renderPointage();renderPointageAnalytics();}
 async function exportSuivi(){if(!state.selectedId)return;const d=await pointageApi(`/api/project-management/pointage/export?affaire_id=${encodeURIComponent(state.selectedId)}`);const blob=new Blob([JSON.stringify(d,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`suivi-pointage-${state.selectedId}.json`;a.click();URL.revokeObjectURL(a.href);}
 async function init(){
   try{
@@ -4453,6 +4670,7 @@ async function init(){
     const reminderClose=document.getElementById('reminderModalClose');if(reminderClose)reminderClose.addEventListener('click',hideReminderModal);
     const affaireSelect=document.getElementById('affaireSelect');if(affaireSelect)affaireSelect.addEventListener('change',async e=>{await loadBoard(e.target.value||'');});
     const companyMetric=document.getElementById('companyMetric');if(companyMetric)companyMetric.addEventListener('change',()=>renderCompanyChart(state.board||{}));
+    const level2Metric=document.getElementById('level2Metric');if(level2Metric)level2Metric.addEventListener('change',()=>renderLevel2Analytics());
   }catch(err){console.error(err);renderBoard();showPageError(err);}
 }
 init();
@@ -4494,7 +4712,7 @@ const esc=v=>String(v||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&
 async function api(u){const r=await fetch(u);const d=await r.json();if(!r.ok) throw new Error(d.detail||'Erreur API');return d;}
 async function loadAffairesList(search=''){const d=await api(`/api/finance/affaires?search=${encodeURIComponent(search)}`);state.affaires=d.items||[];const sel=document.getElementById('affaireSelect');sel.innerHTML=`<option value=''>Sélectionnez une affaire</option>`+state.affaires.map(x=>`<option value="${esc(x.affaire_id)}">${esc(x.display_name)}</option>`).join('');if(state.selectedId&&state.affaires.some(x=>x.affaire_id===state.selectedId))sel.value=state.selectedId;}
 async function loadSelectedAffaire(id){if(!id){state.selectedId='';state.selected=null;state.board=null;render();return;}state.selectedId=id;const d=await api(`/api/finance/affaire/${encodeURIComponent(id)}`);state.selected=d.affaire;localStorage.setItem('selectedAffaireId',id);try{state.board=await api(`/api/project-management/board?affaire_id=${encodeURIComponent(id)}`);}catch(errById){try{const alt=(d&&d.affaire&&(d.affaire.affaire||d.affaire.display_name||''))||'';if(alt){state.board=await api(`/api/project-management/board?affaire_name=${encodeURIComponent(alt)}`);}else{state.board=null;}}catch(_){state.board=null;}}render();}
-function renderChart(prodPct){const root=document.getElementById('chart');const a=state.selected;if(!a){root.innerHTML='';return;}const data=MONTHS.map(m=>({label:MONTH_LABELS[m],pre:Number(((a.mensuel||{})[m]||{}).previsionnel||0),fac:Number(((a.mensuel||{})[m]||{}).facture||0)}));let cp=0,cf=0;const cum=data.map(d=>({l:d.label,pre:(cp+=d.pre),fac:(cf+=d.fac)}));const finalProd=(Number(a.commande_ht||0)*Math.max(0,prodPct))/100;const max=Math.max(1,...cum.flatMap(x=>[x.pre,x.fac]),finalProd);const left=54,top=16,width=892,height=250,step=width/Math.max(1,cum.length-1);let out='';for(let i=0;i<=4;i++){const y=top+(height/4)*i;const val=Math.round(max*(1-i/4));out+=`<line x1='${left}' y1='${y}' x2='${left+width}' y2='${y}' stroke='#dde5f2'/><text x='${left-8}' y='${y+4}' text-anchor='end' fill='#5f6f88' font-size='12'>${val.toLocaleString('fr-FR')} €</text>`;}out+=`<text x='${left+width/2}' y='${top+height+42}' text-anchor='middle' fill='#5f6f88' font-size='12'>Mois</text>`;out+=`<text x='16' y='${top+height/2}' transform='rotate(-90 16 ${top+height/2})' text-anchor='middle' fill='#5f6f88' font-size='12'>Montants cumulés (€)</text>`;const toPts=(arr,key)=>arr.map((d,i)=>`${left+i*step},${top+height-(Number(d[key]||0)/max)*height}`).join(' ');out+=`<polyline points='${toPts(cum,'pre')}' fill='none' stroke='#9db4de' stroke-width='4'/>`;out+=`<polyline points='${toPts(cum,'fac')}' fill='none' stroke='#ef8d00' stroke-width='4'/>`;const prodY=top+height-(finalProd/max)*height;out+=`<line x1='${left}' y1='${prodY}' x2='${left+width}' y2='${prodY}' stroke='#239b5b' stroke-width='3' stroke-dasharray='7 7'/>`;cum.forEach((d,i)=>{if(i%2===0)out+=`<text x='${left+i*step}' y='${top+height+20}' text-anchor='middle' fill='#5f6f88' font-size='12'>${d.l}</text>`;});root.innerHTML=out;const maxVal=Math.max(cum.length?cum[cum.length-1].pre:0,cum.length?cum[cum.length-1].fac:0,finalProd,1);const rows=[['Prévisionnel cumulé',cum.length?cum[cum.length-1].pre:0,'pre'],['Facturation cumulée',cum.length?cum[cum.length-1].fac:0,'fac'],['Production cumulée (estimée)',finalProd,'prod']];document.getElementById('cumRows').innerHTML=rows.map(r=>`<div class='row'><div>${r[0]}</div><div class='track'><div class='fill ${r[2]}' style='width:${Math.min(100,(r[1]/maxVal)*100)}%'></div></div><div style='text-align:right;font-weight:800'>${euro(r[1])}</div></div>`).join('');}
+function renderChart(prodPct){const root=document.getElementById('chart');const a=state.selected;if(!a){root.innerHTML='';return;}const anteriorite=Number(a.anteriorite||0);const data=MONTHS.map(m=>({label:MONTH_LABELS[m],pre:Number(((a.mensuel||{})[m]||{}).previsionnel||0),fac:Number(((a.mensuel||{})[m]||{}).facture||0),prod:Number(((a.production_cumulee_mensuelle||{})[m])||0)}));let cp=0,cf=anteriorite;const cum=data.map(d=>{cp+=d.pre;cf+=d.fac;return {l:d.label,pre:cp,fac:cf,facMonth:d.fac,prod:d.prod};});const max=Math.max(1,...cum.flatMap(x=>[x.pre,x.fac,x.prod]));const left=54,top=16,width=892,height=250,step=width/Math.max(1,cum.length),barW=Math.max(8,Math.min(22,step*0.32));let out='';for(let i=0;i<=4;i++){const y=top+(height/4)*i;const val=Math.round(max*(1-i/4));out+=`<line x1='${left}' y1='${y}' x2='${left+width}' y2='${y}' stroke='#dde5f2'/><text x='${left-8}' y='${y+4}' text-anchor='end' fill='#5f6f88' font-size='12'>${val.toLocaleString('fr-FR')} €</text>`;}out+=`<text x='${left+width/2}' y='${top+height+42}' text-anchor='middle' fill='#5f6f88' font-size='12'>Mois</text>`;out+=`<text x='16' y='${top+height/2}' transform='rotate(-90 16 ${top+height/2})' text-anchor='middle' fill='#5f6f88' font-size='12'>Montants cumulés (€)</text>`;cum.forEach((d,i)=>{const x=left+i*step+step*0.5;const preH=(Number(d.pre||0)/max)*height;out+=`<rect x='${x-barW-2}' y='${top+height-preH}' width='${barW}' height='${Math.max(0,preH)}' rx='4' fill='#9db4de'/>`;if(Number(d.facMonth||0)>0||i===0&&anteriorite>0){const facH=(Number(d.fac||0)/max)*height;out+=`<rect x='${x+2}' y='${top+height-facH}' width='${barW}' height='${Math.max(0,facH)}' rx='4' fill='#ef8d00'/>`;}if(i%2===0)out+=`<text x='${x}' y='${top+height+20}' text-anchor='middle' fill='#5f6f88' font-size='12'>${d.l}</text>`;});const prodPts=cum.map((d,i)=>`${left+i*step+step*0.5},${top+height-(Number(d.prod||0)/max)*height}`).join(' ');out+=`<polyline points='${prodPts}' fill='none' stroke='#239b5b' stroke-width='3' stroke-dasharray='7 7'/>`;root.innerHTML=out;const finalPre=cum.length?cum[cum.length-1].pre:0;const finalFac=Number(a.facturation_totale||((a.anteriorite||0)+(a.facture_2026||a.facturation_cumulee_2026||0)));const finalProd=cum.length?cum[cum.length-1].prod:0;const maxVal=Math.max(finalPre,finalFac,finalProd,1);const rows=[['Prévisionnel cumulé',finalPre,'pre'],['Facturation cumulée',finalFac,'fac'],['Production cumulée (estimée)',finalProd,'prod']];document.getElementById('cumRows').innerHTML=rows.map(r=>`<div class='row'><div>${r[0]}</div><div class='track'><div class='fill ${r[2]}' style='width:${Math.min(100,(r[1]/maxVal)*100)}%'></div></div><div style='text-align:right;font-weight:800'>${euro(r[1])}</div></div>`).join('');}
 function render(){const a=state.selected;document.getElementById('financeBtn').href=state.selectedId?`/finance?affaire_id=${encodeURIComponent(state.selectedId)}`:'/finance';document.getElementById('pmBtn').href=state.selectedId?`/gestion-projet?affaire_id=${encodeURIComponent(state.selectedId)}`:'/gestion-projet';document.getElementById('exportBtn').disabled=!state.selectedId;if(!a){document.getElementById('title').textContent='Sélectionnez une affaire';return;}const billed=Number(a.facturation_totale||((a.anteriorite||0)+(a.facture_2026||a.facturation_cumulee_2026||0)));const cmd=Number(a.commande_ht||0);const reste=Number(a.reste_a_facturer||0);const finPct=cmd>0?(billed/cmd*100):0;const prodPct=Number((((state.board||{}).analytics||{}).kpi_project_progress||{}).calendar_progress_pct||0);const pilot=((state.board||{}).kpis_pilotage||{});const projectKpis=((state.board||{}).kpis||{});const rappels=Number(pilot.reminders_open_count||pilot.rappels_ouverts_a_date||0);const sujets=Number(projectKpis.open_topics||0);const alerts=Number(projectKpis.overdue_topics||0);const gap=finPct-prodPct;const msg=gap>8?'Facturation en avance sur production':gap<-8?'Production en avance sur facturation':'Facturation et production globalement alignées';const extra=rappels>10?' · Rappels ouverts élevés':alerts>0?' · Projet sous surveillance':'';document.getElementById('healthSignal').textContent=`${msg}${extra}`;const hb=document.getElementById('healthBadge');hb.className='badge '+(alerts>0||gap<-12?'bad':gap<-6||rappels>6?'warn':'ok');hb.textContent=alerts>0?'Risque de dérive':(gap<-6?'Sous surveillance':'Sain');document.getElementById('title').textContent=a.display_name||'-';document.getElementById('subtitle').textContent=`Client ${a.client||'-'} · ${a.affaire||'-'}`;const imgUrl=String((a.project_image||a.image_url||a.image||'')).trim();const imgBox=document.getElementById('projectImageBox');const img=document.getElementById('projectImage');if(imgUrl){img.src=imgUrl;imgBox.classList.add('show');}else{img.removeAttribute('src');imgBox.classList.remove('show');}
 [['kCommande',cmd],['kFacture',billed],['kReste',reste],['kMarge',cmd*0.10],['hReste',reste]].forEach(x=>document.getElementById(x[0]).textContent=euro(x[1]));document.getElementById('kAvance').textContent=`${finPct.toFixed(1)} %`;document.getElementById('hProd').textContent=`${prodPct.toFixed(1)}%`;document.getElementById('hFac').textContent=`${finPct.toFixed(1)}%`;document.getElementById('hGap').textContent=`${gap.toFixed(1)} pt`;document.getElementById('hAlerts').textContent=String(alerts);document.getElementById('hRappels').textContent=String(rappels);document.getElementById('hSujets').textContent=String(sujets);renderChart(prodPct);}
 async function init(){await loadAffairesList('');const params=new URLSearchParams(window.location.search);const pre=params.get('affaire_id')||localStorage.getItem('selectedAffaireId')||'';if(pre&&state.affaires.some(x=>x.affaire_id===pre)){document.getElementById('affaireSelect').value=pre;await loadSelectedAffaire(pre);}else{render();}document.getElementById('searchInput').addEventListener('input',async e=>loadAffairesList(e.target.value||''));document.getElementById('affaireSelect').addEventListener('change',async e=>loadSelectedAffaire(e.target.value||''));document.getElementById('exportBtn').addEventListener('click',()=>{if(state.selectedId)window.location.href=`/api/finance/affaire/${encodeURIComponent(state.selectedId)}/export-csv`;});}
