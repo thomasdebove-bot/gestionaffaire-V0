@@ -3408,6 +3408,44 @@ class PointageService:
             return value, value, "hours"
         return value, value, "hours"
 
+    @staticmethod
+    def _normalize_task_dates(tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        children_by_parent: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for task in tasks:
+            parent_task_id = clean_text(task.get("parent_task_id"))
+            if parent_task_id:
+                children_by_parent[parent_task_id].append(task)
+
+        for task in reversed(tasks):
+            start_date = MetronomeService._parse_date_only(clean_text(task.get("start")))
+            end_date = MetronomeService._parse_date_only(clean_text(task.get("end")))
+
+            child_start_dates: List[date] = []
+            child_end_dates: List[date] = []
+            for child in children_by_parent.get(clean_text(task.get("task_id")), []):
+                child_start = MetronomeService._parse_date_only(clean_text(child.get("start")))
+                child_end = MetronomeService._parse_date_only(clean_text(child.get("end")))
+                if child_start:
+                    child_start_dates.append(child_start)
+                if child_end:
+                    child_end_dates.append(child_end)
+
+            if not start_date and child_start_dates:
+                start_date = min(child_start_dates)
+            if not end_date and child_end_dates:
+                end_date = max(child_end_dates)
+            if not start_date and end_date:
+                start_date = end_date
+            if not end_date and start_date:
+                end_date = start_date
+
+            if start_date:
+                task["start"] = start_date.isoformat()
+            if end_date:
+                task["end"] = end_date.isoformat()
+
+        return tasks
+
     def parse_planning(self, raw: bytes) -> List[Dict[str, Any]]:
         text = self._decode_csv(raw)
         rows = self._csv_rows(text)
@@ -3502,41 +3540,7 @@ class PointageService:
                 task["is_summary"] = True
                 task["is_actionable"] = False
 
-        children_by_parent: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-        for task in tasks:
-            parent_task_id = clean_text(task.get("parent_task_id"))
-            if parent_task_id:
-                children_by_parent[parent_task_id].append(task)
-
-        for task in reversed(tasks):
-            start_date = MetronomeService._parse_date_only(clean_text(task.get("start")))
-            end_date = MetronomeService._parse_date_only(clean_text(task.get("end")))
-
-            child_start_dates: List[date] = []
-            child_end_dates: List[date] = []
-            for child in children_by_parent.get(clean_text(task.get("task_id")), []):
-                child_start = MetronomeService._parse_date_only(clean_text(child.get("start")))
-                child_end = MetronomeService._parse_date_only(clean_text(child.get("end")))
-                if child_start:
-                    child_start_dates.append(child_start)
-                if child_end:
-                    child_end_dates.append(child_end)
-
-            if not start_date and child_start_dates:
-                start_date = min(child_start_dates)
-            if not end_date and child_end_dates:
-                end_date = max(child_end_dates)
-            if not start_date and end_date:
-                start_date = end_date
-            if not end_date and start_date:
-                end_date = start_date
-
-            if start_date:
-                task["start"] = start_date.isoformat()
-            if end_date:
-                task["end"] = end_date.isoformat()
-
-        return tasks
+        return self._normalize_task_dates(tasks)
 
     def _ensure_project(self, key: str) -> Dict[str, Any]:
         data = self._load()
@@ -3655,7 +3659,8 @@ class PointageService:
     def get_project_data(self, project_key: str) -> Dict[str, Any]:
         data = self._load()
         proj = data.get("projects", {}).get(project_key, {"planning_tasks": [], "pointage": {"__cetMembers": "", "__cstRate": 80}, "workState": {"expanded_levels": []}})
-        tasks = self.compute_tasks(proj.get("planning_tasks", []), proj.get("pointage", {}))
+        normalized_planning_tasks = self._normalize_task_dates(list(proj.get("planning_tasks", [])))
+        tasks = self.compute_tasks(normalized_planning_tasks, proj.get("pointage", {}))
         return {
             "project_key": project_key,
             "tasks": tasks,
