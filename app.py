@@ -3339,7 +3339,28 @@ class PointageService:
     def _csv_rows(text: str) -> List[Dict[str, str]]:
         first = text.splitlines()[0] if text.splitlines() else ""
         delimiter = ";" if first.count(";") >= first.count(",") and first.count(";") > 0 else ("	" if "	" in first else ",")
-        return list(csv.DictReader(io.StringIO(text), delimiter=delimiter))
+        reader = csv.reader(io.StringIO(text), delimiter=delimiter)
+        rows = list(reader)
+        if not rows:
+            return []
+
+        raw_headers = rows[0]
+        headers: List[str] = []
+        seen: Dict[str, int] = {}
+        for idx, header in enumerate(raw_headers):
+            base = clean_text(header) or f"__col_{idx}"
+            count = seen.get(base, 0)
+            seen[base] = count + 1
+            headers.append(base if count == 0 else f"{base}__{count}")
+
+        normalized_rows: List[Dict[str, str]] = []
+        for raw_row in rows[1:]:
+            padded = list(raw_row) + [""] * max(0, len(headers) - len(raw_row))
+            normalized_rows.append({
+                headers[idx]: padded[idx] if idx < len(padded) else ""
+                for idx in range(len(headers))
+            })
+        return normalized_rows
 
     @staticmethod
     def _find_col(row: Dict[str, Any], names: List[str]) -> str:
