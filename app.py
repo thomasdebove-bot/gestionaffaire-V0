@@ -3335,8 +3335,6 @@ class MetronomeService:
         warning_message = "Projet trouvé via entrées METRONOME (fallback)" if warning else ""
 
         project_display_name = resolved_title or target
-        if len(selected_project_ids) > 1:
-            project_display_name = f"{target} — multi-projets METRONOME"
         project_id = resolved_id or self._row_id(project_info)
         project_image = self._get_first_value(project_info, METRONOME_COLUMN_ALIASES["project_image"])
         project_description = self._get_first_value(project_info, METRONOME_COLUMN_ALIASES["project_description"])
