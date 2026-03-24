@@ -26,6 +26,7 @@ APP_TITLE = "Gestion Affaire - Finance"
 DEFAULT_WORKBOOK_PATH = r"\\192.168.10.100\03 - finances\10 - TABLEAU DE BORD\01 - TABLEAU ACTIVITEE\TABLEAU ACTIVITEE.xlsx"
 DEFAULT_SHEET_NAME = "AFFAIRES 2026"
 DEFAULT_CACHE_FILE = "finance_cache.json"
+HISTORICAL_ACTIVITY_SHEETS = ("AFFAIRES 23", "AFFAIRES 25")
 
 WORKBOOK_PATH = os.getenv("ACTIVITE_XLSX_PATH", DEFAULT_WORKBOOK_PATH)
 SHEET_NAME = os.getenv("ACTIVITE_SHEET_NAME", DEFAULT_SHEET_NAME)
@@ -1701,6 +1702,7 @@ class FinanceService:
             "source_mtime": None,
         }
         self._lock = Lock()
+        self._historical_activity_cache: Dict[str, Any] = {"source_mtime": None, "sheets": {}}
 
     def workbook_exists(self) -> bool:
         return os.path.exists(self.workbook_path)
@@ -2031,6 +2033,104 @@ class FinanceService:
         affaire.pop("tag", None)
         affaire.pop("_row_index", None)
         return affaire
+
+    @staticmethod
+    def _activity_sheet_aliases(sheet_name: str) -> List[str]:
+        slug = slugify(sheet_name)
+        aliases = [sheet_name]
+        if "23" in slug:
+            aliases.extend(["AFFAIRES 2023", "AFFAIRES23"])
+        if "25" in slug:
+            aliases.extend(["AFFAIRES 2025", "AFFAIRES25"])
+        return aliases
+
+    @staticmethod
+    def _affaire_match_tokens(row: Dict[str, Any]) -> set[str]:
+        client = clean_text(row.get("client"))
+        affaire = clean_text(row.get("affaire"))
+        display = clean_text(row.get("display_name"))
+        numero = clean_text(row.get("numero"))
+        tokens = {
+            slugify(clean_text(row.get("affaire_id"))),
+            slugify(display),
+            slugify(affaire),
+            slugify(build_display_name(client, affaire)) if client and affaire else "",
+            slugify(numero),
+            slugify(f"{affaire} {numero}"),
+        }
+        return {t for t in tokens if t}
+
+    def _get_activity_sheet_cache(self, wb, sheet_name: str) -> Optional[Dict[str, Any]]:
+        mtime = self.source_mtime()
+        if self._historical_activity_cache.get("source_mtime") != mtime:
+            self._historical_activity_cache = {"source_mtime": mtime, "sheets": {}}
+
+        if sheet_name in self._historical_activity_cache["sheets"]:
+            return self._historical_activity_cache["sheets"][sheet_name]
+
+        candidates = self._activity_sheet_aliases(sheet_name)
+        ws_name = next((name for name in candidates if name in wb.sheetnames), None)
+        if ws_name is None:
+            self._historical_activity_cache["sheets"][sheet_name] = None
+            return None
+
+        parsed = self.parse_affaires_sheet(wb[ws_name])
+        payload = {"sheet_name": ws_name, "parsed": parsed}
+        self._historical_activity_cache["sheets"][sheet_name] = payload
+        return payload
+
+    def find_affaire_activity_history(self, affaire_id: str, target_sheets: Tuple[str, ...] = HISTORICAL_ACTIVITY_SHEETS) -> Dict[str, Any]:
+        cache = self.get_finance_cache()
+        current = (cache.get("items") or {}).get(affaire_id)
+        if not current:
+            raise HTTPException(status_code=404, detail=f"Affaire introuvable : {affaire_id}")
+
+        ref_tokens = self._affaire_match_tokens(current)
+        wb = load_workbook(self.workbook_path, data_only=True, read_only=True)
+
+        matches: List[Dict[str, Any]] = []
+        missing_sheets: List[str] = []
+
+        try:
+            for requested in target_sheets:
+                sheet_cache = self._get_activity_sheet_cache(wb, requested)
+                if sheet_cache is None:
+                    missing_sheets.append(requested)
+                    continue
+
+                parsed = sheet_cache.get("parsed") or {}
+                items = (parsed.get("items") or {}).values()
+                match = None
+                for item in items:
+                    item_tokens = self._affaire_match_tokens(item)
+                    if ref_tokens.intersection(item_tokens):
+                        match = item
+                        break
+
+                if not match:
+                    continue
+
+                mensuel = match.get("mensuel") or {}
+                monthly_facture = [round(clean_number((mensuel.get(month) or {}).get("facture")), 2) for month in MONTHS]
+                matches.append({
+                    "requested_sheet": requested,
+                    "sheet_name": sheet_cache.get("sheet_name", requested),
+                    "affaire_id": match.get("affaire_id"),
+                    "display_name": match.get("display_name") or "",
+                    "total_facture": round(sum(monthly_facture), 2),
+                    "monthly_facture": monthly_facture,
+                })
+        finally:
+            wb.close()
+
+        return {
+            "affaire_id": affaire_id,
+            "source_display_name": current.get("display_name") or affaire_id,
+            "months": [MONTH_LABELS.get(m, m.title()) for m in MONTHS],
+            "matches": matches,
+            "missing_sheets": missing_sheets,
+            "found": bool(matches),
+        }
 
     @staticmethod
     def compute_insights(affaire: Dict[str, Any]) -> List[str]:
@@ -4693,6 +4793,14 @@ def finance_html() -> str:
       <h3>Facturation mensuelle</h3><div id='historicalBilling' class='small' style='margin:-2px 0 10px'>Historique facturé (années antérieures): -</div>
       <div class='chart-wrap'><svg id='monthlyChart' width='100%' height='100%' viewBox='0 0 980 320' preserveAspectRatio='xMidYMid meet'></svg></div>
       <div class='legend'><span><i class='swatch' style='background:#dbe6ff'></i>Prévisionnel</span><span><i class='swatch' style='background:#ef8d00'></i>Facturation</span></div><div class='cum-wrap'><div class='cum-title'>Graphique cumulatif</div><div id='cumulativeChart'></div></div>
+      <div class='cum-wrap' style='margin-top:16px'>
+        <div style='display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap'>
+          <div class='cum-title' style='margin:0'>Historique activité (AFFAIRES 23/25)</div>
+          <button id='loadActivityHistoryBtn' class='btn' type='button' disabled>Charger AFFAIRES 23/25</button>
+        </div>
+        <div id='activityHistoryStatus' class='small' style='margin-top:8px'>Sélectionnez une affaire puis chargez l’historique.</div>
+        <svg id='activityHistoryChart' width='100%' height='220' viewBox='0 0 980 220' preserveAspectRatio='xMidYMid meet' style='margin-top:8px;border:1px solid #d8e1ef;border-radius:14px;background:#fff'></svg>
+      </div>
     </div>
   </div>
 
@@ -4720,7 +4828,7 @@ def finance_html() -> str:
 <script>
 const MONTHS=["janvier","fevrier","mars","avril","mai","juin","juillet","aout","septembre","octobre","novembre","decembre"];
 const MONTH_LABELS={"janvier":"Janv.","fevrier":"Févr.","mars":"Mars","avril":"Avr.","mai":"Mai","juin":"Juin","juillet":"Juil.","aout":"Août","septembre":"Sept.","octobre":"Oct.","novembre":"Nov.","decembre":"Déc."};
-const state={cacheStatus:null,affaires:[],selectedAffaireId:"",selectedAffaire:null,monthlyExpanded:false,boondImputation:null,boondForcedProjectId:"",boondProjectSearch:"",pointageMissionsMeta:[]};
+const state={cacheStatus:null,affaires:[],selectedAffaireId:"",selectedAffaire:null,monthlyExpanded:false,boondImputation:null,boondForcedProjectId:"",boondProjectSearch:"",pointageMissionsMeta:[],activityHistory:null,activityHistoryLoading:false};
 function euro(v){return new Intl.NumberFormat('fr-FR',{style:'currency',currency:'EUR',maximumFractionDigits:0}).format(Number(v||0));}
 function pct(v){return new Intl.NumberFormat('fr-FR',{style:'percent',maximumFractionDigits:1}).format(Number(v||0));}
 function fmt(v){return new Intl.NumberFormat('fr-FR',{maximumFractionDigits:0}).format(Number(v||0));}
@@ -4734,7 +4842,7 @@ async function api(url,options){const r=await fetch(url,options||{});const data=
 function healthClass(a){const reste=Number(a.reste_a_facturer||0),taux=Number(a.taux_avancement_financier||0);if(taux>=0.9)return{label:'Presque soldée',cls:'ok'};if(reste>0&&taux<0.35)return{label:'À surveiller',cls:'warn'};if(reste<0)return{label:'Incohérence à vérifier',cls:'bad'};return{label:'Stable',cls:'ok'};}
 async function loadCacheStatus(){const d=await api('/api/finance/cache-status');state.cacheStatus=d;const label=d.status==='ready'?`Cache prêt · ${d.affaires_count} affaires`:d.status==='building'?'Cache en reconstruction…':`Cache : ${d.status}`;setCacheBadge(d.status,label);document.getElementById('statusMeta').textContent=`${d.affaires_count||0} affaires · ${d.rows_kept||0} lignes utiles · ${d.generated_at||'pas encore généré'}`;}
 async function loadAffairesList(search=''){const d=await api(`/api/finance/affaires?search=${encodeURIComponent(search)}`);state.affaires=d.items||[];const sel=document.getElementById('affaireSelect');const prev=state.selectedAffaireId;sel.innerHTML=`<option value=''>Sélectionnez une affaire</option>`+state.affaires.map(x=>`<option value="${esc(x.affaire_id)}">${esc(x.display_name)}</option>`).join('');if(prev&&state.affaires.some(x=>x.affaire_id===prev)){sel.value=prev;}else{state.selectedAffaireId='';state.selectedAffaire=null;}showNotice(state.affaires.length?`${state.affaires.length} affaire(s) disponible(s)`:'Aucune affaire trouvée pour ce filtre.');}
-async function loadSelectedAffaire(id){if(!id){state.selectedAffaireId='';state.selectedAffaire=null;state.boondImputation=null;state.pointageMissionsMeta=[];renderAll();return;}const d=await api(`/api/finance/affaire/${encodeURIComponent(id)}`);state.selectedAffaireId=id;state.selectedAffaire=d.affaire||null;state.boondImputation=null;state.pointageMissionsMeta=[];try{const pm=await api(`/api/project-management/pointage?affaire_id=${encodeURIComponent(id)}`);state.pointageMissionsMeta=((pm&&pm.missions)||[]).filter(m=>Number(m.tasks_count||0)>0);}catch(_){state.pointageMissionsMeta=[];}renderAll();try{const boondName=(state.selectedAffaire&&(state.selectedAffaire.display_name||state.selectedAffaire.affaire))||'';if(boondName){state.boondForcedProjectId=localStorage.getItem(`boondForcedProjectId:${id}`)||'';state.boondImputation=await api(`/api/boond/imputations/by-project?project_name=${encodeURIComponent(boondName)}&affaire_id=${encodeURIComponent(id)}&affaire=${encodeURIComponent((state.selectedAffaire&&state.selectedAffaire.affaire)||'')}&numero=${encodeURIComponent((state.selectedAffaire&&state.selectedAffaire.numero)||'')}&client=${encodeURIComponent((state.selectedAffaire&&state.selectedAffaire.client)||'')}&display_name=${encodeURIComponent((state.selectedAffaire&&state.selectedAffaire.display_name)||'')}&boond_project_id=${encodeURIComponent(state.boondForcedProjectId||'')}`);}else{state.boondImputation={matched_project:null,totals:{}};}}catch(_){state.boondImputation={matched_project:null,totals:{}};}renderAll();localStorage.setItem('selectedAffaireId',id);}
+async function loadSelectedAffaire(id){if(!id){state.selectedAffaireId='';state.selectedAffaire=null;state.boondImputation=null;state.pointageMissionsMeta=[];state.activityHistory=null;state.activityHistoryLoading=false;renderAll();return;}const d=await api(`/api/finance/affaire/${encodeURIComponent(id)}`);state.selectedAffaireId=id;state.selectedAffaire=d.affaire||null;state.boondImputation=null;state.pointageMissionsMeta=[];state.activityHistory=null;state.activityHistoryLoading=false;try{const pm=await api(`/api/project-management/pointage?affaire_id=${encodeURIComponent(id)}`);state.pointageMissionsMeta=((pm&&pm.missions)||[]).filter(m=>Number(m.tasks_count||0)>0);}catch(_){state.pointageMissionsMeta=[];}renderAll();try{const boondName=(state.selectedAffaire&&(state.selectedAffaire.display_name||state.selectedAffaire.affaire))||'';if(boondName){state.boondForcedProjectId=localStorage.getItem(`boondForcedProjectId:${id}`)||'';state.boondImputation=await api(`/api/boond/imputations/by-project?project_name=${encodeURIComponent(boondName)}&affaire_id=${encodeURIComponent(id)}&affaire=${encodeURIComponent((state.selectedAffaire&&state.selectedAffaire.affaire)||'')}&numero=${encodeURIComponent((state.selectedAffaire&&state.selectedAffaire.numero)||'')}&client=${encodeURIComponent((state.selectedAffaire&&state.selectedAffaire.client)||'')}&display_name=${encodeURIComponent((state.selectedAffaire&&state.selectedAffaire.display_name)||'')}&boond_project_id=${encodeURIComponent(state.boondForcedProjectId||'')}`);}else{state.boondImputation={matched_project:null,totals:{}};}}catch(_){state.boondImputation={matched_project:null,totals:{}};}renderAll();localStorage.setItem('selectedAffaireId',id);}
 function setHeroEmpty(){document.getElementById('heroTitle').textContent='Sélectionnez une affaire';document.getElementById('heroSubtitle').textContent='Le cockpit se remplit à partir du cache du tableau activité.';document.getElementById('metaClient').textContent='-';document.getElementById('metaProject').textContent='-';document.getElementById('metaMissions').textContent='-';document.getElementById('metaStatus').textContent='🟠 Attention';const h=document.getElementById('heroHealth');h.textContent='En attente';h.className='health warn';}
 function cardTone(id,tone){const el=document.getElementById(id);el.classList.remove('good','warn','bad');if(tone)el.classList.add(tone);}
 function renderHero(){const a=state.selectedAffaire;if(!a){setHeroEmpty();return;}document.getElementById('heroTitle').textContent=a.display_name||'-';document.getElementById('heroSubtitle').textContent=`Client ${a.client||'-'} · ${(a.missions||[]).length} mission(s)`;document.getElementById('metaClient').textContent=a.client||'-';document.getElementById('metaProject').textContent=a.affaire||'-';document.getElementById('metaMissions').textContent=String((a.missions||[]).length||0);const hh=healthClass(a),el=document.getElementById('heroHealth');el.textContent=hh.label;el.className=`health ${hh.cls}`;const resteVal=Number(a.reste_a_facturer||0);const reste=euro(resteVal);const av=Number(a.taux_avancement_financier||0);let why='';if(av<0.5)why='Facturation encore faible vs commande';else if(resteVal>0)why='Reste significatif à facturer';else why='Objectif financier atteint';document.getElementById('metaStatus').textContent=(hh.cls==='ok'?`🟢 Stable · `:(hh.cls==='warn'?`🟠 À surveiller · `:`🔴 Risque · `))+why+` (${reste})`;}
@@ -4766,11 +4874,13 @@ function closeCalcDetailModal(){const modal=document.getElementById('calcDetailM
 function bindFinanceCardsDetails(){const a=state.selectedAffaire||{};const cardDetails={kpiCommandeCard:{title:'Montant contractualisé',intro:'Montant de commande de l’affaire.',steps:[{label:'Valeur',value:euro(a.commande_ht||0),desc:'Commande HT issue des données finance.'}],formula:`Commande = ${euro(a.commande_ht||0)}`},kpiFactureCard:{title:'Cumul facturé',intro:'Total facturé depuis le début du projet.',steps:[{label:'Valeur',value:euro(a.facturation_totale||0),desc:'Facturation cumulée toutes périodes.'}],formula:`Facturé cumulé = ${euro(a.facturation_totale||0)}`},kpiResteCard:{title:'Reste à facturer',intro:'Différence commande et facturation cumulée.',steps:[{label:'Commande',value:euro(a.commande_ht||0),desc:'Montant contractualisé.'},{label:'Facturé',value:euro(a.facturation_totale||0),desc:'Cumul facturé.'}],formula:`Reste = commande - facturé = ${euro(a.reste_a_facturer||0)}`},kpiAvanceCard:{title:'Avancement financier',intro:'Part facturée par rapport à la commande.',steps:[{label:'Facturé',value:euro(a.facturation_totale||0),desc:'Cumul facturé.'},{label:'Commande',value:euro(a.commande_ht||0),desc:'Montant contractualisé.'}],formula:`Avancement financier = facturé / commande = ${pct(a.taux_avancement_financier||0)}`},kpiPlanningCard:{title:'Avancement planning',intro:'Avancement production issu du pointage planning.',steps:[{label:'Avancement',value:pct(a.pointage_progress_ratio||0),desc:'Progression issue du pointage.'},{label:'Tâches',value:fmt(a.pointage_task_count||0),desc:'Nombre de tâches prises en compte.'}],formula:`Avancement planning = ${pct(a.pointage_progress_ratio||0)}`}};['kpiCommandeCard','kpiFactureCard','kpiResteCard','kpiAvanceCard','kpiPlanningCard'].forEach(id=>{const el=document.getElementById(id);if(!el)return;el.style.cursor='pointer';el.onclick=()=>openCalcDetailModal(cardDetails[id]);});const prodDetails={prodFinPct:{title:'Avancement financier',intro:'Même indicateur que la carte KPI finance.',steps:[{label:'Valeur',value:pct(a.taux_avancement_financier||0),desc:'Facturation cumulée / commande.'}],formula:`${pct(a.taux_avancement_financier||0)}`},prodPointagePct:{title:'Avancement production pointé',intro:'Progression issue du pointage planning (tous plannings).',steps:[{label:'Valeur',value:pct(a.pointage_progress_ratio||0),desc:'Calculée sur le pointage planning.'}],formula:`${pct(a.pointage_progress_ratio||0)}`},prodGapPct:{title:'Écart financier vs production',intro:'Différence entre avancement financier et avancement pointé.',steps:[{label:'Financier',value:pct(a.taux_avancement_financier||0),desc:'Facturation / commande.'},{label:'Production',value:pct(a.pointage_progress_ratio||0),desc:'Pointage planning.'}],formula:`Écart (pt) = ${(Number(a.taux_avancement_financier||0)-Number(a.pointage_progress_ratio||0))*100}`},prodBoondRentability:{title:'Rentabilité imputation BOOND',intro:'Rentabilité comparant facturé et coût imputations BOOND.',steps:[{label:'Valeur',value:(document.getElementById('prodBoondRentability')||{}).textContent||'-',desc:'Calcul affiché sur la carte.'}],formula:'(facturé - coût imputations) / coût imputations'}};['prodFinPct','prodPointagePct','prodGapPct','prodBoondRentability'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const card=el.closest('.prod-card');if(card){card.style.cursor='pointer';card.onclick=()=>openCalcDetailModal(prodDetails[id]);}});}
 function renderPointageFinanceChart(){const sec=document.getElementById('pointagePlanningFinanceSection');const root=document.getElementById('pointageFinanceChart');const title=document.getElementById('pointageFinanceChartTitle');const a=state.selectedAffaire||{};const boond=(state.boondImputation||{}).totals||{};const taskCount=Number(a.pointage_task_count||0);if(!sec||!root)return;if(taskCount<=0){sec.style.display='none';root.innerHTML="<div class='small'>Aucune donnée de pointage planning.</div>";return;}sec.style.display='block';const mode=((document.getElementById('pointageFinanceChartSelect')||{}).value)||'planned-vs-pointed';const rows=pointageFinanceCalculationRows(mode,a,boond);if(title)title.textContent=mode==='pointed-vs-boond'?'Vente pointée à date vs coût de production BOOND':'Vente planifiée à date vs vente pointée à date';const max=Math.max(1,...rows.map(r=>Number(r.value||0)));root.innerHTML=`<div style='display:grid;grid-template-columns:repeat(${rows.length},minmax(260px,1fr));gap:18px'>${rows.map((r,idx)=>{const width=Math.max(4,(Number(r.value||0)/max)*100);return `<button type='button' class='pilot-row calc-card-btn' data-calc-index='${idx}' style='display:block;padding:18px'><div style='display:flex;justify-content:space-between;gap:18px;align-items:flex-start'><div style='min-width:0'><div style='font-weight:800;font-size:16px'>${esc(r.label)}</div><div class='small' style='margin-top:4px'>${esc(r.subtitle)}</div><div class='calc-badge'>🧮 ${esc(r.badge||'Cliquer pour voir le calcul')}</div></div><div style='font-weight:900;white-space:nowrap'>${euro(r.value||0)}</div></div><div style='margin-top:14px;height:14px;border-radius:999px;background:#edf1f8;overflow:hidden'><div style='height:100%;width:${width}%;background:${r.color}'></div></div></button>`;}).join('')}</div>`;Array.from(root.querySelectorAll('[data-calc-index]')).forEach(btn=>btn.addEventListener('click',()=>{const idx=Number(btn.getAttribute('data-calc-index')||-1);if(idx>=0&&rows[idx])openCalcDetailModal(rows[idx].details);}));}
 function renderBoondImputation(){const root=document.getElementById('boondImputationBox');if(!root)return;const b=state.boondImputation;const a=state.selectedAffaire;if(!a){root.className='empty';root.textContent='Sélectionnez une affaire pour charger le coût cumulé BOOND.';return;}if(!b){root.className='empty';root.textContent='Chargement des données BOOND…';return;}if(!b.matched_project){root.className='empty';root.innerHTML=`<div>Aucun projet BOOND matché pour cette affaire.</div><div style='margin-top:8px' class='small'>Choisissez provisoirement un projet BOOND dans la liste :</div><div style='margin-top:8px;display:flex;gap:8px;align-items:center'><input id='boondProjectSearch' placeholder='Filtrer (ex: laffitte)' value='${esc(state.boondProjectSearch||'')}' style='padding:6px 8px;min-width:220px'><select id='boondProjectSelect' style='padding:6px 8px;min-width:520px'>${boondOptionsHtml(b)}</select><button id='boondProjectOverrideApply' class='btn' type='button'>Forcer</button><button id='boondProjectOverrideClear' class='btn' type='button'>Retirer</button></div>`;}else{const t=b.totals||{};const billed=Number((a&&a.facturation_totale)||0);const imputed=Number(t.total_cost||0);const margin=(imputed>0||billed>0)?(billed-imputed):null;const rent=(imputed>0&&billed>0)?(((billed-imputed)/Math.max(imputed,1))*100):null;const resources=(b.resources_imputation||[]);const totalCost=Math.max(1,...resources.map(x=>Number(x.cost||0)),imputed);const detail=resources.length?`<table style='margin-top:10px'><thead><tr><th>Ressource</th><th class='num'>Jours</th><th class='num'>Coût imputé</th><th class='num'>Part coût</th></tr></thead><tbody>${resources.map(r=>{const c=Number(r.cost||0);const part=(c/totalCost)*100;return `<tr><td>${esc(r.resource_name||r.resource_id||'-')}<div style='margin-top:6px;height:6px;background:#edf1f8;border-radius:999px;overflow:hidden'><div style='height:100%;width:${Math.min(100,part)}%;background:#ef8d00'></div></div></td><td class='num'>${fmt(r.days)}</td><td class='num'>${r.cost==null?'-':euro(r.cost)}</td><td class='num'>${part.toFixed(1)}%</td></tr>`;}).join('')}</tbody></table>`:`<div style='padding:8px 12px' class='small'>Détail ressource indisponible.</div>`;root.className='table-wrap';root.innerHTML=`<div style='padding:10px 12px;font-weight:800'>Source BOOND · coût global issu de la productivité projet BOOND.</div><table><thead><tr><th>Source</th><th class='num'>Coût cumulé</th><th class='num'>Marge imputée</th><th class='num'>Rentabilité</th></tr></thead><tbody><tr><td>${esc(t.cost_source||'projects_productivity')}</td><td class='num'><strong>${t.total_cost==null?'-':euro(t.total_cost)}</strong></td><td class='num'>${margin==null?'-':euro(margin)}</td><td class='num'>${rent==null?'-':fmt(rent)+'%'}</td></tr></tbody></table><div style='padding:10px 12px' class='small'>Projet BOOND utilisé: <b>${esc((b.matched_project||{}).project_label||(b.matched_project||{}).project_reference||'-')}</b> (id: <code>${esc((b.matched_project||{}).project_id||'-')}</code>) · mode: ${esc((b.matched_project||{}).matched_on||'auto')}</div><div style='padding:0 12px 10px;display:flex;gap:8px;align-items:center'><input id='boondProjectSearch' placeholder='Filtrer (ex: laffitte)' value='${esc(state.boondProjectSearch||'')}' style='padding:6px 8px;min-width:220px'><select id='boondProjectSelect' style='padding:6px 8px;min-width:520px'>${boondOptionsHtml(b)}</select><button id='boondProjectOverrideApply' class='btn' type='button'>Forcer</button><button id='boondProjectOverrideClear' class='btn' type='button'>Retirer</button></div>${detail}`;}const search=document.getElementById('boondProjectSearch');if(search)search.addEventListener('input',()=>{state.boondProjectSearch=(search.value||'').trim();renderBoondImputation();});const apply=document.getElementById('boondProjectOverrideApply');if(apply)apply.addEventListener('click',async()=>{const sel=document.getElementById('boondProjectSelect');const v=(sel&&sel.value||'').trim();state.boondForcedProjectId=v;if(state.selectedAffaireId){if(v)localStorage.setItem(`boondForcedProjectId:${state.selectedAffaireId}`,v);else localStorage.removeItem(`boondForcedProjectId:${state.selectedAffaireId}`);await loadSelectedAffaire(state.selectedAffaireId);}});const clear=document.getElementById('boondProjectOverrideClear');if(clear)clear.addEventListener('click',async()=>{state.boondForcedProjectId='';if(state.selectedAffaireId){localStorage.removeItem(`boondForcedProjectId:${state.selectedAffaireId}`);await loadSelectedAffaire(state.selectedAffaireId);}});} 
-function renderAll(){renderHero();renderKpis();renderProductionPilot();renderFinanceChart();renderCumulativeChart();renderMonthlyTable();renderMissions();renderInsights();renderBoondImputation();renderPointageFinanceChart();bindFinanceCardsDetails();document.getElementById('exportBtn').disabled=!state.selectedAffaireId;const dash=document.getElementById('dashboardBtn');dash.href=state.selectedAffaireId?`/dashboard?affaire_id=${encodeURIComponent(state.selectedAffaireId)}`:'/dashboard';const pm=document.getElementById('pmBtn');pm.href=state.selectedAffaireId?`/gestion-projet?affaire_id=${encodeURIComponent(state.selectedAffaireId)}`:'/gestion-projet';}
+function renderActivityHistoryChart(){const svg=document.getElementById('activityHistoryChart');const status=document.getElementById('activityHistoryStatus');const btn=document.getElementById('loadActivityHistoryBtn');if(btn)btn.disabled=!state.selectedAffaireId||state.activityHistoryLoading;if(!svg||!status)return;if(!state.selectedAffaire){status.textContent='Sélectionnez une affaire puis chargez l’historique.';svg.innerHTML="<text x='490' y='110' text-anchor='middle' fill='#6e7a90' font-size='16'>Aucune affaire sélectionnée</text>";return;}if(state.activityHistoryLoading){status.textContent='Recherche en cours dans les onglets AFFAIRES 23 et AFFAIRES 25…';svg.innerHTML="<text x='490' y='110' text-anchor='middle' fill='#6e7a90' font-size='16'>Chargement…</text>";return;}const history=state.activityHistory;if(!history){status.textContent='Cliquez sur « Charger AFFAIRES 23/25 » pour afficher la facturation historique.';svg.innerHTML="<text x='490' y='110' text-anchor='middle' fill='#6e7a90' font-size='16'>Historique non chargé</text>";return;}const matches=history.matches||[];const missing=history.missing_sheets||[];if(!matches.length){status.textContent=`Aucun match trouvé dans AFFAIRES 23/25.${missing.length?` Onglets manquants: ${missing.join(', ')}.`:''}`;svg.innerHTML="<text x='490' y='110' text-anchor='middle' fill='#b04a4a' font-size='16'>Aucun match trouvé</text>";return;}status.textContent=`${matches.length} match(s) trouvé(s): ${matches.map(m=>m.sheet_name).join(' · ')}${missing.length?` · Onglets manquants: ${missing.join(', ')}`:''}`;const left=56,top=16,width=888,height=154,step=width/Math.max(1,MONTHS.length);const colors=['#ef8d00','#1b6ef3','#239b5b','#a254d2'];const allValues=matches.flatMap(m=>m.monthly_facture||[]);const max=Math.max(1,...allValues);let out='';for(let i=0;i<=4;i++){const y=top+(height/4)*i;const val=Math.round(max*(1-i/4));out+=`<line x1='${left}' y1='${y}' x2='${left+width}' y2='${y}' stroke='#e6edf7'/><text x='${left-8}' y='${y+4}' text-anchor='end' fill='#5f6f88' font-size='11'>${fmt(val)} €</text>`;}matches.forEach((series,idx)=>{const vals=(series.monthly_facture||[]).map(v=>Number(v||0));const pts=vals.map((v,i)=>`${left+i*step+step/2},${top+height-(v/max)*height}`).join(' ');const color=colors[idx%colors.length];out+=`<polyline points='${pts}' fill='none' stroke='${color}' stroke-width='3'><title>${esc(series.sheet_name||series.requested_sheet||`Série ${idx+1}`)}</title></polyline>`;vals.forEach((v,i)=>{const x=left+i*step+step/2,y=top+height-(v/max)*height;out+=`<circle cx='${x}' cy='${y}' r='3.5' fill='${color}'><title>${MONTH_LABELS[MONTHS[i]]}: ${euro(v)}</title></circle>`;});});MONTHS.forEach((m,idx)=>{const x=left+idx*step+step/2;if(idx%2===0)out+=`<text x='${x}' y='${top+height+18}' text-anchor='middle' fill='#5f6f88' font-size='11'>${MONTH_LABELS[m]}</text>`;});const legend=matches.map((m,idx)=>`<g><rect x='${left+idx*180}' y='${top+height+34}' width='14' height='14' rx='3' fill='${colors[idx%colors.length]}'></rect><text x='${left+idx*180+20}' y='${top+height+45}' fill='#5f6f88' font-size='12'>${esc(m.sheet_name||m.requested_sheet||`Série ${idx+1}`)}</text></g>`).join('');svg.innerHTML=out+legend;}
+async function loadActivityHistory(){if(!state.selectedAffaireId)return;state.activityHistoryLoading=true;renderActivityHistoryChart();try{state.activityHistory=await api(`/api/finance/affaire/${encodeURIComponent(state.selectedAffaireId)}/activity-history`);}catch(err){state.activityHistory={matches:[],missing_sheets:[],found:false,error:err.message||'Erreur'};showError(err.message||'Impossible de charger l’historique activité.');}finally{state.activityHistoryLoading=false;renderActivityHistoryChart();}}
+function renderAll(){renderHero();renderKpis();renderProductionPilot();renderFinanceChart();renderCumulativeChart();renderMonthlyTable();renderMissions();renderInsights();renderBoondImputation();renderPointageFinanceChart();renderActivityHistoryChart();bindFinanceCardsDetails();document.getElementById('exportBtn').disabled=!state.selectedAffaireId;const dash=document.getElementById('dashboardBtn');dash.href=state.selectedAffaireId?`/dashboard?affaire_id=${encodeURIComponent(state.selectedAffaireId)}`:'/dashboard';const pm=document.getElementById('pmBtn');pm.href=state.selectedAffaireId?`/gestion-projet?affaire_id=${encodeURIComponent(state.selectedAffaireId)}`:'/gestion-projet';}
 async function rebuildCache(){clearError();showNotice('Reconstruction du cache en cours…');await api('/api/finance/rebuild-cache',{method:'POST'});await loadCacheStatus();await loadAffairesList(document.getElementById('searchInput').value||'');if(state.selectedAffaireId&&state.affaires.some(x=>x.affaire_id===state.selectedAffaireId)){await loadSelectedAffaire(state.selectedAffaireId);}else{state.selectedAffaireId='';state.selectedAffaire=null;renderAll();}showNotice('Cache reconstruit avec succès.');}
 async function initFinancePage(){clearError();try{await loadCacheStatus();await loadAffairesList('');const params=new URLSearchParams(window.location.search);const affairFromUrl=params.get('affaire_id');const affairFromStorage=localStorage.getItem('selectedAffaireId')||'';const preselected=affairFromUrl||affairFromStorage;if(preselected&&state.affaires.some(x=>x.affaire_id===preselected)){document.getElementById('affaireSelect').value=preselected;await loadSelectedAffaire(preselected);}else{renderAll();}}catch(err){showError(err.message||'Erreur de chargement');}
 document.getElementById('reloadBtn').addEventListener('click',async()=>{try{await rebuildCache();}catch(err){showError(err.message||'Erreur de reconstruction du cache');}});
-document.getElementById('exportBtn').addEventListener('click',()=>{if(!state.selectedAffaireId)return;window.location.href=`/api/finance/affaire/${encodeURIComponent(state.selectedAffaireId)}/export-csv`;});const pointageFinanceChartSelect=document.getElementById('pointageFinanceChartSelect');if(pointageFinanceChartSelect)pointageFinanceChartSelect.addEventListener('change',renderPointageFinanceChart);const calcDetailClose=document.getElementById('calcDetailClose');if(calcDetailClose)calcDetailClose.addEventListener('click',closeCalcDetailModal);const calcDetailModal=document.getElementById('calcDetailModal');if(calcDetailModal)calcDetailModal.addEventListener('click',e=>{if(e.target===calcDetailModal)closeCalcDetailModal();});}
+document.getElementById('exportBtn').addEventListener('click',()=>{if(!state.selectedAffaireId)return;window.location.href=`/api/finance/affaire/${encodeURIComponent(state.selectedAffaireId)}/export-csv`;});const pointageFinanceChartSelect=document.getElementById('pointageFinanceChartSelect');if(pointageFinanceChartSelect)pointageFinanceChartSelect.addEventListener('change',renderPointageFinanceChart);const calcDetailClose=document.getElementById('calcDetailClose');if(calcDetailClose)calcDetailClose.addEventListener('click',closeCalcDetailModal);const calcDetailModal=document.getElementById('calcDetailModal');if(calcDetailModal)calcDetailModal.addEventListener('click',e=>{if(e.target===calcDetailModal)closeCalcDetailModal();});const loadActivityHistoryBtn=document.getElementById('loadActivityHistoryBtn');if(loadActivityHistoryBtn)loadActivityHistoryBtn.addEventListener('click',async()=>{await loadActivityHistory();});}
 initFinancePage();
 </script>
 </body>
@@ -5340,6 +5450,12 @@ def api_affaire_detail(affaire_id: str, mission_key: str = Query(default="")):
     affaire["pointage_vs_financial_gap_pct"] = round((clean_number(affaire.get("taux_avancement_financier")) - clean_number(affaire.get("pointage_progress_ratio"))) * 100.0, 2)
     affaire["insights"] = FinanceService.compute_insights(affaire)
     return {"ok": True, "affaire": affaire}
+
+
+@app.get("/api/finance/affaire/{affaire_id}/activity-history", response_class=JSONResponse)
+def api_affaire_activity_history(affaire_id: str):
+    history = service.find_affaire_activity_history(affaire_id)
+    return {"ok": True, **history}
 
 
 @app.get("/api/project-management/board", response_class=JSONResponse)
