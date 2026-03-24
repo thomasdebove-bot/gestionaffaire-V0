@@ -30,7 +30,8 @@ DEFAULT_CACHE_FILE = "finance_cache.json"
 WORKBOOK_PATH = os.getenv("ACTIVITE_XLSX_PATH", DEFAULT_WORKBOOK_PATH)
 SHEET_NAME = os.getenv("ACTIVITE_SHEET_NAME", DEFAULT_SHEET_NAME)
 CACHE_FILE = os.getenv("FINANCE_CACHE_FILE", DEFAULT_CACHE_FILE)
-EXPECTED_SCHEMA_VERSION = "finance_affaires_dataset_v4"
+LEGACY_SHEETS = [s.strip() for s in os.getenv("ACTIVITE_LEGACY_SHEETS", "AFFAIRES 2025,AFFAIRES 2024,AFFAIRES 2023").split(",") if s.strip()]
+EXPECTED_SCHEMA_VERSION = "finance_affaires_dataset_v5"
 TEMPO_LOGO_PATH = os.getenv("TEMPO_LOGO_PATH", r"\\192.168.10.100\02 - affaires\02.2 - SYNTHESE\ZZ - METRONOME\Content\T logo.png")
 METRONOME_BASE_PATH = os.getenv("METRONOME_BASE_PATH", r"\\192.168.10.100\02 - affaires\02.2 - SYNTHESE\ZZ - METRONOME")
 POINTAGE_STORE_FILE = Path(os.getenv("POINTAGE_STORE_FILE", "pointage_store.json"))
@@ -1667,26 +1668,29 @@ def row_tuple_to_dict(values: tuple) -> Dict[str, Any]:
 
 
 def anteriorite_from_row(row: Dict[str, Any]) -> float:
-    keys = [
-        "facturation_cumulee_2017",
-        "facturation_cumulee_2018",
-        "facturation_cumulee_2021",
-        "facturation_cumulee_2022",
-        "facturation_cumulee_2023",
-        "facturation_cumulee_2024",
-        "facturation_cumulee_2025",
-    ]
-    return sum(clean_number(row.get(k)) for k in keys)
+    return sum(clean_number(row.get(k)) for k in CUMULE_KEYS)
 
 
 def facture_2026_from_row(row: Dict[str, Any]) -> float:
     return clean_number(row.get("facturation_cumulee_2026"))
 
 
+CUMULE_KEYS = [
+    "facturation_cumulee_2017",
+    "facturation_cumulee_2018",
+    "facturation_cumulee_2021",
+    "facturation_cumulee_2022",
+    "facturation_cumulee_2023",
+    "facturation_cumulee_2024",
+    "facturation_cumulee_2025",
+]
+
+
 class FinanceService:
-    def __init__(self, workbook_path: str, sheet_name: str, cache_file: str) -> None:
+    def __init__(self, workbook_path: str, sheet_name: str, cache_file: str, legacy_sheets: Optional[List[str]] = None) -> None:
         self.workbook_path = workbook_path
         self.sheet_name = sheet_name
+        self.legacy_sheets = [clean_text(s) for s in (legacy_sheets or []) if clean_text(s)]
         self.cache_file = Path(cache_file)
         self._cache: Dict[str, Any] = {
             "status": "idle",
@@ -1765,6 +1769,25 @@ class FinanceService:
 
         ws = wb[self.sheet_name]
         parsed = self.parse_affaires_sheet(ws)
+        merged_from_legacy = 0
+        parsed["meta"]["legacy_sheets_used"] = []
+
+        available_legacy_sheets = self._list_available_legacy_sheets(list(wb.sheetnames))
+        for legacy_sheet in available_legacy_sheets:
+            legacy_ws = wb[legacy_sheet]
+            legacy_parsed = self.parse_affaires_sheet(legacy_ws)
+            merged_from_legacy += self._merge_legacy_affaires(parsed["items"], legacy_parsed["items"])
+            parsed["meta"]["legacy_sheets_used"].append(legacy_sheet)
+
+        missing_legacy = [name for name in self.legacy_sheets if name and name != self.sheet_name and name not in wb.sheetnames]
+        if missing_legacy:
+            parsed["meta"]["warnings"].append(
+                "Onglets historiques introuvables: " + ", ".join(missing_legacy)
+            )
+        if merged_from_legacy:
+            parsed["meta"]["warnings"].append(
+                f"Historique enrichi via {merged_from_legacy} affaire(s) depuis: {', '.join(parsed['meta']['legacy_sheets_used'])}"
+            )
 
         cache = {
             "schema_version": EXPECTED_SCHEMA_VERSION,
@@ -1777,6 +1800,7 @@ class FinanceService:
             "source_path": self.workbook_path,
             "source_mtime": self.source_mtime(),
             "sheet_name": self.sheet_name,
+            "legacy_sheets": parsed["meta"].get("legacy_sheets_used", []),
             "items": parsed["items"],
             "ordered_ids": parsed["ordered_ids"],
         }
@@ -1867,6 +1891,80 @@ class FinanceService:
             "warnings": warnings,
         }
         return {"items": items, "ordered_ids": ordered_ids, "meta": meta}
+
+    def _list_available_legacy_sheets(self, sheetnames: List[str]) -> List[str]:
+        return [name for name in self.legacy_sheets if name and name != self.sheet_name and name in sheetnames]
+
+    def _merge_legacy_affaires(self, current_items: Dict[str, Dict[str, Any]], legacy_items: Dict[str, Dict[str, Any]]) -> int:
+        updated = 0
+        for affaire_id, current in current_items.items():
+            legacy = legacy_items.get(affaire_id)
+            if not legacy:
+                continue
+            if self._merge_affaire_with_legacy(current, legacy):
+                updated += 1
+        return updated
+
+    def _merge_affaire_with_legacy(self, current: Dict[str, Any], legacy: Dict[str, Any]) -> bool:
+        changed = False
+        for key in CUMULE_KEYS:
+            current_val = clean_number(current.get(key))
+            legacy_val = clean_number(legacy.get(key))
+            merged = max(current_val, legacy_val)
+            if abs(merged - current_val) > 1e-9:
+                current[key] = merged
+                changed = True
+
+        legacy_missions = legacy.get("missions") or []
+        current_missions = current.get("missions") or []
+        if legacy_missions and current_missions:
+            legacy_by_id = {slugify(clean_text(m.get("label"))): m for m in legacy_missions if clean_text(m.get("label"))}
+            for mission in current_missions:
+                mission_key = slugify(clean_text(mission.get("label")))
+                if not mission_key:
+                    continue
+                legacy_mission = legacy_by_id.get(mission_key)
+                if legacy_mission and self._merge_mission_with_legacy(mission, legacy_mission):
+                    changed = True
+
+        if changed:
+            self._recompute_affaire_financials(current)
+        return changed
+
+    def _merge_mission_with_legacy(self, mission: Dict[str, Any], legacy_mission: Dict[str, Any]) -> bool:
+        changed = False
+        for key in CUMULE_KEYS:
+            current_val = clean_number(mission.get(key))
+            legacy_val = clean_number(legacy_mission.get(key))
+            merged = max(current_val, legacy_val)
+            if abs(merged - current_val) > 1e-9:
+                mission[key] = merged
+                changed = True
+        if changed:
+            mission["anteriorite"] = sum(clean_number(mission.get(k)) for k in CUMULE_KEYS)
+            mission["facture_2026"] = clean_number(mission.get("facture_2026", mission.get("facturation_cumulee_2026")))
+            mission["facturation_totale"] = clean_number(mission.get("anteriorite")) + clean_number(mission.get("facture_2026"))
+        return changed
+
+    def _recompute_affaire_financials(self, affaire: Dict[str, Any]) -> None:
+        missions = affaire.get("missions") or []
+        if missions:
+            affaire["anteriorite"] = sum(clean_number(m.get("anteriorite")) for m in missions)
+            affaire["facture_2026"] = sum(clean_number(m.get("facture_2026", m.get("facturation_cumulee_2026"))) for m in missions)
+            affaire["facturation_totale"] = clean_number(affaire.get("anteriorite")) + clean_number(affaire.get("facture_2026"))
+            if abs(clean_number(affaire.get("reste_a_facturer"))) < 1e-9 and abs(clean_number(affaire.get("commande_ht"))) > 1e-9:
+                affaire["reste_a_facturer"] = clean_number(affaire.get("commande_ht")) - clean_number(affaire.get("facturation_totale"))
+        else:
+            affaire["anteriorite"] = sum(clean_number(affaire.get(k)) for k in CUMULE_KEYS)
+            affaire["facture_2026"] = clean_number(affaire.get("facture_2026", affaire.get("facturation_cumulee_2026")))
+            affaire["facturation_totale"] = clean_number(affaire.get("anteriorite")) + clean_number(affaire.get("facture_2026"))
+            if abs(clean_number(affaire.get("reste_a_facturer"))) < 1e-9 and abs(clean_number(affaire.get("commande_ht"))) > 1e-9:
+                affaire["reste_a_facturer"] = clean_number(affaire.get("commande_ht")) - clean_number(affaire.get("facturation_totale"))
+        affaire["taux_avancement_financier"] = (
+            clean_number(affaire.get("facturation_totale")) / clean_number(affaire.get("commande_ht"))
+            if clean_number(affaire.get("commande_ht"))
+            else 0.0
+        )
 
     def _normalize_row(
         self,
@@ -3975,7 +4073,7 @@ class PointageService:
         }
 
 
-service = FinanceService(WORKBOOK_PATH, SHEET_NAME, CACHE_FILE)
+service = FinanceService(WORKBOOK_PATH, SHEET_NAME, CACHE_FILE, legacy_sheets=LEGACY_SHEETS)
 metronome_service = MetronomeService(METRONOME_BASE_PATH)
 pointage_service = PointageService(POINTAGE_STORE_FILE)
 boond_service = BoondService(BOOND_CACHE_DB_PATH)
