@@ -2433,6 +2433,44 @@ class MetronomeService:
                 score = max(score, min(token_score, 95))
         return score
 
+    def _collect_project_name_matches(self, projects: List[Dict[str, str]], project_name: str) -> List[Dict[str, Any]]:
+        target_name = clean_text(project_name)
+        target_slug = slugify(target_name)
+        target_tokens = self._tokenize_project_name(target_name)
+        if not target_slug:
+            return []
+        out: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for project in projects:
+            project_row_id = self._row_id(project)
+            title = self._get_first_value(project, METRONOME_COLUMN_ALIASES["project_title_projects"])
+            name = self._get_first_value(project, METRONOME_COLUMN_ALIASES["project_name_projects"])
+            for candidate_name in [title, name]:
+                local_name = clean_text(candidate_name)
+                if not local_name:
+                    continue
+                local_slug = slugify(local_name)
+                local_tokens = self._tokenize_project_name(local_name)
+                score = self._score_project_match(target_slug, target_tokens, local_name)
+                has_name_hit = bool(
+                    (target_slug and local_slug and (target_slug in local_slug or local_slug in target_slug))
+                    or (target_tokens and local_tokens and len(target_tokens & local_tokens) >= 1)
+                )
+                if not has_name_hit:
+                    continue
+                key = project_row_id or slugify(local_name)
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                out.append({
+                    "project_id": clean_text(project_row_id),
+                    "project_title": local_name,
+                    "match_score": int(score),
+                    "source": "name_match",
+                })
+        out.sort(key=lambda x: (-clean_number(x.get("match_score")), clean_text(x.get("project_title"))))
+        return out
+
     def _resolve_project(self, projects: List[Dict[str, str]], entries: List[Dict[str, str]], project_name: str) -> Dict[str, Any]:
         target_name = clean_text(project_name)
         target_slug = slugify(target_name)
@@ -2534,7 +2572,14 @@ class MetronomeService:
             })
         return resolved
 
-    def build_project_board(self, project_name: str, start_date: str = "", end_date: str = "") -> Dict[str, Any]:
+    def build_project_board(
+        self,
+        project_name: str,
+        start_date: str = "",
+        end_date: str = "",
+        forced_project_id: str = "",
+        forced_project_title: str = "",
+    ) -> Dict[str, Any]:
         cache = self._ensure_loaded()
         t = cache.get("tables", {})
         projects = t.get("projects", [])
@@ -2582,6 +2627,17 @@ class MetronomeService:
         match_debug = self._resolve_project(projects, entries, target)
         resolved_title = clean_text(match_debug.get("resolved_project_title"))
         resolved_id = clean_text(match_debug.get("resolved_project_id"))
+        forced_id = clean_text(forced_project_id)
+        forced_title = clean_text(forced_project_title)
+        if forced_id:
+            resolved_id = forced_id
+            match_debug["resolved_project_id"] = forced_id
+            match_debug["resolution_mode"] = "forced_project_id"
+        if forced_title:
+            resolved_title = forced_title
+            match_debug["resolved_project_title"] = forced_title
+            if not forced_id:
+                match_debug["resolution_mode"] = "forced_project_title"
 
         project_info: Dict[str, str] = {}
         if resolved_title:
@@ -2602,15 +2658,66 @@ class MetronomeService:
                         match_debug["resolved_project_title"] = resolved_title
                     break
 
+        metronome_projects: List[Dict[str, Any]] = []
+        metronome_seen: set[str] = set()
+
+        def register_metronome_project(pid: str, title: str, score: int = 0, source: str = ""):
+            local_pid = clean_text(pid)
+            local_title = clean_text(title)
+            key = local_pid or slugify(local_title)
+            if not key or key in metronome_seen:
+                return
+            metronome_seen.add(key)
+            metronome_projects.append({
+                "project_id": local_pid,
+                "project_title": local_title or local_pid,
+                "match_score": int(score or 0),
+                "source": source or "match",
+            })
+
+        for candidate in (match_debug.get("best_project_candidates") or []):
+            register_metronome_project(
+                clean_text(candidate.get("project_id")),
+                clean_text(candidate.get("project_name")),
+                clean_number(candidate.get("score")),
+                "projects",
+            )
+        for candidate in (match_debug.get("best_entry_candidates") or []):
+            register_metronome_project(
+                clean_text(candidate.get("project_id")),
+                clean_text(candidate.get("project_name")),
+                clean_number(candidate.get("score")),
+                "entries",
+            )
+        for candidate in self._collect_project_name_matches(projects, target):
+            register_metronome_project(
+                clean_text(candidate.get("project_id")),
+                clean_text(candidate.get("project_title")),
+                clean_number(candidate.get("match_score")),
+                clean_text(candidate.get("source")),
+            )
+
+        matched_project_ids = [clean_text(p.get("project_id")) for p in metronome_projects if clean_text(p.get("project_id"))]
+        matched_project_ids = [pid for i, pid in enumerate(matched_project_ids) if pid and pid not in matched_project_ids[:i]]
+        selected_project_ids: set[str] = set()
+        if forced_id:
+            selected_project_ids = {forced_id}
+        elif matched_project_ids:
+            selected_project_ids = set(matched_project_ids)
+        elif resolved_id:
+            selected_project_ids = {resolved_id}
+
+        display_target = re.split(r"\s*[-—]\s*", target, maxsplit=1)[0].strip() if target else ""
         if not resolved_title and not resolved_id:
             return {
                 "ok": False,
-                "project_name": target,
+                "project_name": display_target or target,
                 "reason": "project_not_found",
                 "confidence_level": "low",
                 "warning": True,
                 "warning_message": "Aucune correspondance projet fiable trouvée",
                 "match_debug": match_debug,
+                "metronome_projects": metronome_projects,
                 "missing_files": cache.get("missing", []),
                 "loaded_at": cache.get("loaded_at"),
             }
@@ -2619,7 +2726,7 @@ class MetronomeService:
         today = datetime.now().date()
         rows_filtered_by_title = 0
         rows_filtered_by_id = 0
-        filter_mode = "id" if resolved_id else "title"
+        filter_mode = "id_multi" if len(selected_project_ids) > 1 else ("id" if selected_project_ids else "title")
         match_debug["filter_mode"] = filter_mode
 
         def parse_date(value: str) -> Optional[date]:
@@ -2640,8 +2747,8 @@ class MetronomeService:
             entry_project_id = self._get_first_value(e, METRONOME_COLUMN_ALIASES["entry_project_id"])
 
             use_row = False
-            if resolved_id:
-                if entry_project_id == resolved_id:
+            if selected_project_ids:
+                if entry_project_id in selected_project_ids:
                     rows_filtered_by_id += 1
                     use_row = True
             elif resolved_title and entry_project_title == resolved_title:
@@ -3228,10 +3335,14 @@ class MetronomeService:
         warning = bool(match_debug.get("resolution_mode") == "entries_fallback" or not project_info)
         warning_message = "Projet trouvé via entrées METRONOME (fallback)" if warning else ""
 
-        project_display_name = resolved_title or target
+        project_display_name_raw = resolved_title or target
+        project_display_name = re.split(r"\s*[-—]\s*", project_display_name_raw, maxsplit=1)[0].strip() or project_display_name_raw
         project_id = resolved_id or self._row_id(project_info)
         project_image = self._get_first_value(project_info, METRONOME_COLUMN_ALIASES["project_image"])
         project_description = self._get_first_value(project_info, METRONOME_COLUMN_ALIASES["project_description"])
+        register_metronome_project(resolved_id, project_display_name, clean_number(match_debug.get("match_score")), "selected")
+        metronome_projects.sort(key=lambda x: (-clean_number(x.get("match_score")), clean_text(x.get("project_title"))))
+        selected_metronome_project_id = forced_id if forced_id else ""
         return {
             "ok": True,
             "project_name": project_display_name,
@@ -3242,6 +3353,9 @@ class MetronomeService:
             "warning": warning,
             "warning_message": warning_message,
             "match_debug": match_debug,
+            "metronome_projects": metronome_projects,
+            "selected_metronome_project_id": selected_metronome_project_id,
+            "selected_metronome_project_ids": sorted(selected_project_ids),
             "kpis_meeting_simple": meeting_simple_kpis,
             "kpis": {
                 "open_topics": len(open_tasks_today),
@@ -3325,6 +3439,11 @@ class PointageService:
         if aid:
             return f"id::{aid}"
         return f"name::{slugify(affaire_name)}"
+
+    @staticmethod
+    def _mission_key(mission_key: str) -> str:
+        mk = slugify(mission_key)
+        return mk or "__default__"
 
     @staticmethod
     def _decode_csv(raw: bytes) -> str:
@@ -3563,53 +3682,78 @@ class PointageService:
             "planning_tasks": [],
             "pointage": {"__cetMembers": "", "__cstRate": 80},
             "workState": {"expanded_levels": []},
+            "missions": {},
             "updated_at": now_iso(),
         })
         return data
 
-    def import_planning(self, project_key: str, raw: bytes) -> Dict[str, Any]:
+    def _ensure_mission_slot(self, proj: Dict[str, Any], mission_key: str) -> Tuple[str, Dict[str, Any]]:
+        normalized = self._mission_key(mission_key)
+        missions = proj.setdefault("missions", {})
+        if normalized not in missions:
+            if normalized == "__default__" and ("planning_tasks" in proj or "pointage" in proj or "workState" in proj):
+                missions[normalized] = {
+                    "planning_tasks": list(proj.get("planning_tasks", [])),
+                    "pointage": dict(proj.get("pointage", {"__cetMembers": "", "__cstRate": 80})),
+                    "workState": dict(proj.get("workState", {"expanded_levels": []})),
+                    "updated_at": clean_text(proj.get("updated_at")) or now_iso(),
+                }
+            else:
+                missions[normalized] = {
+                    "planning_tasks": [],
+                    "pointage": {"__cetMembers": "", "__cstRate": 80},
+                    "workState": {"expanded_levels": []},
+                    "updated_at": now_iso(),
+                }
+        return normalized, missions[normalized]
+
+    def import_planning(self, project_key: str, raw: bytes, mission_key: str = "") -> Dict[str, Any]:
         tasks = self.parse_planning(raw)
         with self._lock:
             data = self._ensure_project(project_key)
             proj = data["projects"][project_key]
-            existing_pointage = proj.get("pointage", {})
+            normalized_mission_key, slot = self._ensure_mission_slot(proj, mission_key)
+            existing_pointage = slot.get("pointage", {})
             remapped: Dict[str, Any] = {k: v for k, v in existing_pointage.items() if k.startswith("__")}
-            by_task = {t.get("task_id"): t for t in proj.get("planning_tasks", [])}
-            by_stable = {t.get("stable_key"): t for t in proj.get("planning_tasks", [])}
+            by_task = {t.get("task_id"): t for t in slot.get("planning_tasks", [])}
+            by_stable = {t.get("stable_key"): t for t in slot.get("planning_tasks", [])}
             for nt in tasks:
                 old = by_task.get(nt.get("task_id")) or by_stable.get(nt.get("stable_key"))
                 if old and old.get("task_id") in existing_pointage:
                     remapped[nt["task_id"]] = existing_pointage[old["task_id"]]
-            proj["planning_tasks"] = tasks
-            proj["pointage"] = remapped
+            slot["planning_tasks"] = tasks
+            slot["pointage"] = remapped
+            slot["updated_at"] = now_iso()
             proj["updated_at"] = now_iso()
             self._save(data)
-        return self.get_project_data(project_key)
+        return self.get_project_data(project_key, normalized_mission_key)
 
-    def save_pointage(self, project_key: str, pointage_patch: Dict[str, Any], work_state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def save_pointage(self, project_key: str, pointage_patch: Dict[str, Any], work_state: Optional[Dict[str, Any]] = None, mission_key: str = "") -> Dict[str, Any]:
         with self._lock:
             data = self._ensure_project(project_key)
             proj = data["projects"][project_key]
-            p = proj.setdefault("pointage", {"__cetMembers": "", "__cstRate": 80})
+            normalized_mission_key, slot = self._ensure_mission_slot(proj, mission_key)
+            p = slot.setdefault("pointage", {"__cetMembers": "", "__cstRate": 80})
             for k, v in pointage_patch.items():
                 if k.startswith("__"):
                     p[k] = v
                 else:
                     p[k] = self._deep_merge_dicts(p.get(k, {}), v)
             if work_state is not None:
-                proj["workState"] = work_state
+                slot["workState"] = work_state
+            slot["updated_at"] = now_iso()
             proj["updated_at"] = now_iso()
             self._save(data)
-        return self.get_project_data(project_key)
+        return self.get_project_data(project_key, normalized_mission_key)
 
-    def import_suivi(self, project_key: str, raw_json: bytes) -> Dict[str, Any]:
+    def import_suivi(self, project_key: str, raw_json: bytes, mission_key: str = "") -> Dict[str, Any]:
         payload = json.loads(raw_json.decode("utf-8"))
         pointage = payload.get("pointage", {})
         work_state = payload.get("workState", {})
-        return self.save_pointage(project_key, pointage, work_state=work_state)
+        return self.save_pointage(project_key, pointage, work_state=work_state, mission_key=mission_key)
 
-    def export_suivi(self, project_key: str) -> Dict[str, Any]:
-        data = self.get_project_data(project_key)
+    def export_suivi(self, project_key: str, mission_key: str = "") -> Dict[str, Any]:
+        data = self.get_project_data(project_key, mission_key=mission_key)
         return {"exportedAt": now_iso(), "pointage": data.get("pointage", {}), "workState": data.get("workState", {})}
 
     def compute_tasks(self, planning_tasks: List[Dict[str, Any]], pointage: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -3759,17 +3903,75 @@ class PointageService:
                 task["actualEnd"] = latest_actual_end.isoformat()
         return out
 
-    def get_project_data(self, project_key: str) -> Dict[str, Any]:
+    def get_project_data(self, project_key: str, mission_key: str = "") -> Dict[str, Any]:
         data = self._load()
-        proj = data.get("projects", {}).get(project_key, {"planning_tasks": [], "pointage": {"__cetMembers": "", "__cstRate": 80}, "workState": {"expanded_levels": []}})
-        normalized_planning_tasks = self._normalize_task_dates(list(proj.get("planning_tasks", [])))
-        tasks = self.compute_tasks(normalized_planning_tasks, proj.get("pointage", {}))
+        proj = data.get("projects", {}).get(project_key, {"missions": {}, "planning_tasks": [], "pointage": {"__cetMembers": "", "__cstRate": 80}, "workState": {"expanded_levels": []}})
+        missions = dict(proj.get("missions", {})) if isinstance(proj.get("missions"), dict) else {}
+        if "__default__" not in missions:
+            missions["__default__"] = {
+                "planning_tasks": list(proj.get("planning_tasks", [])),
+                "pointage": dict(proj.get("pointage", {"__cetMembers": "", "__cstRate": 80})),
+                "workState": dict(proj.get("workState", {"expanded_levels": []})),
+                "updated_at": clean_text(proj.get("updated_at")) or "",
+            }
+
+        selected_mission_key = self._mission_key(mission_key)
+        if selected_mission_key != "__default__" and selected_mission_key not in missions:
+            missions[selected_mission_key] = {
+                "planning_tasks": [],
+                "pointage": {"__cetMembers": "", "__cstRate": 80},
+                "workState": {"expanded_levels": []},
+                "updated_at": "",
+            }
+
+        def slot_payload(slot: Dict[str, Any]) -> Dict[str, Any]:
+            normalized_planning_tasks = self._normalize_task_dates(list(slot.get("planning_tasks", [])))
+            tasks_local = self.compute_tasks(normalized_planning_tasks, slot.get("pointage", {}))
+            return {
+                "tasks": tasks_local,
+                "pointage": slot.get("pointage", {}),
+                "workState": slot.get("workState", {}),
+                "updated_at": slot.get("updated_at", ""),
+            }
+
+        if mission_key:
+            selected_slot = missions.get(selected_mission_key, {})
+            payload = slot_payload(selected_slot)
+            tasks = payload["tasks"]
+            pointage = payload["pointage"]
+            work_state = payload["workState"]
+            updated_at = payload["updated_at"]
+        else:
+            tasks = []
+            pointage = {"__cetMembers": "", "__cstRate": 80}
+            work_state = {"expanded_levels": []}
+            updated_at = proj.get("updated_at", "")
+            for mk, slot in missions.items():
+                payload = slot_payload(slot)
+                tasks.extend(payload["tasks"])
+                if mk == "__default__":
+                    pointage = payload["pointage"]
+                    work_state = payload["workState"]
+                if clean_text(payload["updated_at"]):
+                    updated_at = payload["updated_at"]
+
+        mission_options = [
+            {
+                "mission_key": mk,
+                "label": mk.upper(),
+                "tasks_count": len((slot.get("planning_tasks") or [])),
+            }
+            for mk, slot in sorted(missions.items(), key=lambda x: x[0])
+            if mk != "__default__"
+        ]
         return {
             "project_key": project_key,
             "tasks": tasks,
-            "pointage": proj.get("pointage", {}),
-            "workState": proj.get("workState", {}),
-            "updated_at": proj.get("updated_at", ""),
+            "pointage": pointage,
+            "workState": work_state,
+            "mission_key": selected_mission_key if mission_key else "",
+            "missions": mission_options,
+            "updated_at": updated_at,
         }
 
 
@@ -3779,20 +3981,63 @@ pointage_service = PointageService(POINTAGE_STORE_FILE)
 boond_service = BoondService(BOOND_CACHE_DB_PATH)
 
 
-def pointage_finance_summary(affaire_id: str, commande_ht: float) -> Dict[str, float]:
+def pointage_finance_summary(affaire_id: str, commande_ht: float, mission_key: str = "") -> Dict[str, float]:
     try:
-        data = pointage_service.get_project_data(PointageService._project_key(affaire_id, ""))
+        project_key = PointageService._project_key(affaire_id, "")
+        data = pointage_service.get_project_data(project_key)
         tasks = data.get("tasks", []) if isinstance(data, dict) else []
+        missions_meta = data.get("missions", []) if isinstance(data, dict) else []
     except Exception:
         tasks = []
+        missions_meta = []
     actionable = [t for t in tasks if not bool(t.get("is_summary"))]
     planned = sum(clean_number(t.get("plannedCostCst")) for t in actionable)
     actual = sum(clean_number(t.get("actualCostCst")) for t in actionable)
     task_count = len(actionable)
-    planning_progress_ratio = (
-        sum(max(0.0, min(100.0, clean_number(t.get("progress")))) for t in actionable) / (task_count * 100.0)
-        if task_count > 0 else 0.0
-    )
+
+    selected_mission = clean_text(mission_key)
+    if selected_mission:
+        try:
+            selected_data = pointage_service.get_project_data(project_key, mission_key=selected_mission)
+            selected_tasks = selected_data.get("tasks", []) if isinstance(selected_data, dict) else []
+        except Exception:
+            selected_tasks = []
+        actionable = [t for t in selected_tasks if not bool(t.get("is_summary"))]
+        planned = sum(clean_number(t.get("plannedCostCst")) for t in actionable)
+        actual = sum(clean_number(t.get("actualCostCst")) for t in actionable)
+        task_count = len(actionable)
+
+    mission_progress_ratios: List[float] = []
+    for mission in missions_meta:
+        if not isinstance(mission, dict):
+            continue
+        mk = clean_text(mission.get("mission_key"))
+        if mk in ("", "__default__"):
+            continue
+        try:
+            md = pointage_service.get_project_data(project_key, mission_key=mk)
+            mtasks = md.get("tasks", []) if isinstance(md, dict) else []
+        except Exception:
+            mtasks = []
+        m_actionable = [t for t in mtasks if not bool(t.get("is_summary"))]
+        m_count = len(m_actionable)
+        if m_count <= 0:
+            continue
+        m_ratio = sum(max(0.0, min(100.0, clean_number(t.get("progress")))) for t in m_actionable) / (m_count * 100.0)
+        mission_progress_ratios.append(m_ratio)
+
+    if selected_mission:
+        planning_progress_ratio = (
+            sum(max(0.0, min(100.0, clean_number(t.get("progress")))) for t in actionable) / (task_count * 100.0)
+            if task_count > 0 else 0.0
+        )
+    elif mission_progress_ratios:
+        planning_progress_ratio = sum(mission_progress_ratios) / len(mission_progress_ratios)
+    else:
+        planning_progress_ratio = (
+            sum(max(0.0, min(100.0, clean_number(t.get("progress")))) for t in actionable) / (task_count * 100.0)
+            if task_count > 0 else 0.0
+        )
     today = datetime.now().date()
 
     def schedule_ratio(task: Dict[str, Any]) -> float:
@@ -4475,7 +4720,7 @@ def finance_html() -> str:
 <script>
 const MONTHS=["janvier","fevrier","mars","avril","mai","juin","juillet","aout","septembre","octobre","novembre","decembre"];
 const MONTH_LABELS={"janvier":"Janv.","fevrier":"Févr.","mars":"Mars","avril":"Avr.","mai":"Mai","juin":"Juin","juillet":"Juil.","aout":"Août","septembre":"Sept.","octobre":"Oct.","novembre":"Nov.","decembre":"Déc."};
-const state={cacheStatus:null,affaires:[],selectedAffaireId:"",selectedAffaire:null,monthlyExpanded:false,boondImputation:null,boondForcedProjectId:"",boondProjectSearch:""};
+const state={cacheStatus:null,affaires:[],selectedAffaireId:"",selectedAffaire:null,monthlyExpanded:false,boondImputation:null,boondForcedProjectId:"",boondProjectSearch:"",pointageMissionsMeta:[]};
 function euro(v){return new Intl.NumberFormat('fr-FR',{style:'currency',currency:'EUR',maximumFractionDigits:0}).format(Number(v||0));}
 function pct(v){return new Intl.NumberFormat('fr-FR',{style:'percent',maximumFractionDigits:1}).format(Number(v||0));}
 function fmt(v){return new Intl.NumberFormat('fr-FR',{maximumFractionDigits:0}).format(Number(v||0));}
@@ -4489,7 +4734,7 @@ async function api(url,options){const r=await fetch(url,options||{});const data=
 function healthClass(a){const reste=Number(a.reste_a_facturer||0),taux=Number(a.taux_avancement_financier||0);if(taux>=0.9)return{label:'Presque soldée',cls:'ok'};if(reste>0&&taux<0.35)return{label:'À surveiller',cls:'warn'};if(reste<0)return{label:'Incohérence à vérifier',cls:'bad'};return{label:'Stable',cls:'ok'};}
 async function loadCacheStatus(){const d=await api('/api/finance/cache-status');state.cacheStatus=d;const label=d.status==='ready'?`Cache prêt · ${d.affaires_count} affaires`:d.status==='building'?'Cache en reconstruction…':`Cache : ${d.status}`;setCacheBadge(d.status,label);document.getElementById('statusMeta').textContent=`${d.affaires_count||0} affaires · ${d.rows_kept||0} lignes utiles · ${d.generated_at||'pas encore généré'}`;}
 async function loadAffairesList(search=''){const d=await api(`/api/finance/affaires?search=${encodeURIComponent(search)}`);state.affaires=d.items||[];const sel=document.getElementById('affaireSelect');const prev=state.selectedAffaireId;sel.innerHTML=`<option value=''>Sélectionnez une affaire</option>`+state.affaires.map(x=>`<option value="${esc(x.affaire_id)}">${esc(x.display_name)}</option>`).join('');if(prev&&state.affaires.some(x=>x.affaire_id===prev)){sel.value=prev;}else{state.selectedAffaireId='';state.selectedAffaire=null;}showNotice(state.affaires.length?`${state.affaires.length} affaire(s) disponible(s)`:'Aucune affaire trouvée pour ce filtre.');}
-async function loadSelectedAffaire(id){if(!id){state.selectedAffaireId='';state.selectedAffaire=null;state.boondImputation=null;renderAll();return;}const d=await api(`/api/finance/affaire/${encodeURIComponent(id)}`);state.selectedAffaireId=id;state.selectedAffaire=d.affaire||null;state.boondImputation=null;renderAll();try{const boondName=(state.selectedAffaire&&(state.selectedAffaire.display_name||state.selectedAffaire.affaire))||'';if(boondName){state.boondForcedProjectId=localStorage.getItem(`boondForcedProjectId:${id}`)||'';state.boondImputation=await api(`/api/boond/imputations/by-project?project_name=${encodeURIComponent(boondName)}&affaire_id=${encodeURIComponent(id)}&affaire=${encodeURIComponent((state.selectedAffaire&&state.selectedAffaire.affaire)||'')}&numero=${encodeURIComponent((state.selectedAffaire&&state.selectedAffaire.numero)||'')}&client=${encodeURIComponent((state.selectedAffaire&&state.selectedAffaire.client)||'')}&display_name=${encodeURIComponent((state.selectedAffaire&&state.selectedAffaire.display_name)||'')}&boond_project_id=${encodeURIComponent(state.boondForcedProjectId||'')}`);}else{state.boondImputation={matched_project:null,totals:{}};}}catch(_){state.boondImputation={matched_project:null,totals:{}};}renderAll();localStorage.setItem('selectedAffaireId',id);}
+async function loadSelectedAffaire(id){if(!id){state.selectedAffaireId='';state.selectedAffaire=null;state.boondImputation=null;state.pointageMissionsMeta=[];renderAll();return;}const d=await api(`/api/finance/affaire/${encodeURIComponent(id)}`);state.selectedAffaireId=id;state.selectedAffaire=d.affaire||null;state.boondImputation=null;state.pointageMissionsMeta=[];try{const pm=await api(`/api/project-management/pointage?affaire_id=${encodeURIComponent(id)}`);state.pointageMissionsMeta=((pm&&pm.missions)||[]).filter(m=>Number(m.tasks_count||0)>0);}catch(_){state.pointageMissionsMeta=[];}renderAll();try{const boondName=(state.selectedAffaire&&(state.selectedAffaire.display_name||state.selectedAffaire.affaire))||'';if(boondName){state.boondForcedProjectId=localStorage.getItem(`boondForcedProjectId:${id}`)||'';state.boondImputation=await api(`/api/boond/imputations/by-project?project_name=${encodeURIComponent(boondName)}&affaire_id=${encodeURIComponent(id)}&affaire=${encodeURIComponent((state.selectedAffaire&&state.selectedAffaire.affaire)||'')}&numero=${encodeURIComponent((state.selectedAffaire&&state.selectedAffaire.numero)||'')}&client=${encodeURIComponent((state.selectedAffaire&&state.selectedAffaire.client)||'')}&display_name=${encodeURIComponent((state.selectedAffaire&&state.selectedAffaire.display_name)||'')}&boond_project_id=${encodeURIComponent(state.boondForcedProjectId||'')}`);}else{state.boondImputation={matched_project:null,totals:{}};}}catch(_){state.boondImputation={matched_project:null,totals:{}};}renderAll();localStorage.setItem('selectedAffaireId',id);}
 function setHeroEmpty(){document.getElementById('heroTitle').textContent='Sélectionnez une affaire';document.getElementById('heroSubtitle').textContent='Le cockpit se remplit à partir du cache du tableau activité.';document.getElementById('metaClient').textContent='-';document.getElementById('metaProject').textContent='-';document.getElementById('metaMissions').textContent='-';document.getElementById('metaStatus').textContent='🟠 Attention';const h=document.getElementById('heroHealth');h.textContent='En attente';h.className='health warn';}
 function cardTone(id,tone){const el=document.getElementById(id);el.classList.remove('good','warn','bad');if(tone)el.classList.add(tone);}
 function renderHero(){const a=state.selectedAffaire;if(!a){setHeroEmpty();return;}document.getElementById('heroTitle').textContent=a.display_name||'-';document.getElementById('heroSubtitle').textContent=`Client ${a.client||'-'} · ${(a.missions||[]).length} mission(s)`;document.getElementById('metaClient').textContent=a.client||'-';document.getElementById('metaProject').textContent=a.affaire||'-';document.getElementById('metaMissions').textContent=String((a.missions||[]).length||0);const hh=healthClass(a),el=document.getElementById('heroHealth');el.textContent=hh.label;el.className=`health ${hh.cls}`;const resteVal=Number(a.reste_a_facturer||0);const reste=euro(resteVal);const av=Number(a.taux_avancement_financier||0);let why='';if(av<0.5)why='Facturation encore faible vs commande';else if(resteVal>0)why='Reste significatif à facturer';else why='Objectif financier atteint';document.getElementById('metaStatus').textContent=(hh.cls==='ok'?`🟢 Stable · `:(hh.cls==='warn'?`🟠 À surveiller · `:`🔴 Risque · `))+why+` (${reste})`;}
@@ -4518,9 +4763,10 @@ Total retenu = ${euro(plannedCstToDate)}`}},{key:'pointed-sale',label:'Vente poi
 Total retenu = ${euro(pointedCst)}`}}];}
 function openCalcDetailModal(details){const modal=document.getElementById('calcDetailModal');const title=document.getElementById('calcDetailTitle');const body=document.getElementById('calcDetailBody');if(!modal||!title||!body||!details)return;title.textContent=details.title||'Détail du calcul';body.innerHTML=`<div class='small'>${esc(details.intro||'')}</div><div class='calc-list'>${(details.steps||[]).map(step=>`<div class='calc-step'><div class='calc-label'>${esc(step.label||'')}</div><div class='calc-value'>${esc(step.value||'-')}</div><div class='calc-desc'>${esc(step.desc||'')}</div></div>`).join('')}</div><div class='calc-formula'><div class='small' style='margin-bottom:8px;font-weight:800;color:#24354f'>Formule utilisée</div><code>${esc(details.formula||'')}</code></div>`;modal.classList.remove('hidden');}
 function closeCalcDetailModal(){const modal=document.getElementById('calcDetailModal');if(modal)modal.classList.add('hidden');}
+function bindFinanceCardsDetails(){const a=state.selectedAffaire||{};const cardDetails={kpiCommandeCard:{title:'Montant contractualisé',intro:'Montant de commande de l’affaire.',steps:[{label:'Valeur',value:euro(a.commande_ht||0),desc:'Commande HT issue des données finance.'}],formula:`Commande = ${euro(a.commande_ht||0)}`},kpiFactureCard:{title:'Cumul facturé',intro:'Total facturé depuis le début du projet.',steps:[{label:'Valeur',value:euro(a.facturation_totale||0),desc:'Facturation cumulée toutes périodes.'}],formula:`Facturé cumulé = ${euro(a.facturation_totale||0)}`},kpiResteCard:{title:'Reste à facturer',intro:'Différence commande et facturation cumulée.',steps:[{label:'Commande',value:euro(a.commande_ht||0),desc:'Montant contractualisé.'},{label:'Facturé',value:euro(a.facturation_totale||0),desc:'Cumul facturé.'}],formula:`Reste = commande - facturé = ${euro(a.reste_a_facturer||0)}`},kpiAvanceCard:{title:'Avancement financier',intro:'Part facturée par rapport à la commande.',steps:[{label:'Facturé',value:euro(a.facturation_totale||0),desc:'Cumul facturé.'},{label:'Commande',value:euro(a.commande_ht||0),desc:'Montant contractualisé.'}],formula:`Avancement financier = facturé / commande = ${pct(a.taux_avancement_financier||0)}`},kpiPlanningCard:{title:'Avancement planning',intro:'Avancement production issu du pointage planning.',steps:[{label:'Avancement',value:pct(a.pointage_progress_ratio||0),desc:'Progression issue du pointage.'},{label:'Tâches',value:fmt(a.pointage_task_count||0),desc:'Nombre de tâches prises en compte.'}],formula:`Avancement planning = ${pct(a.pointage_progress_ratio||0)}`}};['kpiCommandeCard','kpiFactureCard','kpiResteCard','kpiAvanceCard','kpiPlanningCard'].forEach(id=>{const el=document.getElementById(id);if(!el)return;el.style.cursor='pointer';el.onclick=()=>openCalcDetailModal(cardDetails[id]);});const prodDetails={prodFinPct:{title:'Avancement financier',intro:'Même indicateur que la carte KPI finance.',steps:[{label:'Valeur',value:pct(a.taux_avancement_financier||0),desc:'Facturation cumulée / commande.'}],formula:`${pct(a.taux_avancement_financier||0)}`},prodPointagePct:{title:'Avancement production pointé',intro:'Progression issue du pointage planning (tous plannings).',steps:[{label:'Valeur',value:pct(a.pointage_progress_ratio||0),desc:'Calculée sur le pointage planning.'}],formula:`${pct(a.pointage_progress_ratio||0)}`},prodGapPct:{title:'Écart financier vs production',intro:'Différence entre avancement financier et avancement pointé.',steps:[{label:'Financier',value:pct(a.taux_avancement_financier||0),desc:'Facturation / commande.'},{label:'Production',value:pct(a.pointage_progress_ratio||0),desc:'Pointage planning.'}],formula:`Écart (pt) = ${(Number(a.taux_avancement_financier||0)-Number(a.pointage_progress_ratio||0))*100}`},prodBoondRentability:{title:'Rentabilité imputation BOOND',intro:'Rentabilité comparant facturé et coût imputations BOOND.',steps:[{label:'Valeur',value:(document.getElementById('prodBoondRentability')||{}).textContent||'-',desc:'Calcul affiché sur la carte.'}],formula:'(facturé - coût imputations) / coût imputations'}};['prodFinPct','prodPointagePct','prodGapPct','prodBoondRentability'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const card=el.closest('.prod-card');if(card){card.style.cursor='pointer';card.onclick=()=>openCalcDetailModal(prodDetails[id]);}});}
 function renderPointageFinanceChart(){const sec=document.getElementById('pointagePlanningFinanceSection');const root=document.getElementById('pointageFinanceChart');const title=document.getElementById('pointageFinanceChartTitle');const a=state.selectedAffaire||{};const boond=(state.boondImputation||{}).totals||{};const taskCount=Number(a.pointage_task_count||0);if(!sec||!root)return;if(taskCount<=0){sec.style.display='none';root.innerHTML="<div class='small'>Aucune donnée de pointage planning.</div>";return;}sec.style.display='block';const mode=((document.getElementById('pointageFinanceChartSelect')||{}).value)||'planned-vs-pointed';const rows=pointageFinanceCalculationRows(mode,a,boond);if(title)title.textContent=mode==='pointed-vs-boond'?'Vente pointée à date vs coût de production BOOND':'Vente planifiée à date vs vente pointée à date';const max=Math.max(1,...rows.map(r=>Number(r.value||0)));root.innerHTML=`<div style='display:grid;grid-template-columns:repeat(${rows.length},minmax(260px,1fr));gap:18px'>${rows.map((r,idx)=>{const width=Math.max(4,(Number(r.value||0)/max)*100);return `<button type='button' class='pilot-row calc-card-btn' data-calc-index='${idx}' style='display:block;padding:18px'><div style='display:flex;justify-content:space-between;gap:18px;align-items:flex-start'><div style='min-width:0'><div style='font-weight:800;font-size:16px'>${esc(r.label)}</div><div class='small' style='margin-top:4px'>${esc(r.subtitle)}</div><div class='calc-badge'>🧮 ${esc(r.badge||'Cliquer pour voir le calcul')}</div></div><div style='font-weight:900;white-space:nowrap'>${euro(r.value||0)}</div></div><div style='margin-top:14px;height:14px;border-radius:999px;background:#edf1f8;overflow:hidden'><div style='height:100%;width:${width}%;background:${r.color}'></div></div></button>`;}).join('')}</div>`;Array.from(root.querySelectorAll('[data-calc-index]')).forEach(btn=>btn.addEventListener('click',()=>{const idx=Number(btn.getAttribute('data-calc-index')||-1);if(idx>=0&&rows[idx])openCalcDetailModal(rows[idx].details);}));}
 function renderBoondImputation(){const root=document.getElementById('boondImputationBox');if(!root)return;const b=state.boondImputation;const a=state.selectedAffaire;if(!a){root.className='empty';root.textContent='Sélectionnez une affaire pour charger le coût cumulé BOOND.';return;}if(!b){root.className='empty';root.textContent='Chargement des données BOOND…';return;}if(!b.matched_project){root.className='empty';root.innerHTML=`<div>Aucun projet BOOND matché pour cette affaire.</div><div style='margin-top:8px' class='small'>Choisissez provisoirement un projet BOOND dans la liste :</div><div style='margin-top:8px;display:flex;gap:8px;align-items:center'><input id='boondProjectSearch' placeholder='Filtrer (ex: laffitte)' value='${esc(state.boondProjectSearch||'')}' style='padding:6px 8px;min-width:220px'><select id='boondProjectSelect' style='padding:6px 8px;min-width:520px'>${boondOptionsHtml(b)}</select><button id='boondProjectOverrideApply' class='btn' type='button'>Forcer</button><button id='boondProjectOverrideClear' class='btn' type='button'>Retirer</button></div>`;}else{const t=b.totals||{};const billed=Number((a&&a.facturation_totale)||0);const imputed=Number(t.total_cost||0);const margin=(imputed>0||billed>0)?(billed-imputed):null;const rent=(imputed>0&&billed>0)?(((billed-imputed)/Math.max(imputed,1))*100):null;const resources=(b.resources_imputation||[]);const totalCost=Math.max(1,...resources.map(x=>Number(x.cost||0)),imputed);const detail=resources.length?`<table style='margin-top:10px'><thead><tr><th>Ressource</th><th class='num'>Jours</th><th class='num'>Coût imputé</th><th class='num'>Part coût</th></tr></thead><tbody>${resources.map(r=>{const c=Number(r.cost||0);const part=(c/totalCost)*100;return `<tr><td>${esc(r.resource_name||r.resource_id||'-')}<div style='margin-top:6px;height:6px;background:#edf1f8;border-radius:999px;overflow:hidden'><div style='height:100%;width:${Math.min(100,part)}%;background:#ef8d00'></div></div></td><td class='num'>${fmt(r.days)}</td><td class='num'>${r.cost==null?'-':euro(r.cost)}</td><td class='num'>${part.toFixed(1)}%</td></tr>`;}).join('')}</tbody></table>`:`<div style='padding:8px 12px' class='small'>Détail ressource indisponible.</div>`;root.className='table-wrap';root.innerHTML=`<div style='padding:10px 12px;font-weight:800'>Source BOOND · coût global issu de la productivité projet BOOND.</div><table><thead><tr><th>Source</th><th class='num'>Coût cumulé</th><th class='num'>Marge imputée</th><th class='num'>Rentabilité</th></tr></thead><tbody><tr><td>${esc(t.cost_source||'projects_productivity')}</td><td class='num'><strong>${t.total_cost==null?'-':euro(t.total_cost)}</strong></td><td class='num'>${margin==null?'-':euro(margin)}</td><td class='num'>${rent==null?'-':fmt(rent)+'%'}</td></tr></tbody></table><div style='padding:10px 12px' class='small'>Projet BOOND utilisé: <b>${esc((b.matched_project||{}).project_label||(b.matched_project||{}).project_reference||'-')}</b> (id: <code>${esc((b.matched_project||{}).project_id||'-')}</code>) · mode: ${esc((b.matched_project||{}).matched_on||'auto')}</div><div style='padding:0 12px 10px;display:flex;gap:8px;align-items:center'><input id='boondProjectSearch' placeholder='Filtrer (ex: laffitte)' value='${esc(state.boondProjectSearch||'')}' style='padding:6px 8px;min-width:220px'><select id='boondProjectSelect' style='padding:6px 8px;min-width:520px'>${boondOptionsHtml(b)}</select><button id='boondProjectOverrideApply' class='btn' type='button'>Forcer</button><button id='boondProjectOverrideClear' class='btn' type='button'>Retirer</button></div>${detail}`;}const search=document.getElementById('boondProjectSearch');if(search)search.addEventListener('input',()=>{state.boondProjectSearch=(search.value||'').trim();renderBoondImputation();});const apply=document.getElementById('boondProjectOverrideApply');if(apply)apply.addEventListener('click',async()=>{const sel=document.getElementById('boondProjectSelect');const v=(sel&&sel.value||'').trim();state.boondForcedProjectId=v;if(state.selectedAffaireId){if(v)localStorage.setItem(`boondForcedProjectId:${state.selectedAffaireId}`,v);else localStorage.removeItem(`boondForcedProjectId:${state.selectedAffaireId}`);await loadSelectedAffaire(state.selectedAffaireId);}});const clear=document.getElementById('boondProjectOverrideClear');if(clear)clear.addEventListener('click',async()=>{state.boondForcedProjectId='';if(state.selectedAffaireId){localStorage.removeItem(`boondForcedProjectId:${state.selectedAffaireId}`);await loadSelectedAffaire(state.selectedAffaireId);}});} 
-function renderAll(){renderHero();renderKpis();renderProductionPilot();renderFinanceChart();renderCumulativeChart();renderMonthlyTable();renderMissions();renderInsights();renderBoondImputation();renderPointageFinanceChart();document.getElementById('exportBtn').disabled=!state.selectedAffaireId;const dash=document.getElementById('dashboardBtn');dash.href=state.selectedAffaireId?`/dashboard?affaire_id=${encodeURIComponent(state.selectedAffaireId)}`:'/dashboard';const pm=document.getElementById('pmBtn');pm.href=state.selectedAffaireId?`/gestion-projet?affaire_id=${encodeURIComponent(state.selectedAffaireId)}`:'/gestion-projet';}
+function renderAll(){renderHero();renderKpis();renderProductionPilot();renderFinanceChart();renderCumulativeChart();renderMonthlyTable();renderMissions();renderInsights();renderBoondImputation();renderPointageFinanceChart();bindFinanceCardsDetails();document.getElementById('exportBtn').disabled=!state.selectedAffaireId;const dash=document.getElementById('dashboardBtn');dash.href=state.selectedAffaireId?`/dashboard?affaire_id=${encodeURIComponent(state.selectedAffaireId)}`:'/dashboard';const pm=document.getElementById('pmBtn');pm.href=state.selectedAffaireId?`/gestion-projet?affaire_id=${encodeURIComponent(state.selectedAffaireId)}`:'/gestion-projet';}
 async function rebuildCache(){clearError();showNotice('Reconstruction du cache en cours…');await api('/api/finance/rebuild-cache',{method:'POST'});await loadCacheStatus();await loadAffairesList(document.getElementById('searchInput').value||'');if(state.selectedAffaireId&&state.affaires.some(x=>x.affaire_id===state.selectedAffaireId)){await loadSelectedAffaire(state.selectedAffaireId);}else{state.selectedAffaireId='';state.selectedAffaire=null;renderAll();}showNotice('Cache reconstruit avec succès.');}
 async function initFinancePage(){clearError();try{await loadCacheStatus();await loadAffairesList('');const params=new URLSearchParams(window.location.search);const affairFromUrl=params.get('affaire_id');const affairFromStorage=localStorage.getItem('selectedAffaireId')||'';const preselected=affairFromUrl||affairFromStorage;if(preselected&&state.affaires.some(x=>x.affaire_id===preselected)){document.getElementById('affaireSelect').value=preselected;await loadSelectedAffaire(preselected);}else{renderAll();}}catch(err){showError(err.message||'Erreur de chargement');}
 document.getElementById('reloadBtn').addEventListener('click',async()=>{try{await rebuildCache();}catch(err){showError(err.message||'Erreur de reconstruction du cache');}});
@@ -4597,7 +4843,7 @@ def gestion_projet_html() -> str:
 
   <div id='sectionPilot' class='section'>
     <div class='pilot-box'>
-      <h3 style='margin:0 0 10px'>PILOTAGE METRONOME</h3>
+      <div style='display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap'><h3 style='margin:0'>PILOTAGE METRONOME</h3><div class='chart-controls' style='margin:0'><label for='gpMetronomeProjectPickerPilot' class='small'>Projet METRONOME :</label><select id='gpMetronomeProjectPickerPilot' class='chart-select'><option value=''>Choisir un projet</option></select></div></div>
       <div class='pilot-grid'>
         <div class='pilot-card'><div class='t'>Rappels ouverts à date</div><div id='kRappelsDate' class='v'>0</div></div>
         <div class='pilot-card'><div class='t'>À suivre ouverts</div><div id='kASuivre' class='v'>0</div></div>
@@ -4611,6 +4857,8 @@ def gestion_projet_html() -> str:
   <div id='sectionCompany' class='section'>
     <h3>Niveau 2 — ANALYSE METRONOME</h3>
     <div class='chart-controls'>
+      <label for='gpMetronomeProjectPickerAnalysis' class='small'>Projet METRONOME :</label>
+      <select id='gpMetronomeProjectPickerAnalysis' class='chart-select'><option value=''>Choisir un projet</option></select>
       <label for='companyMetric' class='small'>Afficher :</label>
       <select id='companyMetric' class='chart-select'>
         <option value='open'>Tâches ouvertes par entreprise</option>
@@ -4626,6 +4874,8 @@ def gestion_projet_html() -> str:
   <div id='sectionPlanningAnalysis' class='section' style='display:none'>
     <h3>Niveau 3 — ANALYSE PLANNING</h3>
     <div class='chart-controls'>
+      <label for='planningMissionSelect' class='small'>Mission planning :</label>
+      <select id='planningMissionSelect' class='chart-select'><option value=''>Aucune mission</option></select>
       <label for='planningChartSelect' class='small'>Afficher :</label>
       <select id='planningChartSelect' class='chart-select'>
         <option value='delay-trigger'>Déclencheur de retard</option>
@@ -4642,10 +4892,10 @@ def gestion_projet_html() -> str:
 
   <div class='section'>
     <h3>Pointage planning</h3>
+    <div id='missionsPlanningWrap' class='table-wrap' style='margin-bottom:10px'><div class='small' style='padding:10px'>Aucune mission disponible.</div></div>
     <div class='chart-controls'>
       <input id='planningCsvInput' type='file' accept='.csv' style='display:none'>
       <input id='suiviImportInput' type='file' accept='.json' style='display:none'>
-      <button id='btnImportPlanning' class='btn'>Importer planning CSV</button>
       <button id='btnExportSuivi' class='btn'>Exporter suivi (.json)</button>
       <button id='btnImportSuivi' class='btn'>Importer suivi</button>
       <input id='cetMembersInput' class='search' style='height:36px;min-width:320px' placeholder='Équipe CET (ex: CVC, PLB, ELE)'>
@@ -4681,10 +4931,11 @@ def gestion_projet_html() -> str:
 
 </div>
 <script>
-const state={affaires:[],selectedId:'',selectedLabel:'',board:null,pointage:null};
+const state={affaires:[],selectedId:'',selectedLabel:'',board:null,pointage:null,metronomeProjectId:'',planningMissionKey:''};
 function resolveAffaire(input){const raw=String(input||'').trim();if(!raw)return null;const low=raw.toLowerCase();const slug=raw.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g,'').replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'');return (state.affaires||[]).find(a=>String(a.affaire_id||'')===raw)|| (state.affaires||[]).find(a=>String(a.display_name||'').toLowerCase()===low)|| (state.affaires||[]).find(a=>String(a.display_name||'').toLowerCase().startsWith(low))|| (state.affaires||[]).find(a=>String((a.display_name||'').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g,'').replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,''))===slug)||null;}
 function esc(v){return String(v??'').replace(/[&<>]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[ch]||ch));}
 function escAttr(v){return String(v??'').replace(/[&<>'"]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]||ch));}
+function trimProjectName(v){const raw=String(v||'').trim();if(!raw)return raw;return raw.split(/[-—]/)[0].trim()||raw;}
 async function api(u){const r=await fetch(u);const d=await r.json();if(!r.ok) throw new Error(d.detail||'Erreur API');return d;}
 function renderBars(id,items){const root=document.getElementById(id);if(!root)return;if(!items||!items.length){root.innerHTML="<div class='small'>Aucune donnée</div>";return;}const max=Math.max(1,...items.map(x=>Number(x.count||0)));root.innerHTML=items.map(x=>`<div style='margin:8px 0'><div style='display:flex;justify-content:space-between;gap:8px'><span>${esc(x.label)}</span><strong>${x.count}</strong></div><div class='bar'><div class='fill' style='width:${(Number(x.count||0)/max)*100}%'></div></div></div>`).join('');}
 function renderTable(rows){const root=document.getElementById('boardTable');if(!root)return;if(!rows||!rows.length){root.innerHTML="<div class='small' style='padding:12px'>Aucun sujet ouvert.</div>";return;}root.innerHTML=`<table><thead><tr><th>Zone</th><th>Lot</th><th>Sujet</th><th>Entreprise</th><th>Responsable</th><th>Statut</th><th>Date échéance</th><th>Réunion origine</th><th>Commentaire</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${esc(r.zone)}</td><td>${esc(r.lot)}</td><td>${esc(r.sujet)}</td><td>${esc(r.entreprise)}</td><td>${esc(r.responsable)}</td><td>${esc(r.statut)}</td><td>${esc(r.date_echeance)}</td><td>${esc(r.reunion_origine)}</td><td>${esc(r.commentaire)}</td></tr>`).join('')}</tbody></table>`;}
@@ -4712,28 +4963,34 @@ function renderPerimeterProgressChart(root,tasks){if(!root)return;const items=gr
 function renderPlanningProgressComparison(root,tasks){if(!root)return;const actionable=(tasks||[]).filter(t=>!t.is_summary);if(!actionable.length){root.innerHTML="<div class='small'>Aucune donnée d'avancement disponible.</div>";return;}const today=new Date();today.setHours(0,0,0,0);const clamp=v=>Math.max(0,Math.min(1,v));const actualRatio=clamp(actionable.reduce((sum,t)=>sum+Math.max(0,Math.min(100,Number(t.progress||0))),0)/(actionable.length*100));const plannedRatio=clamp(actionable.reduce((sum,t)=>{const start=parseDateOnly(t.start||'');const end=parseDateOnly(t.end||'')||start;if(!start&&!end)return sum;const s=start||end;const e=end||start;if(today<=s)return sum;if(today>=e)return sum+1;const duration=Math.max(1,Math.round((e-s)/(1000*60*60*24)));const elapsed=Math.max(0,Math.round((today-s)/(1000*60*60*24)));return sum+clamp(elapsed/duration);},0)/actionable.length);const rows=[{label:'Pointé vs reste à faire',value:actualRatio,color:'#ef8d00',subtitle:`${(actualRatio*100).toFixed(1)}% pointé · ${((1-actualRatio)*100).toFixed(1)}% restant`},{label:'Avancement attendu à date',value:plannedRatio,color:'#1b6ef3',subtitle:'Calculé uniquement à partir des dates du planning'}];root.innerHTML=`<div style='display:grid;gap:14px'>${rows.map(r=>`<div class='progress-card'><div style='display:flex;justify-content:space-between;gap:12px;align-items:flex-start'><div><div class='progress-title'>${esc(r.label)}</div><div class='small'>${esc(r.subtitle)}</div></div><strong style='font-size:24px'>${(r.value*100).toFixed(1)}%</strong></div><div class='progress-track' style='margin-top:10px;height:16px'><div class='progress-fill' style='width:${r.value*100}%;background:${r.color}'></div></div></div>`).join('')}</div>`;}
 function renderMetronomeReactivity(){const root=document.getElementById('metronomeReactivityChart');const board=state.board||{};renderReactivityChart(root,(((board||{}).kpis_pilotage)||{}).reactivity_by_company||[]);}
 function renderCstChronology(root,tasks){if(!root)return;const rows=(tasks||[]).filter(t=>!t.is_summary&&normalizeText(t.owner||'')==='cst').map(t=>({label:String(t.perimeter||'Sans périmètre').trim()||'Sans périmètre',task:String(t.name||'').trim()||'Tâche CST',start:parseDateOnly(t.start||''),end:parseDateOnly(t.end||'')||parseDateOnly(t.start||''),delay:Number(t.delayDays||0),owner:String(t.owner||'').trim()||'CST'})).filter(x=>x.start||x.end).sort((a,b)=>(a.start||a.end)-(b.start||b.end)||a.label.localeCompare(b.label,'fr'));if(!rows.length){root.innerHTML="<div class='small'>Aucune tâche CST datée dans le planning importé.</div>";return;}const startMin=new Date(Math.min(...rows.map(r=>(r.start||r.end).getTime())));const endMax=new Date(Math.max(...rows.map(r=>(r.end||r.start).getTime())));const total=Math.max(1,Math.round((endMax-startMin)/(1000*60*60*24)));root.innerHTML=`<div class='timeline-macro'>${rows.map(r=>{const s=r.start||r.end;const e=r.end||r.start;const offset=Math.max(0,Math.round((s-startMin)/(1000*60*60*24)));const span=Math.max(1,Math.round((e-s)/(1000*60*60*24))+1);const left=(offset/total)*100;const width=Math.max(2,(span/total)*100);const today=new Date();today.setHours(0,0,0,0);const todayLeft=Math.max(0,Math.min(100,((today-startMin)/(1000*60*60*24))/total*100));return `<div class='timeline-macro-row'><div class='timeline-macro-head'><div><div class='timeline-macro-title'>${esc(r.label)}</div><div class='timeline-macro-sub'>${esc(r.task)} · ${esc(r.owner)}${r.delay>0?` · ${r.delay} j`:''}</div></div><div class='timeline-macro-date'>${esc(fmtDateFrShort(s.toISOString().slice(0,10)))} → ${esc(fmtDateFrShort(e.toISOString().slice(0,10)))}</div></div><div class='timeline-macro-track'><div class='timeline-macro-marker' style='left:${todayLeft}%'></div><div class='timeline-macro-fill' style='left:${left}%;width:${width}%'></div></div><div class='timeline-macro-labels'><span>${esc(fmtDateFrShort(startMin.toISOString().slice(0,10)))}</span><span>${esc(fmtDateFrShort(endMax.toISOString().slice(0,10)))}</span></div></div>`;}).join('')}</div>`;}
-function renderPlanningChart(){const sec=document.getElementById('sectionPlanningAnalysis');const root=document.getElementById('planningChartList');const title=document.getElementById('planningChartTitle');const pointage=state.pointage||{};const tasks=(pointage&&pointage.tasks)||[];if(!sec||!root)return;if(!tasks.length){sec.style.display='none';root.innerHTML="<div class='small'>Aucune donnée</div>";return;}sec.style.display='block';const mode=((document.getElementById('planningChartSelect')||{}).value)||'delay-trigger';if(mode==='delay-trigger'){if(title)title.textContent='Déclencheur de retard';renderDelayTriggerChart(root,tasks);return;}if(mode==='perimeter-progress'){if(title)title.textContent='Avancement par périmètre';renderPerimeterProgressChart(root,tasks);return;}if(mode==='resource-delay-today'){if(title)title.textContent='Retard moyen par ressource à date';renderPointageAnalytics(root,tasks,{includeUnpointed:true});return;}if(mode==='planning-progress'){if(title)title.textContent='Avancement planning';renderPlanningProgressComparison(root,tasks);return;}if(mode==='cst-chronology'){if(title)title.textContent='Chronologie macro des tâches CST';renderCstChronology(root,tasks);return;}if(title)title.textContent='Retard moyen par ressource';renderPointageAnalytics(root,tasks,{includeUnpointed:false});}
+function getMissionCatalog(board,pointage){const byKey={};for(const m of ((board&&board.finance_missions)||[])){if(!m||typeof m!=='object')continue;const mk=String(m.mission_key||'').trim();if(!mk)continue;byKey[mk]={mission_key:mk,label:String(m.label||m.mission_key||'Mission').trim()||'Mission',tasks_count:0};}for(const m of ((pointage&&pointage.missions)||[])){if(!m||typeof m!=='object')continue;const mk=String(m.mission_key||'').trim();if(!mk)continue;if(!byKey[mk])byKey[mk]={mission_key:mk,label:String(m.label||mk).trim()||mk,tasks_count:0};byKey[mk].tasks_count=Math.max(Number(byKey[mk].tasks_count||0),Number(m.tasks_count||0));if(!String(byKey[mk].label||'').trim())byKey[mk].label=String(m.label||mk).trim()||mk;}const items=Object.values(byKey);items.sort((a,b)=>String(a.label||'').localeCompare(String(b.label||''),'fr'));return items;}
+function renderPlanningChart(){const sec=document.getElementById('sectionPlanningAnalysis');const root=document.getElementById('planningChartList');const title=document.getElementById('planningChartTitle');const missions=getMissionCatalog(state.board||{},state.pointage||{});const pointage=state.pointage||{};const tasks=(pointage&&pointage.tasks)||[];const hasPlanning=missions.some(m=>Number(m.tasks_count||0)>0)||tasks.length>0;if(!sec||!root)return;if(!hasPlanning){sec.style.display='none';root.innerHTML="<div class='small'>Aucune donnée</div>";return;}sec.style.display='block';if(!tasks.length){root.innerHTML="<div class='small'>Un planning est chargé sur une autre mission. Sélectionnez-la dans Mission planning pour afficher l'analyse.</div>";return;}const mode=((document.getElementById('planningChartSelect')||{}).value)||'delay-trigger';if(mode==='delay-trigger'){if(title)title.textContent='Déclencheur de retard';renderDelayTriggerChart(root,tasks);return;}if(mode==='perimeter-progress'){if(title)title.textContent='Avancement par périmètre';renderPerimeterProgressChart(root,tasks);return;}if(mode==='resource-delay-today'){if(title)title.textContent='Retard moyen par ressource à date';renderPointageAnalytics(root,tasks,{includeUnpointed:true});return;}if(mode==='planning-progress'){if(title)title.textContent='Avancement planning';renderPlanningProgressComparison(root,tasks);return;}if(mode==='cst-chronology'){if(title)title.textContent='Chronologie macro des tâches CST';renderCstChronology(root,tasks);return;}if(title)title.textContent='Retard moyen par ressource';renderPointageAnalytics(root,tasks,{includeUnpointed:false});}
 function renderReactivity(b){renderMetronomeReactivity();renderPlanningChart();}
 function initials(v){const parts=String(v||'').trim().split(/\s+/).slice(0,2);return parts.map(x=>x[0]||'').join('').toUpperCase()||'?';}
 function companyLogoHtml(item){const name=item.name||item.label||'';const logo=item.logo||'';if(logo){return `<img class='company-logo' src='${esc(logo)}' alt='${esc(name)}'>`;}return `<span class='company-logo'>${esc(initials(name))}</span>`;}
 function showReminderModal(company,b){const p=(b&&b.kpis_pilotage)||{};const norm=v=>String(v||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').trim();const items=(p.reminders_open_items||[]).filter(x=>norm(x.company)===norm(company)).filter(x=>reminderWeeks(x.deadline)>0);const body=document.getElementById('reminderModalBody');const title=document.getElementById('reminderModalTitle');if(title)title.textContent=`Rappels ouverts - ${company}`;if(!body)return;if(!items.length){body.innerHTML="<div class='small' style='padding:10px'>Aucun rappel ouvert.</div>";}else{const byPer={};for(const it of items){const k=it.perimetre||'Général';(byPer[k]=byPer[k]||[]).push(it);}let html='';for(const per of Object.keys(byPer).sort()){html+=`<h4 style='margin:10px 0 6px'>${esc(per)}</h4><table class='reminder-modal-table'><thead><tr><th style='width:100%'>Tâche</th><th>Échéance</th><th>Rappel</th></tr></thead><tbody>${byPer[per].map(r=>{const w=reminderWeeks(r.deadline);const warn=`<span style='color:#d64545;font-weight:800;white-space:nowrap'>Rappel ${w}</span>`;return `<tr><td>${esc(r.task||'')}</td><td>${esc(fmtDateFrShort(r.deadline||''))}</td><td>${warn}</td></tr>`;}).join('')}</tbody></table>`;}body.innerHTML=html;}const modal=document.getElementById('reminderModal');if(modal)modal.style.display='flex';}
 function hideReminderModal(){const modal=document.getElementById('reminderModal');if(modal)modal.style.display='none';}
 function openBoardWindow(){if(!state.selectedId)return;const url=`/dashboard-board?affaire_id=${encodeURIComponent(state.selectedId)}`;window.open(url,'_blank','noopener,noreferrer,width=1440,height=960');}
-async function loadBoard(id){const requested=id||state.selectedId||'';if(!requested){state.selectedId='';state.selectedLabel='';state.board=null;renderBoard();return;}const selected=resolveAffaire(requested);const aid=(selected&&selected.affaire_id)||requested;state.selectedId=aid;const sel=document.getElementById('affaireSelect');if(sel)sel.value=aid;state.selectedLabel=(selected&&selected.display_name)||state.selectedLabel||'';localStorage.setItem('selectedAffaireId',aid);showLoading(true,'Chargement de la vue projet…');try{let b;try{b=await api(`/api/project-management/board?affaire_id=${encodeURIComponent(aid)}`);}catch(errById){const msg=String((errById&&errById.message)||'');if(state.selectedLabel&&(msg.includes('Affaire introuvable')||msg.includes('affaire_id ou affaire_name requis')||msg.includes('404'))){const alt=String(state.selectedLabel||'').split(' - ').slice(-1)[0]||state.selectedLabel;b=await api(`/api/project-management/board?affaire_name=${encodeURIComponent(alt)}`);}else{throw errById;}}state.board=b;renderBoard();}catch(err){console.error(err);state.board=null;renderBoard();showPageError(err);}finally{showLoading(false);}}
-function renderMatchDebug(b){const md=(b&&b.match_debug)||{};const box=document.getElementById('matchBox');const status=document.getElementById('matchStatus');const reason=document.getElementById('matchReason');if(box){box.className=`match-box ${(b&&b.warning)?'warn':'ok'}`;}if(status){const conf=(b&&b.confidence_level)||'low';status.innerHTML=`Diagnostic de matching METRONOME <span class='conf-badge'>${esc(conf)}</span>`;}if(reason){reason.textContent=(b&&b.warning_message)||((b&&b.project_name)?`Projet chargé : ${b.project_name}`:'Aucune affaire sélectionnée.');}setHtml('matchSearchName',`<b>Projet recherché</b>${esc(md.searched_project_name||'-')}`);setHtml('matchSearchSlug',`<b>Slug recherché</b><span class='mono'>${esc(md.searched_project_slug||'-')}</span>`);setHtml('matchFoundName',`<b>Projet matché</b>${esc(md.matched_project_name||'-')}`);setHtml('matchFoundSlug',`<b>Slug matché</b><span class='mono'>${esc(md.matched_project_slug||'-')}</span>`);setHtml('matchResolvedTitle',`<b>Projet résolu (title)</b>${esc(md.resolved_project_title||'-')}`);setHtml('matchResolutionMode',`<b>Mode de résolution</b>${esc(md.resolution_mode||'-')}`);setHtml('matchScore',`<b>Score de match</b>${esc(String(md.match_score??'-'))}`);setHtml('rowsByTitle',`<b>Lignes filtrées par titre</b>${esc(String(md.rows_filtered_by_title??'-'))}`);setHtml('rowsById',`<b>Lignes filtrées par ID</b>${esc(String(md.rows_filtered_by_id??'-'))}`);const miss=((b&&b.missing_files)||[]);setHtml('missingFiles',`<b>Fichiers CSV manquants</b>${esc(miss.length?miss.join(', '):'-')}`);} 
-function renderBoard(){const b=state.board||{};const p=(b&&b.kpis_pilotage)||{};const k=(b&&b.kpis)||{};const hasMatch=!!((b&&b.match_debug&&((b.match_debug.matched_project_name||'')||(Number(b.match_debug.match_score||0)>0)))&&!b.warning);const secPilot=document.getElementById('sectionPilot');const secCompany=document.getElementById('sectionCompany');if(secPilot)secPilot.style.display=hasMatch?'block':'none';if(secCompany)secCompany.style.display=hasMatch?'block':'none';setText('projectTitle',b.project_name||'-');setText('projectDesc',b.project_description||'-');const img=document.getElementById('projectImage');if(img){const src=String(b.project_image||'').trim();if(src){img.src=src;img.style.display='block';}else{img.removeAttribute('src');img.style.display='none';}}renderMatchDebug(b);setText('kOpen',Number(k.open_topics||0));setText('kLate',Number(k.overdue_topics||0));setText('kTopRappels',Number(p.reminders_open_count||0));setText('kTopASuivre',Number(p.a_suivre_ouverts||p.followups_open_count||0));setText('kDateRef',p.date_reference||p.reference_date||'-');setText('kRappelsDate',Number(p.rappels_ouverts_a_date||p.reminders_open_count||0));setText('kASuivre',Number(p.a_suivre_ouverts||p.followups_open_count||0));renderTable(b.rows||[]);renderProjectTimeline(b);renderCompanyChart(b);renderReactivity(b);const companyRows=(p.rappels_cumules_par_entreprise||p.reminders_by_company||[]);setHtml('pilotByCompany',companyRows.length?companyRows.map(r=>{const nm=r.name||r.company||'';return `<button class='pilot-row-btn pilot-row' data-company='${esc(nm)}'><span class='company-cell'>${companyLogoHtml({name:nm,logo:r.logo||''})}<span class='name'>${esc(nm)}</span></span><span><strong>${Number(r.count||0)}</strong> rappels</span></button>`;}).join(''):"<div class='small'>Aucune donnée</div>");Array.from(document.querySelectorAll('.pilot-row-btn')).forEach(btn=>btn.addEventListener('click',()=>showReminderModal(btn.getAttribute('data-company')||'',b)));}
+function renderPlanningMissionSelect(board){const select=document.getElementById('planningMissionSelect');if(!select)return;const missions=getMissionCatalog(board,state.pointage);const selected=state.planningMissionKey||'';if(!missions.length){select.innerHTML="<option value=''>Aucune mission</option>";select.value='';return;}select.innerHTML=missions.map(m=>`<option value='${escAttr(m.mission_key||'')}' ${(m.mission_key||'')===selected?'selected':''}>${esc(m.label||'Mission')}</option>`).join('');if(!missions.some(m=>String(m.mission_key||'')===selected)){state.planningMissionKey=String(missions[0].mission_key||'');select.value=state.planningMissionKey;}}
+function pointageMissionQuery(missionKey){const mk=typeof missionKey==='string'?missionKey:(state.planningMissionKey||'');return mk?`&mission_key=${encodeURIComponent(mk)}`:'';}
+function renderMissionsPlanningTable(){const wrap=document.getElementById('missionsPlanningWrap');if(!wrap)return;const missions=getMissionCatalog(state.board||{},state.pointage||{});if(!missions.length){wrap.innerHTML="<div class='small' style='padding:10px'>Aucune mission finance trouvée. Vérifiez les missions dans l'onglet Finance.</div>";return;}wrap.innerHTML=`<table><thead><tr><th>Mission</th><th>Planning chargé</th><th style='width:320px'>Action</th></tr></thead><tbody>${missions.map(m=>{const key=String(m.mission_key||'');const loaded=Number(m.tasks_count||0)>0;const badge=loaded?`<span class='status-badge done'>${Number(m.tasks_count||0)} tâche(s)</span>`:`<span class='status-badge soon'>Aucun planning</span>`;const active=(key===(state.planningMissionKey||''))?" style='font-weight:800'":'';return `<tr${active}><td>${esc(m.label||'Mission')}</td><td>${badge}</td><td style='display:flex;gap:8px;flex-wrap:wrap'><button type='button' class='btn btn-open-mission' data-mission='${escAttr(key)}' style='height:34px'>Ouvrir pointage</button><button type='button' class='btn btn-import-mission' data-mission='${escAttr(key)}' style='height:34px'>Importer planning CSV</button></td></tr>`;}).join('')}</tbody></table>`;Array.from(wrap.querySelectorAll('.btn-open-mission')).forEach(btn=>btn.addEventListener('click',async()=>{state.planningMissionKey=btn.getAttribute('data-mission')||'';const missionSelect=document.getElementById('planningMissionSelect');if(missionSelect)missionSelect.value=state.planningMissionKey;await loadPointage();}));Array.from(wrap.querySelectorAll('.btn-import-mission')).forEach(btn=>btn.addEventListener('click',()=>{const mission=btn.getAttribute('data-mission')||'';const input=document.getElementById('planningCsvInput');if(!input)return;input.dataset.missionKey=mission;input.click();}));}
+function renderMetronomeProjectPickers(board){const options=(board&&board.metronome_projects)||[];const selected=String((board&&board.selected_metronome_project_id)||state.metronomeProjectId||'');const html=options.length?options.map(opt=>{const id=String(opt.project_id||'').trim();const label=String(opt.project_title||opt.project_id||'Projet').trim();return `<option value='${esc(id)}' ${id===selected?'selected':''}>${esc(label)}</option>`;}).join(''):"<option value=''>Aucun projet METRONOME</option>";['gpMetronomeProjectPickerPilot','gpMetronomeProjectPickerAnalysis'].forEach(id=>{const el=document.getElementById(id);if(el){el.innerHTML=html;el.value=selected;}});}
+function bindMetronomeProjectPickers(){['gpMetronomeProjectPickerPilot','gpMetronomeProjectPickerAnalysis'].forEach(id=>{const el=document.getElementById(id);if(!el||el.dataset.bound==='1')return;el.dataset.bound='1';el.addEventListener('change',async()=>{state.metronomeProjectId=el.value||'';['gpMetronomeProjectPickerPilot','gpMetronomeProjectPickerAnalysis'].forEach(otherId=>{const other=document.getElementById(otherId);if(other&&other!==el)other.value=state.metronomeProjectId;});await loadBoard(state.selectedId||'');});});}
+async function loadBoard(id){const requested=id||state.selectedId||'';if(!requested){state.selectedId='';state.selectedLabel='';state.board=null;renderBoard();return;}const selected=resolveAffaire(requested);const aid=(selected&&selected.affaire_id)||requested;if(String(aid)!==String(state.selectedId||'')){state.metronomeProjectId='';state.planningMissionKey='';}state.selectedId=aid;const sel=document.getElementById('affaireSelect');if(sel)sel.value=aid;state.selectedLabel=(selected&&selected.display_name)||state.selectedLabel||'';localStorage.setItem('selectedAffaireId',aid);showLoading(true,'Chargement de la vue projet…');try{let b;const projectParam=state.metronomeProjectId?`&metronome_project_id=${encodeURIComponent(state.metronomeProjectId)}`:'';try{b=await api(`/api/project-management/board?affaire_id=${encodeURIComponent(aid)}${projectParam}`);}catch(errById){const msg=String((errById&&errById.message)||'');if(state.selectedLabel&&(msg.includes('Affaire introuvable')||msg.includes('affaire_id ou affaire_name requis')||msg.includes('404'))){const alt=String(state.selectedLabel||'').split(' - ').slice(-1)[0]||state.selectedLabel;b=await api(`/api/project-management/board?affaire_name=${encodeURIComponent(alt)}${projectParam}`);}else{throw errById;}}state.board=b;const missions=(b&&b.finance_missions)||[];if(missions.length&&!missions.some(m=>String(m.mission_key||'')===String(state.planningMissionKey||''))){state.planningMissionKey=String((missions[0]&&missions[0].mission_key)||'');}renderBoard();}catch(err){console.error(err);state.board=null;renderBoard();showPageError(err);}finally{showLoading(false);}}
+function renderMatchDebug(b){const md=(b&&b.match_debug)||{};const box=document.getElementById('matchBox');const status=document.getElementById('matchStatus');const reason=document.getElementById('matchReason');if(box){box.className=`match-box ${(b&&b.warning)?'warn':'ok'}`;}if(status){const conf=(b&&b.confidence_level)||'low';status.innerHTML=`Diagnostic de matching METRONOME <span class='conf-badge'>${esc(conf)}</span>`;}if(reason){reason.textContent=(b&&b.warning_message)||((b&&b.project_name)?`Projet chargé : ${trimProjectName(b.project_name)}`:'Aucune affaire sélectionnée.');}setHtml('matchSearchName',`<b>Projet recherché</b>${esc(trimProjectName(md.searched_project_name||'-'))}`);setHtml('matchSearchSlug',`<b>Slug recherché</b><span class='mono'>${esc(md.searched_project_slug||'-')}</span>`);setHtml('matchFoundName',`<b>Projet matché</b>${esc(trimProjectName(md.matched_project_name||'-'))}`);setHtml('matchFoundSlug',`<b>Slug matché</b><span class='mono'>${esc(md.matched_project_slug||'-')}</span>`);setHtml('matchResolvedTitle',`<b>Projet résolu (title)</b>${esc(trimProjectName(md.resolved_project_title||'-'))}`);setHtml('matchResolutionMode',`<b>Mode de résolution</b>${esc(md.resolution_mode||'-')}`);setHtml('matchScore',`<b>Score de match</b>${esc(String(md.match_score??'-'))}`);setHtml('rowsByTitle',`<b>Lignes filtrées par titre</b>${esc(String(md.rows_filtered_by_title??'-'))}`);setHtml('rowsById',`<b>Lignes filtrées par ID</b>${esc(String(md.rows_filtered_by_id??'-'))}`);const miss=((b&&b.missing_files)||[]);setHtml('missingFiles',`<b>Fichiers CSV manquants</b>${esc(miss.length?miss.join(', '):'-')}`);} 
+function renderBoard(){const b=state.board||{};const p=(b&&b.kpis_pilotage)||{};const k=(b&&b.kpis)||{};const hasMatch=!!((b&&b.match_debug&&((b.match_debug.matched_project_name||'')||(Number(b.match_debug.match_score||0)>0)))&&!b.warning);const secPilot=document.getElementById('sectionPilot');const secCompany=document.getElementById('sectionCompany');if(secPilot)secPilot.style.display=hasMatch?'block':'none';if(secCompany)secCompany.style.display=hasMatch?'block':'none';renderMetronomeProjectPickers(b);renderPlanningMissionSelect(b);renderMissionsPlanningTable();setText('projectTitle',trimProjectName(b.project_name||'-'));setText('projectDesc',b.project_description||'-');const img=document.getElementById('projectImage');if(img){const src=String(b.project_image||'').trim();if(src){img.src=src;img.style.display='block';}else{img.removeAttribute('src');img.style.display='none';}}renderMatchDebug(b);setText('kOpen',Number(k.open_topics||0));setText('kLate',Number(k.overdue_topics||0));setText('kTopRappels',Number(p.reminders_open_count||0));setText('kTopASuivre',Number(p.a_suivre_ouverts||p.followups_open_count||0));setText('kDateRef',p.date_reference||p.reference_date||'-');setText('kRappelsDate',Number(p.rappels_ouverts_a_date||p.reminders_open_count||0));setText('kASuivre',Number(p.a_suivre_ouverts||p.followups_open_count||0));renderTable(b.rows||[]);renderProjectTimeline(b);renderCompanyChart(b);renderReactivity(b);const companyRows=(p.rappels_cumules_par_entreprise||p.reminders_by_company||[]);setHtml('pilotByCompany',companyRows.length?companyRows.map(r=>{const nm=r.name||r.company||'';return `<button class='pilot-row-btn pilot-row' data-company='${esc(nm)}'><span class='company-cell'>${companyLogoHtml({name:nm,logo:r.logo||''})}<span class='name'>${esc(nm)}</span></span><span><strong>${Number(r.count||0)}</strong> rappels</span></button>`;}).join(''):"<div class='small'>Aucune donnée</div>");Array.from(document.querySelectorAll('.pilot-row-btn')).forEach(btn=>btn.addEventListener('click',()=>showReminderModal(btn.getAttribute('data-company')||'',b)));}
 function showPageError(err){const root=document.getElementById('boardTable');if(root)root.innerHTML=`<div class='small' style='padding:12px;color:#b42318'>${esc(err?.message||'Erreur de chargement')}</div>`;}
 async function loadAffaires(q){const data=await api(`/api/finance/affaires?search=${encodeURIComponent(q||'')}`);state.affaires=data.items||[];const sel=document.getElementById('affaireSelect');if(!sel)return;sel.innerHTML=`<option value=''>Sélectionner une affaire…</option>${state.affaires.map(a=>`<option value='${esc(a.affaire_id)}'>${esc(a.display_name||a.affaire_id)}</option>`).join('')}`;if(state.selectedId){const selected=state.affaires.find(a=>String(a.affaire_id||'')===String(state.selectedId||''));if(selected){state.selectedLabel=selected.display_name||state.selectedLabel||'';sel.value=selected.affaire_id;}}}
 function getProjectKey(){return state.selectedId?`id::${state.selectedId}`:'';}
 async function pointageApi(url,opts){const r=await fetch(url,opts);const d=await r.json();if(!r.ok) throw new Error(d.detail||'Erreur pointage');return d;}
-async function loadPointage(){if(!state.selectedId)return;try{const d=await pointageApi(`/api/project-management/pointage?affaire_id=${encodeURIComponent(state.selectedId)}`);state.pointage=d;renderPointage();renderPlanningChart();}catch(e){console.warn(e);}}
+async function loadPointage(){if(!state.selectedId)return;try{const boardMissions=getMissionCatalog(state.board||{},{missions:[]});if(boardMissions.length&&(!state.planningMissionKey||!boardMissions.some(m=>String(m.mission_key||'')===String(state.planningMissionKey||'')))){state.planningMissionKey=String((boardMissions[0]&&boardMissions[0].mission_key)||'');}let d=await pointageApi(`/api/project-management/pointage?affaire_id=${encodeURIComponent(state.selectedId)}${pointageMissionQuery(state.planningMissionKey)}`);if(!state.planningMissionKey){const apiMissions=getMissionCatalog(state.board||{},d||{});if(apiMissions.length){state.planningMissionKey=String((apiMissions[0]&&apiMissions[0].mission_key)||'');d=await pointageApi(`/api/project-management/pointage?affaire_id=${encodeURIComponent(state.selectedId)}${pointageMissionQuery(state.planningMissionKey)}`);}}state.pointage=d||{tasks:[],missions:[]};renderPlanningMissionSelect(state.board||{});renderMissionsPlanningTable();renderPointage();renderPlanningChart();}catch(e){console.warn(e);state.pointage={tasks:[],missions:[]};renderPlanningMissionSelect(state.board||{});renderMissionsPlanningTable();renderPointage();renderPlanningChart();}}
 function levelGroups(tasks){const g={};for(const t of (tasks||[])){const lvl=t.level_label||t.level||'Général';(g[lvl]=g[lvl]||[]).push(t);}return g;}
 function renderPointageAnalytics(root,tasks,{includeUnpointed=false}={}){if(!root)return;const stats={};const push=(name,delay)=>{const key=String(name||'').trim();if(!key || key==='Non attribué' || key.includes('+'))return;const rec=stats[key]||(stats[key]={sum:0,count:0});rec.sum+=Number(delay||0);rec.count+=1;};for(const t of tasks){if(t.is_summary)continue;if(t.is_cet&&Array.isArray(t.cetMembers)&&t.cetMembers.length){for(const m of t.cetMembers){const cm=((t.cet||{})[m]||{});const isPointed=Number(cm.progress||0)>0 || !!cm.actualEnd;const shouldUse=includeUnpointed?(cm.status==='late' || cm.status==='soon' || cm.status==='past' || isPointed):((cm.status==='past' || !!cm.actualEnd) && isPointed);if(shouldUse)push(m,cm.delayDays||0);}continue;}const owner=String(t.owner||'').trim();const isPointed=Number(t.progress||0)>0 || !!t.actualEnd;const shouldUse=includeUnpointed?(t.status==='late' || t.status==='soon' || t.status==='past' || isPointed):((t.status==='past' || !!t.actualEnd) && isPointed);if(shouldUse)push(owner,t.delayDays||0);}const items=Object.entries(stats).map(([name,v])=>({name,avg:v.count?(v.sum/v.count):0,count:v.count})).filter(x=>x.count>0).sort((a,b)=>b.avg-a.avg||a.name.localeCompare(b.name,'fr'));if(!items.length){root.innerHTML=`<div class='small'>${includeUnpointed?'Aucune donnée de retard à date disponible.':'Aucune donnée de pointage terminée.'}</div>`;return;}const max=Math.max(1,...items.map(x=>Math.abs(Number(x.avg||0))));root.innerHTML=`<div style='display:flex;align-items:flex-end;gap:14px;height:260px;padding:10px 0'>${items.map(x=>{const v=Number(x.avg||0);const h=Math.max(10,(Math.abs(v)/max)*190);const tooltip=`${x.name}: ${v.toFixed(1)} j de retard moyen${includeUnpointed?' à date':''}`;return `<div style='flex:1;min-width:90px;text-align:center'><div title='${escAttr(tooltip)}' style='margin:0 auto;width:42px;height:${h}px;background:${x.name==='CST'?'#ef8d00':'#d64545'};border-radius:10px 10px 0 0'></div><div style='font-size:12px;margin-top:8px;font-weight:800'>${esc(x.name)}</div><div style='font-size:12px;color:#6e7a90'>${v.toFixed(1)} j</div><div style='font-size:11px;color:#8a94a8'>${x.count} tâche(s)</div></div>`;}).join('')}</div>`;}
-function renderPointage(){const root=document.getElementById('pointageWrap');const d=state.pointage||{};const tasks=d.tasks||[];if(!root)return;if(!tasks.length){root.innerHTML="<div class='small' style='padding:10px'>Aucun planning importé.</div>";return;}const expanded=new Set((d.workState&&d.workState.expanded_levels)||[]);const groups=levelGroups(tasks);let html=`<table><thead><tr><th>Tâche</th><th>Ressource</th><th>Début</th><th>Fin</th><th>% achevé</th><th>Réception réelle</th><th>Retard</th><th>Coût planifié CST</th><th>Coût pointé CST</th><th>Statut</th></tr></thead><tbody>`;for(const lvl of Object.keys(groups)){const open=expanded.has(lvl);html+=`<tr class='lvl-row'><td colspan='10'><button type='button' data-lvl='${esc(lvl)}' class='btn' style='height:28px'>${open?'−':'+'}</button> ${esc(lvl)}</td></tr>`;if(open){for(const t of groups[lvl]){const isSummary=Boolean(t.is_summary);const toneClass=t.isLate?'task-late':(t.isSoon?'task-soon':'');const cstClass=t.is_cst?' task-cst':'';const rowCls=isSummary?'lvl-row':`${toneClass}${cstClass}`.trim();const label=t.name;const start=fmtDateFrShort(t.start||'');const end=fmtDateFrShort(t.end||'');const depth=Math.max(0,Number(t.depth||0));const pad=12+(depth*14);const delayTxt=`${Number(t.delayDays||0)} j`;const statusLabel=String(t.statusLabel||'');const statusHtml=t.status==='past'?'<span class=\"status-badge done\">Terminé</span>':(t.status==='late'?`<span class=\"status-badge late\">${esc(statusLabel)}</span>`:(t.status==='soon'?`<span class=\"status-badge soon\">${esc(statusLabel)}</span>`:''));if(isSummary){html+=`<tr class='${rowCls}'><td style='padding-left:${pad}px;font-weight:800'>${esc(t.name)}</td><td colspan='8'></td><td>${statusHtml}</td></tr>`;continue;}html+=`<tr class='${rowCls}'><td style='padding-left:${pad}px'>${esc(label)}</td><td>${esc((t.owner==='Non attribué'?'':t.owner))}</td><td>${esc(start)}</td><td>${esc(end)}</td><td><input data-task='${esc(t.task_id)}' data-field='progress' type='number' min='0' max='100' value='${Number(t.progress||0)}' style='width:70px'></td><td><input data-task='${esc(t.task_id)}' data-field='actualEnd' type='date' value='${esc(t.actualEnd||'')}'></td><td>${delayTxt}</td><td style='color:#b45f06;font-weight:800'>${Number(t.plannedCostCst||0)>0?Number(t.plannedCostCst||0).toFixed(0)+' €':''}</td><td>${Number(t.actualCostCst||0)>0?Number(t.actualCostCst||0).toFixed(0)+' €':''}</td><td>${statusHtml}</td></tr>`;if(t.is_cet&&t.cetMembers&&t.cetMembers.length){for(const m of t.cetMembers){const cm=((t.cet||{})[m]||{});const cmDelayTxt=`${Number(cm.delayDays||0)} j`;const cmStatusLabel=String(cm.statusLabel||'');const cmStatusHtml=cm.status==='past'?'<span class=\"status-badge done\">Terminé</span>':(cm.status==='late'?`<span class=\"status-badge late\">${esc(cmStatusLabel)}</span>`:(cm.status==='soon'?`<span class=\"status-badge soon\">${esc(cmStatusLabel)}</span>`:''));html+=`<tr><td style='padding-left:${pad+16}px'>↳ ${esc(m)}</td><td>CET</td><td></td><td></td><td><input data-task='${esc(t.task_id)}' data-cet='${esc(m)}' data-field='progress' type='number' min='0' max='100' value='${Number(cm.progress||0)}' style='width:70px'></td><td><input data-task='${esc(t.task_id)}' data-cet='${esc(m)}' data-field='actualEnd' type='date' value='${esc(cm.actualEnd||'')}'></td><td>${cmDelayTxt}</td><td></td><td></td><td>${cmStatusHtml}</td></tr>`;}}}}}html+='</tbody></table>';root.innerHTML=html;Array.from(root.querySelectorAll('button[data-lvl]')).forEach(b=>b.addEventListener('click',async()=>{const lvl=b.getAttribute('data-lvl')||'';const ws={...(d.workState||{}),expanded_levels:[...new Set([...(d.workState?.expanded_levels||[])]) ]};const set=new Set(ws.expanded_levels);if(set.has(lvl))set.delete(lvl);else set.add(lvl);ws.expanded_levels=[...set];await savePointage({},ws);}));Array.from(root.querySelectorAll('input[data-task]')).forEach(inp=>inp.addEventListener('change',async()=>{const task=inp.getAttribute('data-task')||'';const field=inp.getAttribute('data-field')||'';const cet=inp.getAttribute('data-cet')||'';const patch={};if(cet){patch[task]={cet:{[cet]:{[field]:inp.value}}};}else{patch[task]={[field]:inp.value};}await savePointage(patch,d.workState||{});}));}
-async function savePointage(pointagePatch,workState){if(!state.selectedId)return;const cetMembers=(document.getElementById('cetMembersInput')||{}).value||'';const payload={pointage_patch:{...pointagePatch,__cetMembers:cetMembers},work_state:workState||{}};const d=await pointageApi(`/api/project-management/pointage/save?affaire_id=${encodeURIComponent(state.selectedId)}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});state.pointage=d;renderPointage();renderPlanningChart();}
-async function importPlanningFile(file){if(!state.selectedId||!file)return;const fd=new FormData();fd.append('file',file);const d=await fetch(`/api/project-management/pointage/planning/import?affaire_id=${encodeURIComponent(state.selectedId)}`,{method:'POST',body:fd});const j=await d.json();if(!d.ok)throw new Error(j.detail||'Import planning impossible');state.pointage=j;renderPointage();renderPlanningChart();}
-async function importSuiviFile(file){if(!state.selectedId||!file)return;const fd=new FormData();fd.append('file',file);const d=await fetch(`/api/project-management/pointage/import-suivi?affaire_id=${encodeURIComponent(state.selectedId)}`,{method:'POST',body:fd});const j=await d.json();if(!d.ok)throw new Error(j.detail||'Import suivi impossible');state.pointage=j;renderPointage();renderPlanningChart();}
-async function exportSuivi(){if(!state.selectedId)return;const d=await pointageApi(`/api/project-management/pointage/export?affaire_id=${encodeURIComponent(state.selectedId)}`);const blob=new Blob([JSON.stringify(d,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`suivi-pointage-${state.selectedId}.json`;a.click();URL.revokeObjectURL(a.href);}
+function renderPointage(){const root=document.getElementById('pointageWrap');const d=state.pointage||{};const tasks=d.tasks||[];if(!root)return;if(!tasks.length){root.innerHTML="<div class='small' style='padding:10px'>Aucun planning importé pour cette mission.</div>";return;}const expanded=new Set((d.workState&&d.workState.expanded_levels)||[]);const groups=levelGroups(tasks);let html=`<table><thead><tr><th>Tâche</th><th>Ressource</th><th>Début</th><th>Fin</th><th>% achevé</th><th>Réception réelle</th><th>Retard</th><th>Coût planifié CST</th><th>Coût pointé CST</th><th>Statut</th></tr></thead><tbody>`;for(const lvl of Object.keys(groups)){const open=expanded.has(lvl);html+=`<tr class='lvl-row'><td colspan='10'><button type='button' data-lvl='${esc(lvl)}' class='btn' style='height:28px'>${open?'−':'+'}</button> ${esc(lvl)}</td></tr>`;if(open){for(const t of groups[lvl]){const isSummary=Boolean(t.is_summary);const toneClass=t.isLate?'task-late':(t.isSoon?'task-soon':'');const cstClass=t.is_cst?' task-cst':'';const rowCls=isSummary?'lvl-row':`${toneClass}${cstClass}`.trim();const label=t.name;const start=fmtDateFrShort(t.start||'');const end=fmtDateFrShort(t.end||'');const depth=Math.max(0,Number(t.depth||0));const pad=12+(depth*14);const delayTxt=`${Number(t.delayDays||0)} j`;const statusLabel=String(t.statusLabel||'');const statusHtml=t.status==='past'?'<span class=\"status-badge done\">Terminé</span>':(t.status==='late'?`<span class=\"status-badge late\">${esc(statusLabel)}</span>`:(t.status==='soon'?`<span class=\"status-badge soon\">${esc(statusLabel)}</span>`:''));if(isSummary){html+=`<tr class='${rowCls}'><td style='padding-left:${pad}px;font-weight:800'>${esc(t.name)}</td><td colspan='8'></td><td>${statusHtml}</td></tr>`;continue;}html+=`<tr class='${rowCls}'><td style='padding-left:${pad}px'>${esc(label)}</td><td>${esc((t.owner==='Non attribué'?'':t.owner))}</td><td>${esc(start)}</td><td>${esc(end)}</td><td><input data-task='${esc(t.task_id)}' data-field='progress' type='number' min='0' max='100' value='${Number(t.progress||0)}' style='width:70px'></td><td><input data-task='${esc(t.task_id)}' data-field='actualEnd' type='date' value='${esc(t.actualEnd||'')}'></td><td>${delayTxt}</td><td style='color:#b45f06;font-weight:800'>${Number(t.plannedCostCst||0)>0?Number(t.plannedCostCst||0).toFixed(0)+' €':''}</td><td>${Number(t.actualCostCst||0)>0?Number(t.actualCostCst||0).toFixed(0)+' €':''}</td><td>${statusHtml}</td></tr>`;if(t.is_cet&&t.cetMembers&&t.cetMembers.length){for(const m of t.cetMembers){const cm=((t.cet||{})[m]||{});const cmDelayTxt=`${Number(cm.delayDays||0)} j`;const cmStatusLabel=String(cm.statusLabel||'');const cmStatusHtml=cm.status==='past'?'<span class=\"status-badge done\">Terminé</span>':(cm.status==='late'?`<span class=\"status-badge late\">${esc(cmStatusLabel)}</span>`:(cm.status==='soon'?`<span class=\"status-badge soon\">${esc(cmStatusLabel)}</span>`:''));html+=`<tr><td style='padding-left:${pad+16}px'>↳ ${esc(m)}</td><td>CET</td><td></td><td></td><td><input data-task='${esc(t.task_id)}' data-cet='${esc(m)}' data-field='progress' type='number' min='0' max='100' value='${Number(cm.progress||0)}' style='width:70px'></td><td><input data-task='${esc(t.task_id)}' data-cet='${esc(m)}' data-field='actualEnd' type='date' value='${esc(cm.actualEnd||'')}'></td><td>${cmDelayTxt}</td><td></td><td></td><td>${cmStatusHtml}</td></tr>`;}}}}}html+='</tbody></table>';root.innerHTML=html;Array.from(root.querySelectorAll('button[data-lvl]')).forEach(b=>b.addEventListener('click',async()=>{const lvl=b.getAttribute('data-lvl')||'';const ws={...(d.workState||{}),expanded_levels:[...new Set([...(d.workState?.expanded_levels||[])]) ]};const set=new Set(ws.expanded_levels);if(set.has(lvl))set.delete(lvl);else set.add(lvl);ws.expanded_levels=[...set];await savePointage({},ws);}));Array.from(root.querySelectorAll('input[data-task]')).forEach(inp=>inp.addEventListener('change',async()=>{const task=inp.getAttribute('data-task')||'';const field=inp.getAttribute('data-field')||'';const cet=inp.getAttribute('data-cet')||'';const patch={};if(cet){patch[task]={cet:{[cet]:{[field]:inp.value}}};}else{patch[task]={[field]:inp.value};}await savePointage(patch,d.workState||{});}));}
+async function savePointage(pointagePatch,workState){if(!state.selectedId)return;const cetMembers=(document.getElementById('cetMembersInput')||{}).value||'';const payload={pointage_patch:{...pointagePatch,__cetMembers:cetMembers},work_state:workState||{}};const d=await pointageApi(`/api/project-management/pointage/save?affaire_id=${encodeURIComponent(state.selectedId)}${pointageMissionQuery()}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});state.pointage=d;renderPlanningMissionSelect(state.board||{});renderMissionsPlanningTable();renderPointage();renderPlanningChart();}
+async function importPlanningFile(file,missionKey){if(!state.selectedId||!file)return;const fd=new FormData();fd.append('file',file);const query=pointageMissionQuery(missionKey);const d=await fetch(`/api/project-management/pointage/planning/import?affaire_id=${encodeURIComponent(state.selectedId)}${query}`,{method:'POST',body:fd});const j=await d.json();if(!d.ok)throw new Error(j.detail||'Import planning impossible');if(typeof missionKey==='string'){state.planningMissionKey=missionKey;const missionSelect=document.getElementById('planningMissionSelect');if(missionSelect)missionSelect.value=missionKey;}state.pointage=j;renderPlanningMissionSelect(state.board||{});renderMissionsPlanningTable();renderPointage();renderPlanningChart();}
+async function importSuiviFile(file){if(!state.selectedId||!file)return;const fd=new FormData();fd.append('file',file);const d=await fetch(`/api/project-management/pointage/import-suivi?affaire_id=${encodeURIComponent(state.selectedId)}${pointageMissionQuery()}`,{method:'POST',body:fd});const j=await d.json();if(!d.ok)throw new Error(j.detail||'Import suivi impossible');state.pointage=j;renderPlanningMissionSelect(state.board||{});renderMissionsPlanningTable();renderPointage();renderPlanningChart();}
+async function exportSuivi(){if(!state.selectedId)return;const d=await pointageApi(`/api/project-management/pointage/export?affaire_id=${encodeURIComponent(state.selectedId)}${pointageMissionQuery()}`);const blob=new Blob([JSON.stringify(d,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`suivi-pointage-${state.selectedId}-${state.planningMissionKey||'principal'}.json`;a.click();URL.revokeObjectURL(a.href);}
 async function init(){
   try{
     await loadAffaires('');
@@ -4753,8 +5010,7 @@ async function init(){
       await loadBoard(state.selectedId||initialId);
       await loadPointage();
     }else{renderBoard();}
-    document.getElementById('btnImportPlanning').addEventListener('click',()=>document.getElementById('planningCsvInput').click());
-    document.getElementById('planningCsvInput').addEventListener('change',async e=>{if(e.target.files&&e.target.files[0]){await importPlanningFile(e.target.files[0]);e.target.value='';}});
+    document.getElementById('planningCsvInput').addEventListener('change',async e=>{if(e.target.files&&e.target.files[0]){const missionKey=(e.target.dataset&&typeof e.target.dataset.missionKey==='string')?e.target.dataset.missionKey:'';await importPlanningFile(e.target.files[0],missionKey);e.target.value='';e.target.dataset.missionKey='';}});
     document.getElementById('btnImportSuivi').addEventListener('click',()=>document.getElementById('suiviImportInput').click());
     document.getElementById('suiviImportInput').addEventListener('change',async e=>{if(e.target.files&&e.target.files[0]){await importSuiviFile(e.target.files[0]);e.target.value='';}});
     document.getElementById('btnExportSuivi').addEventListener('click',exportSuivi);
@@ -4762,8 +5018,10 @@ async function init(){
     document.getElementById('btnCollapseAll').addEventListener('click',async()=>{await savePointage({}, {expanded_levels:[]});});
     document.getElementById('cetMembersInput').addEventListener('change',async()=>{await savePointage({}, state.pointage?.workState||{});});
     const reminderClose=document.getElementById('reminderModalClose');if(reminderClose)reminderClose.addEventListener('click',hideReminderModal);const perimeterClose=document.getElementById('perimeterDetailClose');if(perimeterClose)perimeterClose.addEventListener('click',hidePerimeterDetailModal);const boardWindowBtn=document.getElementById('boardWindowBtn');if(boardWindowBtn)boardWindowBtn.addEventListener('click',openBoardWindow);const boardWindowBtnHero=document.getElementById('boardWindowBtnHero');if(boardWindowBtnHero)boardWindowBtnHero.addEventListener('click',openBoardWindow);
-    const affaireSelect=document.getElementById('affaireSelect');if(affaireSelect)affaireSelect.addEventListener('change',async e=>{await loadBoard(e.target.value||'');});
+    bindMetronomeProjectPickers();
+    const affaireSelect=document.getElementById('affaireSelect');if(affaireSelect)affaireSelect.addEventListener('change',async e=>{await loadBoard(e.target.value||'');await loadPointage();});
     const companyMetric=document.getElementById('companyMetric');if(companyMetric)companyMetric.addEventListener('change',()=>renderCompanyChart(state.board||{}));
+    const planningMissionSelect=document.getElementById('planningMissionSelect');if(planningMissionSelect)planningMissionSelect.addEventListener('change',async e=>{state.planningMissionKey=e.target.value||'';await loadPointage();});
     const planningChartSelect=document.getElementById('planningChartSelect');if(planningChartSelect)planningChartSelect.addEventListener('change',()=>renderPlanningChart());
   }catch(err){console.error(err);renderBoard();showPageError(err);}
 }
@@ -4872,14 +5130,14 @@ def dashboard_board_html() -> str:
 
   <div class='board-sections'>
   <section id='section-metronome' class='board-section'>
-    <div class='section-head'><h3>GESTION DE PROJET | METRONOME</h3><button class='notes-btn' data-notes-target='notes-metronome'>+ Notes</button></div>
+    <div class='section-head'><h3>GESTION DE PROJET | METRONOME</h3><div class='section-tools'><label for='metronomeProjectPickerPilot' class='small'>Projet METRONOME</label><select id='metronomeProjectPickerPilot' class='action-btn' style='height:32px;padding:0 12px'><option value=''>Choisir un projet</option></select><button class='notes-btn' data-notes-target='notes-metronome'>+ Notes</button></div></div>
     <div class='panel'>
       <div class='mini-grid'>
         <div class='mini-card'><div class='label'>Rappels ouverts à date</div><div id='metroReminder' class='value'>0</div></div>
         <div class='mini-card'><div class='label'>À suivre ouverts</div><div id='metroFollow' class='value'>0</div></div>
         <div class='mini-card'><div class='label'>Date de référence</div><div id='metroDate' class='value' style='font-size:32px'>-</div></div>
       </div>
-      <div style='margin-top:18px;font-size:18px;font-weight:900'>Retards cumulés par entreprise</div>
+      <div style='margin-top:18px;font-size:18px;font-weight:900'>Rappels ouverts à date cumulés par entreprise</div>
       <div id='metroCompanies' class='stack' style='margin-top:12px'></div>
     </div>
     <div id='companyReminderModal' class='pm-modal hidden'><div class='pm-modal-box'><div style='display:flex;justify-content:space-between;align-items:center;gap:12px'><h3 id='companyReminderTitle' style='margin:0'>Rappels ouverts</h3><button id='companyReminderClose' class='action-btn' style='height:38px;background:#ef8d00;color:#fff;border-color:#ef8d00'>Fermer</button></div><div id='companyReminderBody' style='margin-top:14px'></div></div></div>
@@ -4888,7 +5146,7 @@ def dashboard_board_html() -> str:
   </section>
 
   <section id='section-analysis' class='board-section'>
-    <div class='section-head'><h3>GESTION DE PROJET | ANALYSE METRONOME</h3><div class='section-tools'><label class='mini-toggle'><input type='checkbox' data-chart='analysis-company' checked>Entreprises</label><label class='mini-toggle'><input type='checkbox' data-chart='analysis-reactivity' checked>Réactivité</label><button class='notes-btn' data-notes-target='notes-analysis'>+ Notes</button></div></div>
+    <div class='section-head'><h3>GESTION DE PROJET | ANALYSE METRONOME</h3><div class='section-tools'><label for='metronomeProjectPicker' class='small'>Projet METRONOME</label><select id='metronomeProjectPicker' class='action-btn' style='height:32px;padding:0 12px'><option value=''>Choisir un projet</option></select><label class='mini-toggle'><input type='checkbox' data-chart='analysis-company' checked>Entreprises</label><label class='mini-toggle'><input type='checkbox' data-chart='analysis-reactivity' checked>Réactivité</label><button class='notes-btn' data-notes-target='notes-analysis'>+ Notes</button></div></div>
     <div id='chart-analysis-company' class='chart-box'>
       <div class='chart-title'>Tâches ouvertes / rappels par entreprise</div>
       <div id='analysisBars'></div>
@@ -4901,7 +5159,7 @@ def dashboard_board_html() -> str:
   </section>
 
   <section id='section-planning' class='board-section'>
-    <div class='section-head'><h3>GESTION DE PROJET | PLANNING</h3><div class='section-tools'><label class='mini-toggle'><input type='checkbox' data-chart='planning-delay' checked>Déclencheur</label><label class='mini-toggle'><input type='checkbox' data-chart='planning-progress' checked>Périmètres</label><label class='mini-toggle'><input type='checkbox' data-chart='planning-resources' checked>Ressources</label><label class='mini-toggle'><input type='checkbox' data-chart='planning-resources-today' checked>Ressources à date</label><label class='mini-toggle'><input type='checkbox' data-chart='planning-expected' checked>Avancement</label><label class='mini-toggle'><input type='checkbox' data-chart='planning-cst' checked>CST</label><button class='notes-btn' data-notes-target='notes-planning'>+ Notes</button></div></div>
+    <div class='section-head'><h3>GESTION DE PROJET | PLANNING</h3><div class='section-tools'><label for='planningMissionPickerBoard' class='small'>Mission planning</label><select id='planningMissionPickerBoard' class='action-btn' style='height:32px;padding:0 12px'><option value=''>Aucune mission</option></select><label class='mini-toggle'><input type='checkbox' data-chart='planning-delay' checked>Déclencheur</label><label class='mini-toggle'><input type='checkbox' data-chart='planning-progress' checked>Périmètres</label><label class='mini-toggle'><input type='checkbox' data-chart='planning-resources' checked>Ressources</label><label class='mini-toggle'><input type='checkbox' data-chart='planning-resources-today' checked>Ressources à date</label><label class='mini-toggle'><input type='checkbox' data-chart='planning-expected' checked>Avancement</label><label class='mini-toggle'><input type='checkbox' data-chart='planning-cst' checked>CST</label><button class='notes-btn' data-notes-target='notes-planning'>+ Notes</button></div></div>
     <div id='chart-planning-delay' class='chart-box'><div class='chart-title'>Déclencheur de retard</div><div id='planningDelay' class='planning-stack'></div></div>
     <div id='chart-planning-progress' class='chart-box' style='margin-top:14px'><div class='chart-title'>Avancement par périmètre</div><div id='planningProgress' class='progress-block'></div></div>
     <div id='chart-planning-resources' class='chart-box' style='margin-top:14px'><div class='chart-title'>Retard moyen par ressource, suivant planning pointé</div><div id='planningResources' class='reactivity-bars'></div><div id='planningResourcesPrint' class='print-only'></div></div>
@@ -4935,6 +5193,7 @@ const qs=new URLSearchParams(window.location.search);const affaireId=qs.get('aff
 const euro=v=>new Intl.NumberFormat('fr-FR',{style:'currency',currency:'EUR',maximumFractionDigits:0}).format(Number(v||0));
 const esc=v=>String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]||m));
 const escAttr=esc;
+function trimProjectName(v){const raw=String(v||'').trim();if(!raw)return raw;return raw.split(/[-—]/)[0].trim()||raw;}
 async function api(u){const r=await fetch(u);const d=await r.json();if(!r.ok) throw new Error(d.detail||'Erreur API');return d;}
 function parseDateOnly(v){const raw=String(v||'').trim();if(!raw)return null;const s=raw.split(' ')[0].split('T')[0];if(/^\d{4}-\d{2}-\d{2}$/.test(s)){const d=new Date(`${s}T00:00:00`);return Number.isNaN(d.getTime())?null:d;}const m=s.match(/^(\d{2})\/(\d{2})\/(\d{2,4})$/);if(m){const y=m[3].length===2?`20${m[3]}`:m[3];const d=new Date(`${y}-${m[2]}-${m[1]}T00:00:00`);return Number.isNaN(d.getTime())?null:d;}return null;}
 function fmtDate(v){const d=parseDateOnly(v);return d?d.toLocaleDateString('fr-FR',{day:'2-digit',month:'2-digit',year:'2-digit'}):'-';}
@@ -4951,7 +5210,7 @@ function toggleNotes(id){const wrap=document.getElementById(id);if(wrap)wrap.cla
 function exportBoard(){const payload={affaire_id:affaireId,exported_at:new Date().toISOString(),layout:JSON.parse(localStorage.getItem(projectStorageKey('board-layout'))||'{}'),notes:JSON.parse(localStorage.getItem(projectStorageKey('board-notes'))||'{}')};const blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`board-${affaireId||'affaire'}.json`;a.click();URL.revokeObjectURL(a.href);}
 async function importBoard(file){if(!file)return;const data=JSON.parse(await file.text());if(data.layout)localStorage.setItem(projectStorageKey('board-layout'),JSON.stringify(data.layout));if(data.notes)localStorage.setItem(projectStorageKey('board-notes'),JSON.stringify(data.notes));restoreLayout();restoreNotes();}
 function setText(id,v){const el=document.getElementById(id);if(el)el.textContent=v;}
-function renderCompanyRows(rows){return rows.length?rows.map(r=>{const name=r.name||r.company||'-';return `<button class='company-row-btn' data-company='${esc(name)}'><div class='company-row'><span class='company-cell'>${companyLogoHtml(r)}<span class='name'>${esc(name)}</span></span><span class='count'><strong>${Number(r.count||0)}</strong> rappel(s)</span></div></button>`;}).join(''):`<div class='company-row'><span class='name'>Aucune donnée</span><span class='count'>0</span></div>`;}
+function renderCompanyRows(rows){return rows.length?rows.map(r=>{const name=r.name||r.company||'-';return `<button type='button' class='company-row-btn' data-company='${esc(name)}' onclick=\"showCompanyReminderModal(this.getAttribute('data-company')||'',window.__boardData||{})\"><div class='company-row'><span class='company-cell'>${companyLogoHtml(r)}<span class='name'>${esc(name)}</span></span><span class='count'><strong>${Number(r.count||0)}</strong> rappel(s)</span></div></button>`;}).join(''):`<div class='company-row'><span class='name'>Aucune donnée</span><span class='count'>0</span></div>`;}
 function renderBarList(rootId,items,color='#ef8d00'){const root=document.getElementById(rootId);if(!root)return;if(!items.length){root.innerHTML=`<div class='company-row'><span class='name'>Aucune donnée</span><span class='count'>0</span></div>`;return;}const max=Math.max(1,...items.map(x=>Number(x.count||x.value||0)));root.innerHTML=items.map(x=>{const val=Number(x.count||x.value||0);return `<div class='bar-row'><div class='label'>${esc(x.name||x.label||'-')}</div><div class='bar-track'><div class='bar-fill' style='width:${(val/max)*100}%;background:${color}'></div></div><div style='text-align:right;font-size:16px;font-weight:900'>${val.toFixed(val%1?1:0)}</div></div>`;}).join('');}
 function renderVerticalBars(rootId,items,{tempoName='tempo',suffix=' j'}={}){const root=document.getElementById(rootId);if(!root)return;if(!items.length){root.innerHTML=`<div class='company-row'><span class='name'>Aucune donnée</span><span class='count'>0</span></div>`;return;}const max=Math.max(1,...items.map(x=>Math.abs(Number(x.avg_gap_days??x.avg??0))));const showDelayDetails=rootId==='planningResources'||rootId==='planningResourcesToday';root.innerHTML=items.map((x,idx)=>{const val=Number(x.avg_gap_days??x.avg??0);const h=Math.max(8,(Math.abs(val)/max)*168);const cls=normalizeText(x.name||'')===tempoName?'tempo':'';const title=`${x.name||'-'}: ${val.toFixed(1)}${suffix}${showDelayDetails?` · ${Number(x.count||0)} tâche(s) prises en compte`:''}`;const bar=`<div class='react-stick ${cls}' style='height:${h}px'></div>`;const barHtml=showDelayDetails?`<button type='button' class='react-stick-btn' data-delay-idx='${idx}' title='${escAttr(title)}'>${bar}</button>`:`<div title='${escAttr(title)}'>${bar}</div>`;return `<div class='react-col'>${barHtml}<div class='react-name'>${esc(x.name||'-')}</div><div class='react-val'>${val.toFixed(1)}${suffix}</div></div>`;}).join('');if(showDelayDetails){Array.from(root.querySelectorAll('[data-delay-idx]')).forEach(btn=>btn.addEventListener('click',()=>{const idx=Number(btn.getAttribute('data-delay-idx'));const item=items[idx];if(item)showPlanningDelayModal({rootId,item,suffix});}));}}
 function renderPrintMetricList(rootId,items,{suffix=''}={}){const root=document.getElementById(rootId);if(!root)return;if(!items.length){root.innerHTML=`<div class='company-row'><span class='name'>Aucune donnée</span><span class='count'>0</span></div>`;return;}const max=Math.max(1,...items.map(x=>Math.abs(Number(x.avg_gap_days??x.avg??x.count??x.value??0))));root.innerHTML=items.map(x=>{const label=x.name||x.label||'-';const val=Number(x.avg_gap_days??x.avg??x.count??x.value??0);return `<div class='summary-row'><div>${esc(label)}</div><div class='summary-track'><div class='summary-fill fac' style='width:${Math.max(3,(Math.abs(val)/max)*100)}%'></div></div><div style='text-align:right;font-weight:900'>${val.toFixed(val%1?1:0)}${suffix}</div></div>`;}).join('');}
@@ -4968,7 +5227,14 @@ function showPlanningDelayModal({rootId,item,suffix=' j'}={}){const modal=docume
 function hidePlanningDelayModal(){const modal=document.getElementById('planningDelayModal');if(modal)modal.classList.add('hidden');}
 function showCompanyReminderModal(company,board){const p=(board&&board.kpis_pilotage)||{};const norm=v=>String(v||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').trim();const items=(p.reminders_open_items||[]).filter(x=>norm(x.company)===norm(company));const modal=document.getElementById('companyReminderModal');const title=document.getElementById('companyReminderTitle');const body=document.getElementById('companyReminderBody');if(title)title.textContent=`Rappels ouverts - ${company}`;if(body){if(!items.length){body.innerHTML=`<div class='company-row'><span class='name'>Aucun sujet en retard.</span><span class='count'>0</span></div>`;}else{const grouped={};for(const item of items){const key=String(item.perimetre||item.perimeter||'Général').trim()||'Général';(grouped[key]=grouped[key]||[]).push(item);}body.innerHTML=Object.keys(grouped).sort((a,b)=>a.localeCompare(b,'fr')).map(group=>`<section class='reminder-group'><div class='reminder-group-title'>${esc(group)}</div><table class='reminder-table'><thead><tr><th style='width:100%'>Tâche</th><th>Échéance</th><th>Rappel</th></tr></thead><tbody>${grouped[group].map(item=>`<tr><td>${esc(item.task||'-')}</td><td>${esc(fmtDate(item.deadline||''))}</td><td><span class='reminder-level'>${esc(reminderLevelLabel(item))}</span></td></tr>`).join('')}</tbody></table></section>`).join('');}}if(modal)modal.classList.remove('hidden');}
 function hideCompanyReminderModal(){const modal=document.getElementById('companyReminderModal');if(modal)modal.classList.add('hidden');}
-async function init(){restoreLayout();restoreNotes();document.querySelectorAll('[data-notes-target]').forEach(btn=>btn.addEventListener('click',()=>toggleNotes(btn.getAttribute('data-notes-target'))));document.getElementById('exportBtn').addEventListener('click',exportBoard);document.getElementById('importBtn').addEventListener('click',()=>document.getElementById('importInput').click());document.getElementById('importInput').addEventListener('change',async e=>{if(e.target.files&&e.target.files[0]){await importBoard(e.target.files[0]);e.target.value='';}});document.getElementById('printBtn').addEventListener('click',()=>window.print());document.getElementById('closeBtn').addEventListener('click',()=>window.close());const reminderModal=document.getElementById('companyReminderModal');if(reminderModal)reminderModal.addEventListener('click',e=>{if(e.target===reminderModal)hideCompanyReminderModal();});const financeProductionModal=document.getElementById('financeProductionModal');if(financeProductionModal)financeProductionModal.addEventListener('click',e=>{if(e.target===financeProductionModal)hideFinanceProductionModal();});const financeProductionClose=document.getElementById('financeProductionClose');if(financeProductionClose)financeProductionClose.onclick=hideFinanceProductionModal;const planningDelayModal=document.getElementById('planningDelayModal');if(planningDelayModal)planningDelayModal.addEventListener('click',e=>{if(e.target===planningDelayModal)hidePlanningDelayModal();});const planningDelayModalClose=document.getElementById('planningDelayModalClose');if(planningDelayModalClose)planningDelayModalClose.onclick=hidePlanningDelayModal;const financeModeMonthly=document.getElementById('financeModeMonthly');if(financeModeMonthly)financeModeMonthly.addEventListener('change',()=>{if(financeModeMonthly.checked&&window.__boardAffaire)renderFinance(window.__boardAffaire);});const financeModeCumulative=document.getElementById('financeModeCumulative');if(financeModeCumulative)financeModeCumulative.addEventListener('change',()=>{if(financeModeCumulative.checked&&window.__boardAffaire)renderFinance(window.__boardAffaire);});const financeShowProduction=document.getElementById('financeShowProduction');if(financeShowProduction)financeShowProduction.addEventListener('change',()=>{if(window.__boardAffaire)renderFinance(window.__boardAffaire);});if(!affaireId){setText('projectTitle','Aucune affaire sélectionnée');return;}const finance=await api(`/api/finance/affaire/${encodeURIComponent(affaireId)}`);let board={};let pointage={};try{board=await api(`/api/project-management/board?affaire_id=${encodeURIComponent(affaireId)}`);}catch(_){board={};}try{pointage=await api(`/api/project-management/pointage?affaire_id=${encodeURIComponent(affaireId)}`);}catch(_){pointage={};}const planningTasks=extractPlanningTasks(pointage,board);window.__boardPointageTasks=planningTasks;const affaire=(finance&&finance.affaire)||{};window.__boardAffaire=affaire;const billed=Number(affaire.facturation_totale||((affaire.anteriorite||0)+(affaire.facture_2026||affaire.facturation_cumulee_2026||0)));const budget=Number(affaire.commande_ht||0);const billedPct=budget>0?(billed/budget)*100:0;const projectTitle=String(board.project_name||affaire.affaire||affaire.display_name||affaireId).toUpperCase();const projectDesc=String(board.project_description||affaire.project_description||affaire.start_sentence||affaire.description||'').trim();const projectImage=String(board.project_image||affaire.project_image||affaire.image_url||affaire.image||'').trim();setText('projectTitle',projectTitle);setText('projectDesc',projectDesc||'Description indisponible');const img=document.getElementById('projectImage');if(projectImage){img.src=projectImage;img.style.display='block';}else{img.removeAttribute('src');img.style.display='none';}setText('pillBudget',euro(affaire.commande_ht||0));setText('pillRemain',euro(affaire.reste_a_facturer||0));setText('pillBilledPct',`${billedPct.toFixed(1)} %`);const planning=computePlanningDatasets(planningTasks);setText('pillPlannedPct',`${Number((planning.expected[0]||{}).value||0).toFixed(1)} %`);setText('pillPointedPct',`${(Number(affaire.pointage_progress_ratio||0)*100).toFixed(1)} %`);const p=(board&&board.kpis_pilotage)||{};setText('metroReminder',String(Number(p.rappels_ouverts_a_date||p.reminders_open_count||0)));setText('metroFollow',String(Number(p.a_suivre_ouverts||p.followups_open_count||0)));setText('metroDate',p.date_reference||p.reference_date||'-');document.getElementById('metroCompanies').innerHTML=renderCompanyRows((p.rappels_cumules_par_entreprise||p.reminders_by_company||[]));Array.from(document.querySelectorAll('.company-row-btn')).forEach(btn=>btn.addEventListener('click',()=>showCompanyReminderModal(btn.getAttribute('data-company')||'',board)));const closeModal=document.getElementById('companyReminderClose');if(closeModal)closeModal.onclick=hideCompanyReminderModal;const analysisReactivity=(p.reactivity_by_company||[]).slice(0,8);const planningResources=planning.resources.map(x=>({name:x.name,avg:x.avg}));const planningResourcesToday=planning.resourcesToday.map(x=>({name:x.name,avg:x.avg}));renderBarList('analysisBars',((p.project_company_views||{}).reminder||[]).slice(0,8));renderVerticalBars('analysisReactivity',analysisReactivity,{tempoName:'tempo'});renderPrintMetricList('analysisReactivityPrint',analysisReactivity,{suffix:' j'});renderPlanningCards('planningDelay',planning.delayTrigger.map(x=>({label:x.label,subtitle:x.subtitle,side:x.side})));renderProgressRows('planningProgress',planning.perimeterProgress);renderVerticalBars('planningResources',planningResources,{tempoName:'cst'});renderPrintMetricList('planningResourcesPrint',planningResources,{suffix:' j'});renderVerticalBars('planningResourcesToday',planningResourcesToday,{tempoName:'cst'});renderPrintMetricList('planningResourcesTodayPrint',planningResourcesToday,{suffix:' j'});renderProgressRows('planningExpected',planning.expected);const timelineToggle=document.getElementById('planningTimelineActualToggle');if(timelineToggle){timelineToggle.onchange=()=>renderPerimeterTimeline(planning.perimeterTimeline||[],{showActual:timelineToggle.checked});}renderPerimeterTimeline(planning.perimeterTimeline||[],{showActual:!!(timelineToggle&&timelineToggle.checked)});renderFinance(affaire);}
+function populateMetronomeProjectPicker(board){const options=(board&&board.metronome_projects)||[];const selected=String((board&&board.selected_metronome_project_id)||'');const html=options.length?options.map(opt=>{const id=String(opt.project_id||'').trim();const title=String(opt.project_title||opt.project_id||'Projet').trim();return `<option value='${escAttr(id)}' ${id===selected?'selected':''}>${esc(title)}</option>`;}).join(''):"<option value=''>Aucun projet METRONOME</option>";['metronomeProjectPicker','metronomeProjectPickerPilot'].forEach(id=>{const picker=document.getElementById(id);if(picker)picker.innerHTML=html;});}
+function renderMetronomeBoard(board){const p=(board&&board.kpis_pilotage)||{};setText('metroReminder',String(Number(p.rappels_ouverts_a_date||p.reminders_open_count||0)));setText('metroFollow',String(Number(p.a_suivre_ouverts||p.followups_open_count||0)));setText('metroDate',p.date_reference||p.reference_date||'-');document.getElementById('metroCompanies').innerHTML=renderCompanyRows((p.rappels_cumules_par_entreprise||p.reminders_by_company||[]));Array.from(document.querySelectorAll('.company-row-btn')).forEach(btn=>btn.addEventListener('click',()=>showCompanyReminderModal(btn.getAttribute('data-company')||'',board)));const analysisReactivity=(p.reactivity_by_company||[]).slice(0,8);renderBarList('analysisBars',((p.project_company_views||{}).reminder||[]).slice(0,8));renderVerticalBars('analysisReactivity',analysisReactivity,{tempoName:'tempo'});renderPrintMetricList('analysisReactivityPrint',analysisReactivity,{suffix:' j'});}
+async function loadMetronomeBoard(projectId=''){const params=new URLSearchParams({affaire_id:affaireId});if(projectId)params.set('metronome_project_id',projectId);const board=await api(`/api/project-management/board?${params.toString()}`);window.__boardData=board;populateMetronomeProjectPicker(board);renderMetronomeBoard(board);return board;}
+function bindMetronomePickers(){['metronomeProjectPicker','metronomeProjectPickerPilot'].forEach(id=>{const picker=document.getElementById(id);if(!picker||picker.dataset.bound==='1')return;picker.dataset.bound='1';picker.addEventListener('change',async()=>{const selected=picker.value||'';['metronomeProjectPicker','metronomeProjectPickerPilot'].forEach(otherId=>{const other=document.getElementById(otherId);if(other&&other!==picker)other.value=selected;});try{await loadMetronomeBoard(selected);}catch(err){console.error(err);}});});}
+function getBoardFinanceMissions(board){return ((board&&board.finance_missions)||[]).filter(m=>m&&String(m.mission_key||'').trim());}
+function renderPlanningMissionPickerBoard(board,selectedKey=''){const picker=document.getElementById('planningMissionPickerBoard');if(!picker)return '';const missions=getBoardFinanceMissions(board);if(!missions.length){picker.innerHTML=\"<option value=''>Aucune mission</option>\";picker.value='';return '';}let next=String(selectedKey||'');if(!missions.some(m=>String(m.mission_key||'')===next))next=String((missions[0]&&missions[0].mission_key)||'');picker.innerHTML=missions.map(m=>`<option value='${escAttr(m.mission_key||'')}' ${String(m.mission_key||'')===next?'selected':''}>${esc(m.label||m.mission_key||'Mission')}</option>`).join('');picker.value=next;return next;}
+async function loadBoardMissionPlanning(board,missionKey){const mk=renderPlanningMissionPickerBoard(board,missionKey);let finance={affaire:{}};let pointage={};try{finance=await api(`/api/finance/affaire/${encodeURIComponent(affaireId)}?mission_key=${encodeURIComponent(mk||'')}`);}catch(_){finance={affaire:{}};}try{pointage=await api(`/api/project-management/pointage?affaire_id=${encodeURIComponent(affaireId)}&mission_key=${encodeURIComponent(mk||'')}`);}catch(_){pointage={};}const planningTasks=extractPlanningTasks(pointage,board);window.__boardPointageTasks=planningTasks;const affaire=(finance&&finance.affaire)||{};window.__boardAffaire=affaire;const billed=Number(affaire.facturation_totale||((affaire.anteriorite||0)+(affaire.facture_2026||affaire.facturation_cumulee_2026||0)));const budget=Number(affaire.commande_ht||0);const billedPct=budget>0?(billed/budget)*100:0;setText('pillBudget',euro(affaire.commande_ht||0));setText('pillRemain',euro(affaire.reste_a_facturer||0));setText('pillBilledPct',`${billedPct.toFixed(1)} %`);const planning=computePlanningDatasets(planningTasks);setText('pillPlannedPct',`${Number((planning.expected[0]||{}).value||0).toFixed(1)} %`);setText('pillPointedPct',`${(Number(affaire.pointage_progress_ratio||0)*100).toFixed(1)} %`);const planningResources=planning.resources.map(x=>({name:x.name,avg:x.avg}));const planningResourcesToday=planning.resourcesToday.map(x=>({name:x.name,avg:x.avg}));renderPlanningCards('planningDelay',planning.delayTrigger.map(x=>({label:x.label,subtitle:x.subtitle,side:x.side})));renderProgressRows('planningProgress',planning.perimeterProgress);renderVerticalBars('planningResources',planningResources,{tempoName:'cst'});renderPrintMetricList('planningResourcesPrint',planningResources,{suffix:' j'});renderVerticalBars('planningResourcesToday',planningResourcesToday,{tempoName:'cst'});renderPrintMetricList('planningResourcesTodayPrint',planningResourcesToday,{suffix:' j'});renderProgressRows('planningExpected',planning.expected);const timelineToggle=document.getElementById('planningTimelineActualToggle');if(timelineToggle){timelineToggle.onchange=()=>renderPerimeterTimeline(planning.perimeterTimeline||[],{showActual:timelineToggle.checked});}renderPerimeterTimeline(planning.perimeterTimeline||[],{showActual:!!(timelineToggle&&timelineToggle.checked)});renderFinance(affaire);return mk;}
+async function init(){restoreLayout();restoreNotes();document.querySelectorAll('[data-notes-target]').forEach(btn=>btn.addEventListener('click',()=>toggleNotes(btn.getAttribute('data-notes-target'))));document.getElementById('exportBtn').addEventListener('click',exportBoard);document.getElementById('importBtn').addEventListener('click',()=>document.getElementById('importInput').click());document.getElementById('importInput').addEventListener('change',async e=>{if(e.target.files&&e.target.files[0]){await importBoard(e.target.files[0]);e.target.value='';}});document.getElementById('printBtn').addEventListener('click',()=>window.print());document.getElementById('closeBtn').addEventListener('click',()=>window.close());const reminderModal=document.getElementById('companyReminderModal');if(reminderModal)reminderModal.addEventListener('click',e=>{if(e.target===reminderModal)hideCompanyReminderModal();});const financeProductionModal=document.getElementById('financeProductionModal');if(financeProductionModal)financeProductionModal.addEventListener('click',e=>{if(e.target===financeProductionModal)hideFinanceProductionModal();});const financeProductionClose=document.getElementById('financeProductionClose');if(financeProductionClose)financeProductionClose.onclick=hideFinanceProductionModal;const planningDelayModal=document.getElementById('planningDelayModal');if(planningDelayModal)planningDelayModal.addEventListener('click',e=>{if(e.target===planningDelayModal)hidePlanningDelayModal();});const planningDelayModalClose=document.getElementById('planningDelayModalClose');if(planningDelayModalClose)planningDelayModalClose.onclick=hidePlanningDelayModal;const financeModeMonthly=document.getElementById('financeModeMonthly');if(financeModeMonthly)financeModeMonthly.addEventListener('change',()=>{if(financeModeMonthly.checked&&window.__boardAffaire)renderFinance(window.__boardAffaire);});const financeModeCumulative=document.getElementById('financeModeCumulative');if(financeModeCumulative)financeModeCumulative.addEventListener('change',()=>{if(financeModeCumulative.checked&&window.__boardAffaire)renderFinance(window.__boardAffaire);});const financeShowProduction=document.getElementById('financeShowProduction');if(financeShowProduction)financeShowProduction.addEventListener('change',()=>{if(window.__boardAffaire)renderFinance(window.__boardAffaire);});const metroCompanies=document.getElementById('metroCompanies');if(metroCompanies&&metroCompanies.dataset.bound!=='1'){metroCompanies.dataset.bound='1';metroCompanies.addEventListener('click',e=>{const btn=e.target&&e.target.closest?e.target.closest('.company-row-btn'):null;if(!btn)return;showCompanyReminderModal(btn.getAttribute('data-company')||'',window.__boardData||{});});}if(!affaireId){setText('projectTitle','Aucune affaire sélectionnée');return;}let board={};try{board=await api(`/api/project-management/board?affaire_id=${encodeURIComponent(affaireId)}`);}catch(_){board={};}window.__boardData=board;populateMetronomeProjectPicker(board);renderMetronomeBoard(board);bindMetronomePickers();const picker=document.getElementById('planningMissionPickerBoard');if(picker&&picker.dataset.bound!=='1'){picker.dataset.bound='1';picker.addEventListener('change',async()=>{await loadBoardMissionPlanning(board,picker.value||'');});}const mk=renderPlanningMissionPickerBoard(board,'');await loadBoardMissionPlanning(board,mk);const baseAffaire=window.__boardAffaire||{};const projectTitle=trimProjectName(String(board.project_name||baseAffaire.affaire||baseAffaire.display_name||affaireId)).toUpperCase();const projectDesc=String(board.project_description||baseAffaire.project_description||baseAffaire.start_sentence||baseAffaire.description||'').trim();const projectImage=String(board.project_image||baseAffaire.project_image||baseAffaire.image_url||baseAffaire.image||'').trim();setText('projectTitle',projectTitle);setText('projectDesc',projectDesc||'Description indisponible');const img=document.getElementById('projectImage');if(projectImage){img.src=projectImage;img.style.display='block';}else{img.removeAttribute('src');img.style.display='none';}const closeModal=document.getElementById('companyReminderClose');if(closeModal)closeModal.onclick=hideCompanyReminderModal;}
 init().catch(err=>{setText('projectTitle',err.message||'Erreur de chargement');});
 </script></body></html>"""
 
@@ -5063,13 +5329,13 @@ def api_affaires(search: str = Query(default="")):
 
 
 @app.get("/api/finance/affaire/{affaire_id}", response_class=JSONResponse)
-def api_affaire_detail(affaire_id: str):
+def api_affaire_detail(affaire_id: str, mission_key: str = Query(default="")):
     cache = service.get_finance_cache()
     item = cache.get("items", {}).get(affaire_id)
     if not item:
         raise HTTPException(status_code=404, detail=f"Affaire introuvable : {affaire_id}")
     affaire = dict(item)
-    affaire.update(pointage_finance_summary(affaire_id, clean_number(affaire.get("commande_ht"))))
+    affaire.update(pointage_finance_summary(affaire_id, clean_number(affaire.get("commande_ht")), mission_key=mission_key))
     affaire["pointage_vs_facturation_gap"] = round(clean_number(affaire.get("facturation_totale")) - clean_number(affaire.get("pointage_progress_amount")), 2)
     affaire["pointage_vs_financial_gap_pct"] = round((clean_number(affaire.get("taux_avancement_financier")) - clean_number(affaire.get("pointage_progress_ratio"))) * 100.0, 2)
     affaire["insights"] = FinanceService.compute_insights(affaire)
@@ -5077,7 +5343,13 @@ def api_affaire_detail(affaire_id: str):
 
 
 @app.get("/api/project-management/board", response_class=JSONResponse)
-def api_project_management_board(affaire_id: str = Query(default=""), affaire_name: str = Query(default=""), start_date: str = Query(default=""), end_date: str = Query(default="")):
+def api_project_management_board(
+    affaire_id: str = Query(default=""),
+    affaire_name: str = Query(default=""),
+    start_date: str = Query(default=""),
+    end_date: str = Query(default=""),
+    metronome_project_id: str = Query(default=""),
+):
     name = clean_text(affaire_name)
     if affaire_id and not name:
         cache = service.get_finance_cache()
@@ -5088,32 +5360,76 @@ def api_project_management_board(affaire_id: str = Query(default=""), affaire_na
         candidates = [c for i, c in enumerate(candidates) if c and c not in candidates[:i]]
         if not candidates:
             raise HTTPException(status_code=400, detail="Aucun nom projet exploitable pour cette affaire")
-        boards = [metronome_service.build_project_board(c, start_date=start_date, end_date=end_date) for c in candidates]
+        forced_project_id = clean_text(metronome_project_id)
+        boards = [
+            metronome_service.build_project_board(
+                c,
+                start_date=start_date,
+                end_date=end_date,
+                forced_project_id=forced_project_id,
+            )
+            for c in candidates
+        ]
         boards.sort(key=lambda b: (clean_number((b.get("match_debug") or {}).get("match_score", 0)), len(b.get("rows") or [])), reverse=True)
         best = boards[0]
+        project_catalog: List[Dict[str, Any]] = []
+        seen_catalog_keys: set[str] = set()
+        for board in boards:
+            for option in (board.get("metronome_projects") or []):
+                pid = clean_text(option.get("project_id"))
+                title = clean_text(option.get("project_title"))
+                key = pid or slugify(title)
+                if not key or key in seen_catalog_keys:
+                    continue
+                seen_catalog_keys.add(key)
+                project_catalog.append({
+                    "project_id": pid,
+                    "project_title": title,
+                    "match_score": clean_number(option.get("match_score")),
+                    "source": clean_text(option.get("source")),
+                })
+        project_catalog.sort(key=lambda x: (-clean_number(x.get("match_score")), clean_text(x.get("project_title"))))
+        best["metronome_projects"] = project_catalog
+        best["finance_missions"] = [
+            {
+                "mission_key": slugify(clean_text(m.get("label")) or clean_text(m.get("tag")) or clean_text(m.get("numero")) or f"mission-{idx+1}"),
+                "label": clean_text(m.get("label")) or clean_text(m.get("tag")) or clean_text(m.get("numero")) or f"Mission {idx+1}",
+            }
+            for idx, m in enumerate(item.get("missions") or [])
+            if isinstance(m, dict)
+        ]
+        if clean_text(metronome_project_id):
+            best["selected_metronome_project_id"] = clean_text(metronome_project_id)
+        else:
+            best["selected_metronome_project_id"] = ""
         if isinstance(best.get("match_debug"), dict):
             best["match_debug"]["searched_variants"] = candidates
         return best
     if not name:
         raise HTTPException(status_code=400, detail="affaire_id ou affaire_name requis")
-    return metronome_service.build_project_board(name, start_date=start_date, end_date=end_date)
+    return metronome_service.build_project_board(
+        name,
+        start_date=start_date,
+        end_date=end_date,
+        forced_project_id=clean_text(metronome_project_id),
+    )
 
 
 @app.get("/api/project-management/pointage", response_class=JSONResponse)
-def api_project_management_pointage(affaire_id: str = Query(default=""), affaire_name: str = Query(default="")):
+def api_project_management_pointage(affaire_id: str = Query(default=""), affaire_name: str = Query(default=""), mission_key: str = Query(default="")):
     key = PointageService._project_key(affaire_id, affaire_name)
     if key.endswith("name::"):
         raise HTTPException(status_code=400, detail="affaire_id ou affaire_name requis")
-    return pointage_service.get_project_data(key)
+    return pointage_service.get_project_data(key, mission_key=mission_key)
 
 
 @app.post("/api/project-management/pointage/planning/import", response_class=JSONResponse)
-async def api_project_management_pointage_import_planning(file: UploadFile = File(...), affaire_id: str = Query(default=""), affaire_name: str = Query(default="")):
+async def api_project_management_pointage_import_planning(file: UploadFile = File(...), affaire_id: str = Query(default=""), affaire_name: str = Query(default=""), mission_key: str = Query(default="")):
     key = PointageService._project_key(affaire_id, affaire_name)
     if key.endswith("name::"):
         raise HTTPException(status_code=400, detail="affaire_id ou affaire_name requis")
     raw = await file.read()
-    return pointage_service.import_planning(key, raw)
+    return pointage_service.import_planning(key, raw, mission_key=mission_key)
 
 
 @app.post("/api/project-management/pointage/save", response_class=JSONResponse)
@@ -5121,6 +5437,7 @@ def api_project_management_pointage_save(
     payload: Dict[str, Any] = Body(default={}),
     affaire_id: str = Query(default=""),
     affaire_name: str = Query(default=""),
+    mission_key: str = Query(default=""),
 ):
     key = PointageService._project_key(affaire_id, affaire_name)
     if key.endswith("name::"):
@@ -5129,24 +5446,24 @@ def api_project_management_pointage_save(
     work_state = payload.get("work_state", {}) if isinstance(payload, dict) else {}
     if not isinstance(pointage_patch, dict):
         raise HTTPException(status_code=400, detail="pointage_patch invalide")
-    return pointage_service.save_pointage(key, pointage_patch, work_state)
+    return pointage_service.save_pointage(key, pointage_patch, work_state, mission_key=mission_key)
 
 
 @app.post("/api/project-management/pointage/import-suivi", response_class=JSONResponse)
-async def api_project_management_pointage_import_suivi(file: UploadFile = File(...), affaire_id: str = Query(default=""), affaire_name: str = Query(default="")):
+async def api_project_management_pointage_import_suivi(file: UploadFile = File(...), affaire_id: str = Query(default=""), affaire_name: str = Query(default=""), mission_key: str = Query(default="")):
     key = PointageService._project_key(affaire_id, affaire_name)
     if key.endswith("name::"):
         raise HTTPException(status_code=400, detail="affaire_id ou affaire_name requis")
     raw = await file.read()
-    return pointage_service.import_suivi(key, raw)
+    return pointage_service.import_suivi(key, raw, mission_key=mission_key)
 
 
 @app.get("/api/project-management/pointage/export", response_class=JSONResponse)
-def api_project_management_pointage_export(affaire_id: str = Query(default=""), affaire_name: str = Query(default="")):
+def api_project_management_pointage_export(affaire_id: str = Query(default=""), affaire_name: str = Query(default=""), mission_key: str = Query(default="")):
     key = PointageService._project_key(affaire_id, affaire_name)
     if key.endswith("name::"):
         raise HTTPException(status_code=400, detail="affaire_id ou affaire_name requis")
-    return pointage_service.export_suivi(key)
+    return pointage_service.export_suivi(key, mission_key=mission_key)
 
 
 @app.get("/api/finance/affaire/{affaire_id}/export-csv")
