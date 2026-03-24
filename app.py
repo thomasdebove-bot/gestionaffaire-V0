@@ -30,7 +30,8 @@ DEFAULT_CACHE_FILE = "finance_cache.json"
 WORKBOOK_PATH = os.getenv("ACTIVITE_XLSX_PATH", DEFAULT_WORKBOOK_PATH)
 SHEET_NAME = os.getenv("ACTIVITE_SHEET_NAME", DEFAULT_SHEET_NAME)
 CACHE_FILE = os.getenv("FINANCE_CACHE_FILE", DEFAULT_CACHE_FILE)
-EXPECTED_SCHEMA_VERSION = "finance_affaires_dataset_v4"
+LEGACY_SHEETS = [s.strip() for s in os.getenv("ACTIVITE_LEGACY_SHEETS", "AFFAIRES 2025,AFFAIRES 2024,AFFAIRES 2023").split(",") if s.strip()]
+EXPECTED_SCHEMA_VERSION = "finance_affaires_dataset_v5"
 TEMPO_LOGO_PATH = os.getenv("TEMPO_LOGO_PATH", r"\\192.168.10.100\02 - affaires\02.2 - SYNTHESE\ZZ - METRONOME\Content\T logo.png")
 METRONOME_BASE_PATH = os.getenv("METRONOME_BASE_PATH", r"\\192.168.10.100\02 - affaires\02.2 - SYNTHESE\ZZ - METRONOME")
 POINTAGE_STORE_FILE = Path(os.getenv("POINTAGE_STORE_FILE", "pointage_store.json"))
@@ -1667,26 +1668,29 @@ def row_tuple_to_dict(values: tuple) -> Dict[str, Any]:
 
 
 def anteriorite_from_row(row: Dict[str, Any]) -> float:
-    keys = [
-        "facturation_cumulee_2017",
-        "facturation_cumulee_2018",
-        "facturation_cumulee_2021",
-        "facturation_cumulee_2022",
-        "facturation_cumulee_2023",
-        "facturation_cumulee_2024",
-        "facturation_cumulee_2025",
-    ]
-    return sum(clean_number(row.get(k)) for k in keys)
+    return sum(clean_number(row.get(k)) for k in CUMULE_KEYS)
 
 
 def facture_2026_from_row(row: Dict[str, Any]) -> float:
     return clean_number(row.get("facturation_cumulee_2026"))
 
 
+CUMULE_KEYS = [
+    "facturation_cumulee_2017",
+    "facturation_cumulee_2018",
+    "facturation_cumulee_2021",
+    "facturation_cumulee_2022",
+    "facturation_cumulee_2023",
+    "facturation_cumulee_2024",
+    "facturation_cumulee_2025",
+]
+
+
 class FinanceService:
-    def __init__(self, workbook_path: str, sheet_name: str, cache_file: str) -> None:
+    def __init__(self, workbook_path: str, sheet_name: str, cache_file: str, legacy_sheets: Optional[List[str]] = None) -> None:
         self.workbook_path = workbook_path
         self.sheet_name = sheet_name
+        self.legacy_sheets = [clean_text(s) for s in (legacy_sheets or []) if clean_text(s)]
         self.cache_file = Path(cache_file)
         self._cache: Dict[str, Any] = {
             "status": "idle",
@@ -1765,6 +1769,29 @@ class FinanceService:
 
         ws = wb[self.sheet_name]
         parsed = self.parse_affaires_sheet(ws)
+        merged_from_legacy = 0
+        parsed["meta"]["legacy_sheets_used"] = []
+
+        available_legacy_sheets = self._list_available_legacy_sheets(list(wb.sheetnames))
+        for legacy_sheet in available_legacy_sheets:
+            legacy_ws = wb[legacy_sheet]
+            legacy_parsed = self.parse_affaires_sheet(legacy_ws)
+            merged_from_legacy += self._merge_legacy_affaires(
+                parsed["items"],
+                legacy_parsed["items"],
+                sheet_name=legacy_sheet,
+            )
+            parsed["meta"]["legacy_sheets_used"].append(legacy_sheet)
+
+        missing_legacy = [name for name in self.legacy_sheets if name and name != self.sheet_name and name not in wb.sheetnames]
+        if missing_legacy:
+            parsed["meta"]["warnings"].append(
+                "Onglets historiques introuvables: " + ", ".join(missing_legacy)
+            )
+        if merged_from_legacy:
+            parsed["meta"]["warnings"].append(
+                f"Historique enrichi via {merged_from_legacy} affaire(s) depuis: {', '.join(parsed['meta']['legacy_sheets_used'])}"
+            )
 
         cache = {
             "schema_version": EXPECTED_SCHEMA_VERSION,
@@ -1777,6 +1804,7 @@ class FinanceService:
             "source_path": self.workbook_path,
             "source_mtime": self.source_mtime(),
             "sheet_name": self.sheet_name,
+            "legacy_sheets": parsed["meta"].get("legacy_sheets_used", []),
             "items": parsed["items"],
             "ordered_ids": parsed["ordered_ids"],
         }
@@ -1867,6 +1895,86 @@ class FinanceService:
             "warnings": warnings,
         }
         return {"items": items, "ordered_ids": ordered_ids, "meta": meta}
+
+    def _list_available_legacy_sheets(self, sheetnames: List[str]) -> List[str]:
+        return [name for name in self.legacy_sheets if name and name != self.sheet_name and name in sheetnames]
+
+    def _sheet_year(self, sheet_name: str) -> str:
+        m = re.search(r"(20\d{2})", clean_text(sheet_name))
+        return m.group(1) if m else clean_text(sheet_name) or "legacy"
+
+    def _mission_match_key(self, mission: Dict[str, Any]) -> str:
+        tag = slugify(clean_text(mission.get("tag")))
+        label = slugify(clean_text(mission.get("label")))
+        numero = slugify(clean_text(mission.get("numero")))
+        return "|".join([tag, label, numero])
+
+    def _ensure_historical_monthly(self, affaire: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
+        current = affaire.get("historical_monthly_facture")
+        if isinstance(current, dict):
+            return current
+        affaire["historical_monthly_facture"] = {}
+        return affaire["historical_monthly_facture"]
+
+    def _merge_legacy_affaires(self, current_items: Dict[str, Dict[str, Any]], legacy_items: Dict[str, Dict[str, Any]], sheet_name: str) -> int:
+        updated = 0
+        year_key = self._sheet_year(sheet_name)
+        for affaire_id, current in current_items.items():
+            legacy = legacy_items.get(affaire_id)
+            if not legacy:
+                continue
+            if self._merge_affaire_with_legacy(current, legacy, year_key=year_key):
+                updated += 1
+        return updated
+
+    def _merge_affaire_with_legacy(self, current: Dict[str, Any], legacy: Dict[str, Any], year_key: str) -> bool:
+        changed = False
+
+        monthly = self._ensure_historical_monthly(current)
+        monthly.setdefault(year_key, {m: 0.0 for m in MONTHS})
+        legacy_monthly = legacy.get("mensuel") or {}
+        for month in MONTHS:
+            month_val = clean_number((legacy_monthly.get(month) or {}).get("facture"))
+            if month_val > 0:
+                monthly[year_key][month] = month_val
+                changed = True
+
+        legacy_missions = legacy.get("missions") or []
+        current_missions = current.get("missions") or []
+        existing_keys = {self._mission_match_key(m) for m in current_missions}
+        for legacy_mission in legacy_missions:
+            mission_key = self._mission_match_key(legacy_mission)
+            if mission_key in existing_keys:
+                continue
+            appended = dict(legacy_mission)
+            appended["legacy_source_year"] = year_key
+            current_missions.append(appended)
+            existing_keys.add(mission_key)
+            changed = True
+
+        if changed:
+            self._recompute_affaire_financials(current)
+        return changed
+
+    def _recompute_affaire_financials(self, affaire: Dict[str, Any]) -> None:
+        missions = affaire.get("missions") or []
+        if missions:
+            affaire["anteriorite"] = sum(clean_number(m.get("anteriorite")) for m in missions)
+            affaire["facture_2026"] = sum(clean_number(m.get("facture_2026", m.get("facturation_cumulee_2026"))) for m in missions)
+            affaire["facturation_totale"] = clean_number(affaire.get("anteriorite")) + clean_number(affaire.get("facture_2026"))
+            if abs(clean_number(affaire.get("reste_a_facturer"))) < 1e-9 and abs(clean_number(affaire.get("commande_ht"))) > 1e-9:
+                affaire["reste_a_facturer"] = clean_number(affaire.get("commande_ht")) - clean_number(affaire.get("facturation_totale"))
+        else:
+            affaire["anteriorite"] = sum(clean_number(affaire.get(k)) for k in CUMULE_KEYS)
+            affaire["facture_2026"] = clean_number(affaire.get("facture_2026", affaire.get("facturation_cumulee_2026")))
+            affaire["facturation_totale"] = clean_number(affaire.get("anteriorite")) + clean_number(affaire.get("facture_2026"))
+            if abs(clean_number(affaire.get("reste_a_facturer"))) < 1e-9 and abs(clean_number(affaire.get("commande_ht"))) > 1e-9:
+                affaire["reste_a_facturer"] = clean_number(affaire.get("commande_ht")) - clean_number(affaire.get("facturation_totale"))
+        affaire["taux_avancement_financier"] = (
+            clean_number(affaire.get("facturation_totale")) / clean_number(affaire.get("commande_ht"))
+            if clean_number(affaire.get("commande_ht"))
+            else 0.0
+        )
 
     def _normalize_row(
         self,
@@ -3975,7 +4083,7 @@ class PointageService:
         }
 
 
-service = FinanceService(WORKBOOK_PATH, SHEET_NAME, CACHE_FILE)
+service = FinanceService(WORKBOOK_PATH, SHEET_NAME, CACHE_FILE, legacy_sheets=LEGACY_SHEETS)
 metronome_service = MetronomeService(METRONOME_BASE_PATH)
 pointage_service = PointageService(POINTAGE_STORE_FILE)
 boond_service = BoondService(BOOND_CACHE_DB_PATH)
@@ -4750,7 +4858,59 @@ cardTone('kpiResteCard',a.reste_a_facturer<0?'bad':(a.reste_a_facturer>(a.comman
 cardTone('kpiAvanceCard',a.taux_avancement_financier>0.85?'good':(a.taux_avancement_financier<0.35?'warn':''));
 cardTone('kpiPlanningCard',Number(a.pointage_task_count||0)>0?(Number(a.pointage_progress_ratio||0)>=0.75?'good':Number(a.pointage_progress_ratio||0)<0.35?'warn':''):'warn');}
 function renderProductionPilot(){const a=state.selectedAffaire||{};const fin=Number(a.taux_avancement_financier||0);const prod=Number(a.pointage_progress_ratio||0);const gapPct=(fin-prod)*100;const gapEur=Number(a.pointage_vs_facturation_gap||0);const e1=document.getElementById('prodFinPct');const e2=document.getElementById('prodPointagePct');const e3=document.getElementById('prodGapPct');const e4=document.getElementById('prodGapEur');if(e1)e1.textContent=pct(fin);if(e2)e2.textContent=pct(prod);if(e3)e3.textContent=`${gapPct>=0?'+':''}${gapPct.toFixed(1)} pt`;if(e4)e4.textContent=`${euro(gapEur)} · ${gapEur>=0?'facturation en avance':'production en avance'}`;const t=(state.boondImputation||{}).totals||{};const r=document.getElementById('prodBoondRentability');const rs=document.getElementById('prodBoondRentabilitySub');if(r){const card=document.getElementById('prodBoondRentabilityCard');if((t.total_cost||0)>0 && (a.facturation_totale||0)>0){const rp=((Number(a.facturation_totale)-Number(t.total_cost))/Math.max(Number(t.total_cost),1))*100;r.textContent=`${fmt(rp)}%`;if(rs)rs.textContent='Calculé: (facturé - coût imputations) / coût imputations';if(card){card.style.borderColor=rp>=10?'#8fd5b0':rp>=0?'#f1c171':'#ee9a9a';card.style.background=rp>=10?'linear-gradient(180deg,#ffffff,#ebf9f1)':rp>=0?'linear-gradient(180deg,#ffffff,#fff4e1)':'linear-gradient(180deg,#ffffff,#ffe9e9)';}}else{r.textContent='-';if(rs)rs.textContent='Rentabilité indisponible (facturé ou coût imputé manquant)';if(card){card.style.borderColor='#dbe4f2';card.style.background='linear-gradient(180deg,#fff,#f3f7ff)';}}}}
-function renderFinanceChart(){const root=document.getElementById('monthlyChart');const a=state.selectedAffaire;const h=document.getElementById('historicalBilling');if(!a){if(h)h.textContent='Historique facturé (années antérieures): -';root.innerHTML=`<text x="490" y="160" text-anchor="middle" fill="#6e7a90" font-size="18">Sélectionnez une affaire</text>`;return;}const y2025=Number(a.facturation_cumulee_2025||0);const y2024=Number(a.facturation_cumulee_2024||0);const parts=[];if(y2025>0)parts.push(`2025: ${euro(y2025)}`);if(y2024>0)parts.push(`2024: ${euro(y2024)}`);if(h)h.textContent=`Historique facturé (années antérieures): ${parts.length?parts.join(' · '):'-'}`;const rows=MONTHS.map(m=>({label:MONTH_LABELS[m],pre:Number((((a.mensuel||{})[m]||{}).previsionnel)||0),fac:Number((((a.mensuel||{})[m]||{}).facture)||0)}));const maxVal=Math.max(1,...rows.flatMap(x=>[x.pre,x.fac]));const left=56,top=16,width=880,height=250,step=width/rows.length,groupW=Math.min(66,step*0.72),barW=Math.max(10,(groupW-8)/2);let grid='',bars='',labels='';for(let i=0;i<=4;i++){const y=top+(height/4)*i,val=Math.round(maxVal*(1-i/4));grid+=`<line x1="${left}" y1="${y}" x2="${left+width}" y2="${y}" stroke="#d8e1ef" stroke-width="1"/><text x="${left-10}" y="${y+4}" text-anchor="end" fill="#6f7f97" font-size="12">${fmt(val)}</text>`;}rows.forEach((it,i)=>{const gx=left+i*step+(step-groupW)/2;const preH=(it.pre/maxVal)*height;const facH=(it.fac/maxVal)*height;const preY=top+height-preH;const facY=top+height-facH;bars+=`<rect x="${gx}" y="${preY}" width="${barW}" height="${Math.max(preH,1)}" rx="6" fill="#cfdcf6" stroke="#b5c7eb" stroke-width="1"><title>${it.label} prévisionnel: ${euro(it.pre)}</title></rect>`;bars+=`<rect x="${gx+barW+8}" y="${facY}" width="${barW}" height="${Math.max(facH,1)}" rx="6" fill="#ef8d00" stroke="#d87800" stroke-width="1"><title>${it.label} facturation: ${euro(it.fac)}</title></rect>`;labels+=`<text x="${gx+groupW/2}" y="${top+height+22}" text-anchor="middle" fill="#5f6f88" font-size="12">${it.label}</text>`;});root.innerHTML=`${grid}<line x1="${left}" y1="${top+height}" x2="${left+width}" y2="${top+height}" stroke="#b8c3d4" stroke-width="1.2"/>${bars}${labels}`;}
+function renderFinanceChart(){
+  const root=document.getElementById('monthlyChart');
+  const a=state.selectedAffaire;
+  const h=document.getElementById('historicalBilling');
+  if(!a){
+    if(h)h.textContent='Historique facturé (années antérieures): -';
+    root.innerHTML=`<text x="490" y="160" text-anchor="middle" fill="#6e7a90" font-size="18">Sélectionnez une affaire</text>`;
+    return;
+  }
+
+  const history=(a.historical_monthly_facture||{});
+  const years=Object.keys(history||{}).filter(y=>/^20\d{2}$/.test(String(y||''))).sort();
+  const currentYear=String(new Date().getFullYear());
+  const allYears=[...years];
+  if(!allYears.includes(currentYear))allYears.push(currentYear);
+
+  const rows=[];
+  allYears.forEach(y=>{
+    MONTHS.forEach(m=>{
+      const isCurrent=y===currentYear;
+      const pre=isCurrent?Number((((a.mensuel||{})[m]||{}).previsionnel)||0):0;
+      const fac=isCurrent
+        ?Number((((a.mensuel||{})[m]||{}).facture)||0)
+        :Number((((history||{})[y]||{})[m]||0));
+      rows.push({label:`${MONTH_LABELS[m]} ${y.slice(2)}`,pre,fac,year:y,isCurrent});
+    });
+  });
+  const historyTotals=years.map(y=>({year:y,total:MONTHS.reduce((s,m)=>s+Number((((history||{})[y]||{})[m]||0),0)})).filter(x=>x.total>0);
+  if(h)h.textContent=`Historique facturé (années antérieures): ${historyTotals.length?historyTotals.map(x=>`${x.year}: ${euro(x.total)}`).join(' · '):'-'}`;
+
+  const maxVal=Math.max(1,...rows.flatMap(x=>[x.pre,x.fac]));
+  const left=56,top=16,width=880,height=250,step=width/Math.max(1,rows.length),groupW=Math.min(36,step*0.82),barW=Math.max(4,(groupW-3)/2);
+  let grid='',bars='',labels='';
+  for(let i=0;i<=4;i++){
+    const y=top+(height/4)*i,val=Math.round(maxVal*(1-i/4));
+    grid+=`<line x1="${left}" y1="${y}" x2="${left+width}" y2="${y}" stroke="#d8e1ef" stroke-width="1"/><text x="${left-10}" y="${y+4}" text-anchor="end" fill="#6f7f97" font-size="12">${fmt(val)}</text>`;
+  }
+  rows.forEach((it,i)=>{
+    const gx=left+i*step+(step-groupW)/2;
+    const preH=(it.pre/maxVal)*height;
+    const facH=(it.fac/maxVal)*height;
+    const preY=top+height-preH;
+    const facY=top+height-facH;
+    bars+=`<rect x="${gx}" y="${preY}" width="${barW}" height="${Math.max(preH,1)}" rx="3" fill="#cfdcf6" stroke="#b5c7eb" stroke-width="1"><title>${it.label} prévisionnel: ${euro(it.pre)}</title></rect>`;
+    bars+=`<rect x="${gx+barW+3}" y="${facY}" width="${barW}" height="${Math.max(facH,1)}" rx="3" fill="${it.isCurrent?'#ef8d00':'#f3b35a'}" stroke="#d87800" stroke-width="1"><title>${it.label} facturation: ${euro(it.fac)}</title></rect>`;
+    if(i%2===0)labels+=`<text x="${gx+groupW/2}" y="${top+height+22}" text-anchor="middle" fill="#5f6f88" font-size="10">${it.label}</text>`;
+    if(i>0&&rows[i-1].year!==it.year){
+      const sepX=left+i*step;
+      bars+=`<line x1="${sepX}" y1="${top}" x2="${sepX}" y2="${top+height}" stroke="#ccd7e8" stroke-width="1" stroke-dasharray="3 4"/>`;
+    }
+  });
+  root.innerHTML=`${grid}<line x1="${left}" y1="${top+height}" x2="${left+width}" y2="${top+height}" stroke="#b8c3d4" stroke-width="1.2"/>${bars}${labels}`;
+}
 function renderCumulativeChart(){const root=document.getElementById('cumulativeChart');const a=state.selectedAffaire;if(!a){root.innerHTML="<div class='small'>Sélectionnez une affaire.</div>";return;}const pre=Number(a.reste_a_facturer||0);const fac=Number(a.facturation_totale||0);const max=Math.max(1,pre,fac);const prePct=(pre/max)*100;const facPct=(fac/max)*100;const delta=fac-pre;root.innerHTML=`<div class='cum-row'><div><strong>Prévisionnel cumulé</strong><div class='small'>Reste à facturer</div></div><div class='cum-track'><div class='cum-fill cum-pre' style='width:${prePct}%'></div></div><div><strong>${euro(pre)}</strong></div></div><div class='cum-row'><div><strong>Facturation cumulée</strong><div class='small'>Depuis le début · Écart: ${euro(delta)}</div></div><div class='cum-track'><div class='cum-fill cum-fac' style='width:${facPct}%'></div></div><div><strong>${euro(fac)}</strong></div></div>`;}
 function renderMonthlyTable(){const root=document.getElementById('monthlyTableWrap');const a=state.selectedAffaire;if(!a){root.innerHTML=`<div class='empty'>Sélectionnez une affaire pour afficher le détail mensuel.</div>`;return;}const ordered=[...MONTHS];const showAll=(state.monthlyExpanded===true);const visible=showAll?ordered:ordered.slice(0,6);let rows='';visible.forEach(m=>{const pre=Number((((a.mensuel||{})[m]||{}).previsionnel)||0),fac=Number((((a.mensuel||{})[m]||{}).facture)||0),ec=fac-pre;rows+=`<tr><td>${MONTH_LABELS[m]}</td><td class='num'>${euro(pre)}</td><td class='num'>${euro(fac)}</td><td class='num delta ${ec>=0?'pos':'neg'}'>${euro(ec)}</td></tr>`;});rows+=`<tr><td><strong>Total</strong></td><td class='num'><strong>${euro(a.total_previsionnel||0)}</strong></td><td class='num'><strong>${euro(a.total_facture||0)}</strong></td><td class='num delta ${Number(a.ecart_previsionnel_vs_facture||0)>=0?'pos':'neg'}'><strong>${euro(a.ecart_previsionnel_vs_facture||0)}</strong></td></tr>`;const btn=ordered.length>6?`<div style='padding:8px'><button id='btnToggleMonths' class='btn' type='button'>${showAll?'Voir moins':"Voir toute l'année"}</button></div>`:'';root.innerHTML=`<table><thead><tr><th>Mois</th><th class='num'>Prévisionnel</th><th class='num'>Facturé</th><th class='num'>Écart</th></tr></thead><tbody>${rows}</tbody></table>${btn}`;const t=document.getElementById('btnToggleMonths');if(t)t.addEventListener('click',()=>{state.monthlyExpanded=!state.monthlyExpanded;renderMonthlyTable();});}
 function renderMissions(){const root=document.getElementById('missionsTableWrap');const meta=document.getElementById('missionsMeta');if(!root||!meta)return;const a=state.selectedAffaire;if(!a){meta.textContent='0 mission';root.innerHTML=`<div class='empty'>Sélectionnez une affaire pour afficher les missions.</div>`;return;}const missions=a.missions||[];meta.textContent=`${missions.length} mission(s)`;if(!missions.length){root.innerHTML=`<div class='empty'>Aucune mission détaillée sur cette affaire.</div>`;return;}root.innerHTML=`<table><thead><tr><th>Tag</th><th>Mission</th><th>N°</th><th class='num'>Commande</th><th class='num'>🧾 Facturation totale</th><th class='num'>Reste</th><th class='num'>Prévisionnel</th><th class='num'>Facturé</th></tr></thead><tbody>${missions.map(m=>`<tr><td>${esc(m.tag||'')}</td><td>${esc(m.label||'')}</td><td>${esc(m.numero||'')}</td><td class='num'>${euro(m.commande_ht)}</td><td class='num'>${euro(m.facturation_totale||((m.anteriorite||0)+(m.facture_2026||m.facturation_cumulee_2026||0)))}</td><td class='num'>${euro(m.reste_a_facturer)}</td><td class='num'>${euro(m.total_previsionnel)}</td><td class='num'>${euro(m.total_facture)}</td></tr>`).join('')}</tbody></table>`;}
