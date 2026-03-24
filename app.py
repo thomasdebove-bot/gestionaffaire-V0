@@ -2433,6 +2433,44 @@ class MetronomeService:
                 score = max(score, min(token_score, 95))
         return score
 
+    def _collect_project_name_matches(self, projects: List[Dict[str, str]], project_name: str) -> List[Dict[str, Any]]:
+        target_name = clean_text(project_name)
+        target_slug = slugify(target_name)
+        target_tokens = self._tokenize_project_name(target_name)
+        if not target_slug:
+            return []
+        out: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for project in projects:
+            project_row_id = self._row_id(project)
+            title = self._get_first_value(project, METRONOME_COLUMN_ALIASES["project_title_projects"])
+            name = self._get_first_value(project, METRONOME_COLUMN_ALIASES["project_name_projects"])
+            for candidate_name in [title, name]:
+                local_name = clean_text(candidate_name)
+                if not local_name:
+                    continue
+                local_slug = slugify(local_name)
+                local_tokens = self._tokenize_project_name(local_name)
+                score = self._score_project_match(target_slug, target_tokens, local_name)
+                has_name_hit = bool(
+                    (target_slug and local_slug and (target_slug in local_slug or local_slug in target_slug))
+                    or (target_tokens and local_tokens and len(target_tokens & local_tokens) >= 1)
+                )
+                if not has_name_hit:
+                    continue
+                key = project_row_id or slugify(local_name)
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                out.append({
+                    "project_id": clean_text(project_row_id),
+                    "project_title": local_name,
+                    "match_score": int(score),
+                    "source": "name_match",
+                })
+        out.sort(key=lambda x: (-clean_number(x.get("match_score")), clean_text(x.get("project_title"))))
+        return out
+
     def _resolve_project(self, projects: List[Dict[str, str]], entries: List[Dict[str, str]], project_name: str) -> Dict[str, Any]:
         target_name = clean_text(project_name)
         target_slug = slugify(target_name)
@@ -2534,7 +2572,14 @@ class MetronomeService:
             })
         return resolved
 
-    def build_project_board(self, project_name: str, start_date: str = "", end_date: str = "") -> Dict[str, Any]:
+    def build_project_board(
+        self,
+        project_name: str,
+        start_date: str = "",
+        end_date: str = "",
+        forced_project_id: str = "",
+        forced_project_title: str = "",
+    ) -> Dict[str, Any]:
         cache = self._ensure_loaded()
         t = cache.get("tables", {})
         projects = t.get("projects", [])
@@ -2582,6 +2627,17 @@ class MetronomeService:
         match_debug = self._resolve_project(projects, entries, target)
         resolved_title = clean_text(match_debug.get("resolved_project_title"))
         resolved_id = clean_text(match_debug.get("resolved_project_id"))
+        forced_id = clean_text(forced_project_id)
+        forced_title = clean_text(forced_project_title)
+        if forced_id:
+            resolved_id = forced_id
+            match_debug["resolved_project_id"] = forced_id
+            match_debug["resolution_mode"] = "forced_project_id"
+        if forced_title:
+            resolved_title = forced_title
+            match_debug["resolved_project_title"] = forced_title
+            if not forced_id:
+                match_debug["resolution_mode"] = "forced_project_title"
 
         project_info: Dict[str, str] = {}
         if resolved_title:
@@ -2602,15 +2658,66 @@ class MetronomeService:
                         match_debug["resolved_project_title"] = resolved_title
                     break
 
+        metronome_projects: List[Dict[str, Any]] = []
+        metronome_seen: set[str] = set()
+
+        def register_metronome_project(pid: str, title: str, score: int = 0, source: str = ""):
+            local_pid = clean_text(pid)
+            local_title = clean_text(title)
+            key = local_pid or slugify(local_title)
+            if not key or key in metronome_seen:
+                return
+            metronome_seen.add(key)
+            metronome_projects.append({
+                "project_id": local_pid,
+                "project_title": local_title or local_pid,
+                "match_score": int(score or 0),
+                "source": source or "match",
+            })
+
+        for candidate in (match_debug.get("best_project_candidates") or []):
+            register_metronome_project(
+                clean_text(candidate.get("project_id")),
+                clean_text(candidate.get("project_name")),
+                clean_number(candidate.get("score")),
+                "projects",
+            )
+        for candidate in (match_debug.get("best_entry_candidates") or []):
+            register_metronome_project(
+                clean_text(candidate.get("project_id")),
+                clean_text(candidate.get("project_name")),
+                clean_number(candidate.get("score")),
+                "entries",
+            )
+        for candidate in self._collect_project_name_matches(projects, target):
+            register_metronome_project(
+                clean_text(candidate.get("project_id")),
+                clean_text(candidate.get("project_title")),
+                clean_number(candidate.get("match_score")),
+                clean_text(candidate.get("source")),
+            )
+
+        matched_project_ids = [clean_text(p.get("project_id")) for p in metronome_projects if clean_text(p.get("project_id"))]
+        matched_project_ids = [pid for i, pid in enumerate(matched_project_ids) if pid and pid not in matched_project_ids[:i]]
+        selected_project_ids: set[str] = set()
+        if forced_id:
+            selected_project_ids = {forced_id}
+        elif matched_project_ids:
+            selected_project_ids = set(matched_project_ids)
+        elif resolved_id:
+            selected_project_ids = {resolved_id}
+
+        display_target = re.split(r"\s*[-—]\s*", target, maxsplit=1)[0].strip() if target else ""
         if not resolved_title and not resolved_id:
             return {
                 "ok": False,
-                "project_name": target,
+                "project_name": display_target or target,
                 "reason": "project_not_found",
                 "confidence_level": "low",
                 "warning": True,
                 "warning_message": "Aucune correspondance projet fiable trouvée",
                 "match_debug": match_debug,
+                "metronome_projects": metronome_projects,
                 "missing_files": cache.get("missing", []),
                 "loaded_at": cache.get("loaded_at"),
             }
@@ -2619,7 +2726,7 @@ class MetronomeService:
         today = datetime.now().date()
         rows_filtered_by_title = 0
         rows_filtered_by_id = 0
-        filter_mode = "id" if resolved_id else "title"
+        filter_mode = "id_multi" if len(selected_project_ids) > 1 else ("id" if selected_project_ids else "title")
         match_debug["filter_mode"] = filter_mode
 
         def parse_date(value: str) -> Optional[date]:
@@ -2640,8 +2747,8 @@ class MetronomeService:
             entry_project_id = self._get_first_value(e, METRONOME_COLUMN_ALIASES["entry_project_id"])
 
             use_row = False
-            if resolved_id:
-                if entry_project_id == resolved_id:
+            if selected_project_ids:
+                if entry_project_id in selected_project_ids:
                     rows_filtered_by_id += 1
                     use_row = True
             elif resolved_title and entry_project_title == resolved_title:
@@ -3228,10 +3335,14 @@ class MetronomeService:
         warning = bool(match_debug.get("resolution_mode") == "entries_fallback" or not project_info)
         warning_message = "Projet trouvé via entrées METRONOME (fallback)" if warning else ""
 
-        project_display_name = resolved_title or target
+        project_display_name_raw = resolved_title or target
+        project_display_name = re.split(r"\s*[-—]\s*", project_display_name_raw, maxsplit=1)[0].strip() or project_display_name_raw
         project_id = resolved_id or self._row_id(project_info)
         project_image = self._get_first_value(project_info, METRONOME_COLUMN_ALIASES["project_image"])
         project_description = self._get_first_value(project_info, METRONOME_COLUMN_ALIASES["project_description"])
+        register_metronome_project(resolved_id, project_display_name, clean_number(match_debug.get("match_score")), "selected")
+        metronome_projects.sort(key=lambda x: (-clean_number(x.get("match_score")), clean_text(x.get("project_title"))))
+        selected_metronome_project_id = forced_id if forced_id else ""
         return {
             "ok": True,
             "project_name": project_display_name,
@@ -3242,6 +3353,9 @@ class MetronomeService:
             "warning": warning,
             "warning_message": warning_message,
             "match_debug": match_debug,
+            "metronome_projects": metronome_projects,
+            "selected_metronome_project_id": selected_metronome_project_id,
+            "selected_metronome_project_ids": sorted(selected_project_ids),
             "kpis_meeting_simple": meeting_simple_kpis,
             "kpis": {
                 "open_topics": len(open_tasks_today),
@@ -4597,7 +4711,7 @@ def gestion_projet_html() -> str:
 
   <div id='sectionPilot' class='section'>
     <div class='pilot-box'>
-      <h3 style='margin:0 0 10px'>PILOTAGE METRONOME</h3>
+      <div style='display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap'><h3 style='margin:0'>PILOTAGE METRONOME</h3><div class='chart-controls' style='margin:0'><label for='gpMetronomeProjectPickerPilot' class='small'>Projet METRONOME :</label><select id='gpMetronomeProjectPickerPilot' class='chart-select'><option value=''>Projet principal</option></select></div></div>
       <div class='pilot-grid'>
         <div class='pilot-card'><div class='t'>Rappels ouverts à date</div><div id='kRappelsDate' class='v'>0</div></div>
         <div class='pilot-card'><div class='t'>À suivre ouverts</div><div id='kASuivre' class='v'>0</div></div>
@@ -4611,6 +4725,8 @@ def gestion_projet_html() -> str:
   <div id='sectionCompany' class='section'>
     <h3>Niveau 2 — ANALYSE METRONOME</h3>
     <div class='chart-controls'>
+      <label for='gpMetronomeProjectPickerAnalysis' class='small'>Projet METRONOME :</label>
+      <select id='gpMetronomeProjectPickerAnalysis' class='chart-select'><option value=''>Projet principal</option></select>
       <label for='companyMetric' class='small'>Afficher :</label>
       <select id='companyMetric' class='chart-select'>
         <option value='open'>Tâches ouvertes par entreprise</option>
@@ -4681,10 +4797,11 @@ def gestion_projet_html() -> str:
 
 </div>
 <script>
-const state={affaires:[],selectedId:'',selectedLabel:'',board:null,pointage:null};
+const state={affaires:[],selectedId:'',selectedLabel:'',board:null,pointage:null,metronomeProjectId:''};
 function resolveAffaire(input){const raw=String(input||'').trim();if(!raw)return null;const low=raw.toLowerCase();const slug=raw.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g,'').replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'');return (state.affaires||[]).find(a=>String(a.affaire_id||'')===raw)|| (state.affaires||[]).find(a=>String(a.display_name||'').toLowerCase()===low)|| (state.affaires||[]).find(a=>String(a.display_name||'').toLowerCase().startsWith(low))|| (state.affaires||[]).find(a=>String((a.display_name||'').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g,'').replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,''))===slug)||null;}
 function esc(v){return String(v??'').replace(/[&<>]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[ch]||ch));}
 function escAttr(v){return String(v??'').replace(/[&<>'"]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]||ch));}
+function trimProjectName(v){const raw=String(v||'').trim();if(!raw)return raw;return raw.split(/[-—]/)[0].trim()||raw;}
 async function api(u){const r=await fetch(u);const d=await r.json();if(!r.ok) throw new Error(d.detail||'Erreur API');return d;}
 function renderBars(id,items){const root=document.getElementById(id);if(!root)return;if(!items||!items.length){root.innerHTML="<div class='small'>Aucune donnée</div>";return;}const max=Math.max(1,...items.map(x=>Number(x.count||0)));root.innerHTML=items.map(x=>`<div style='margin:8px 0'><div style='display:flex;justify-content:space-between;gap:8px'><span>${esc(x.label)}</span><strong>${x.count}</strong></div><div class='bar'><div class='fill' style='width:${(Number(x.count||0)/max)*100}%'></div></div></div>`).join('');}
 function renderTable(rows){const root=document.getElementById('boardTable');if(!root)return;if(!rows||!rows.length){root.innerHTML="<div class='small' style='padding:12px'>Aucun sujet ouvert.</div>";return;}root.innerHTML=`<table><thead><tr><th>Zone</th><th>Lot</th><th>Sujet</th><th>Entreprise</th><th>Responsable</th><th>Statut</th><th>Date échéance</th><th>Réunion origine</th><th>Commentaire</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${esc(r.zone)}</td><td>${esc(r.lot)}</td><td>${esc(r.sujet)}</td><td>${esc(r.entreprise)}</td><td>${esc(r.responsable)}</td><td>${esc(r.statut)}</td><td>${esc(r.date_echeance)}</td><td>${esc(r.reunion_origine)}</td><td>${esc(r.commentaire)}</td></tr>`).join('')}</tbody></table>`;}
@@ -4719,9 +4836,11 @@ function companyLogoHtml(item){const name=item.name||item.label||'';const logo=i
 function showReminderModal(company,b){const p=(b&&b.kpis_pilotage)||{};const norm=v=>String(v||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').trim();const items=(p.reminders_open_items||[]).filter(x=>norm(x.company)===norm(company)).filter(x=>reminderWeeks(x.deadline)>0);const body=document.getElementById('reminderModalBody');const title=document.getElementById('reminderModalTitle');if(title)title.textContent=`Rappels ouverts - ${company}`;if(!body)return;if(!items.length){body.innerHTML="<div class='small' style='padding:10px'>Aucun rappel ouvert.</div>";}else{const byPer={};for(const it of items){const k=it.perimetre||'Général';(byPer[k]=byPer[k]||[]).push(it);}let html='';for(const per of Object.keys(byPer).sort()){html+=`<h4 style='margin:10px 0 6px'>${esc(per)}</h4><table class='reminder-modal-table'><thead><tr><th style='width:100%'>Tâche</th><th>Échéance</th><th>Rappel</th></tr></thead><tbody>${byPer[per].map(r=>{const w=reminderWeeks(r.deadline);const warn=`<span style='color:#d64545;font-weight:800;white-space:nowrap'>Rappel ${w}</span>`;return `<tr><td>${esc(r.task||'')}</td><td>${esc(fmtDateFrShort(r.deadline||''))}</td><td>${warn}</td></tr>`;}).join('')}</tbody></table>`;}body.innerHTML=html;}const modal=document.getElementById('reminderModal');if(modal)modal.style.display='flex';}
 function hideReminderModal(){const modal=document.getElementById('reminderModal');if(modal)modal.style.display='none';}
 function openBoardWindow(){if(!state.selectedId)return;const url=`/dashboard-board?affaire_id=${encodeURIComponent(state.selectedId)}`;window.open(url,'_blank','noopener,noreferrer,width=1440,height=960');}
-async function loadBoard(id){const requested=id||state.selectedId||'';if(!requested){state.selectedId='';state.selectedLabel='';state.board=null;renderBoard();return;}const selected=resolveAffaire(requested);const aid=(selected&&selected.affaire_id)||requested;state.selectedId=aid;const sel=document.getElementById('affaireSelect');if(sel)sel.value=aid;state.selectedLabel=(selected&&selected.display_name)||state.selectedLabel||'';localStorage.setItem('selectedAffaireId',aid);showLoading(true,'Chargement de la vue projet…');try{let b;try{b=await api(`/api/project-management/board?affaire_id=${encodeURIComponent(aid)}`);}catch(errById){const msg=String((errById&&errById.message)||'');if(state.selectedLabel&&(msg.includes('Affaire introuvable')||msg.includes('affaire_id ou affaire_name requis')||msg.includes('404'))){const alt=String(state.selectedLabel||'').split(' - ').slice(-1)[0]||state.selectedLabel;b=await api(`/api/project-management/board?affaire_name=${encodeURIComponent(alt)}`);}else{throw errById;}}state.board=b;renderBoard();}catch(err){console.error(err);state.board=null;renderBoard();showPageError(err);}finally{showLoading(false);}}
-function renderMatchDebug(b){const md=(b&&b.match_debug)||{};const box=document.getElementById('matchBox');const status=document.getElementById('matchStatus');const reason=document.getElementById('matchReason');if(box){box.className=`match-box ${(b&&b.warning)?'warn':'ok'}`;}if(status){const conf=(b&&b.confidence_level)||'low';status.innerHTML=`Diagnostic de matching METRONOME <span class='conf-badge'>${esc(conf)}</span>`;}if(reason){reason.textContent=(b&&b.warning_message)||((b&&b.project_name)?`Projet chargé : ${b.project_name}`:'Aucune affaire sélectionnée.');}setHtml('matchSearchName',`<b>Projet recherché</b>${esc(md.searched_project_name||'-')}`);setHtml('matchSearchSlug',`<b>Slug recherché</b><span class='mono'>${esc(md.searched_project_slug||'-')}</span>`);setHtml('matchFoundName',`<b>Projet matché</b>${esc(md.matched_project_name||'-')}`);setHtml('matchFoundSlug',`<b>Slug matché</b><span class='mono'>${esc(md.matched_project_slug||'-')}</span>`);setHtml('matchResolvedTitle',`<b>Projet résolu (title)</b>${esc(md.resolved_project_title||'-')}`);setHtml('matchResolutionMode',`<b>Mode de résolution</b>${esc(md.resolution_mode||'-')}`);setHtml('matchScore',`<b>Score de match</b>${esc(String(md.match_score??'-'))}`);setHtml('rowsByTitle',`<b>Lignes filtrées par titre</b>${esc(String(md.rows_filtered_by_title??'-'))}`);setHtml('rowsById',`<b>Lignes filtrées par ID</b>${esc(String(md.rows_filtered_by_id??'-'))}`);const miss=((b&&b.missing_files)||[]);setHtml('missingFiles',`<b>Fichiers CSV manquants</b>${esc(miss.length?miss.join(', '):'-')}`);} 
-function renderBoard(){const b=state.board||{};const p=(b&&b.kpis_pilotage)||{};const k=(b&&b.kpis)||{};const hasMatch=!!((b&&b.match_debug&&((b.match_debug.matched_project_name||'')||(Number(b.match_debug.match_score||0)>0)))&&!b.warning);const secPilot=document.getElementById('sectionPilot');const secCompany=document.getElementById('sectionCompany');if(secPilot)secPilot.style.display=hasMatch?'block':'none';if(secCompany)secCompany.style.display=hasMatch?'block':'none';setText('projectTitle',b.project_name||'-');setText('projectDesc',b.project_description||'-');const img=document.getElementById('projectImage');if(img){const src=String(b.project_image||'').trim();if(src){img.src=src;img.style.display='block';}else{img.removeAttribute('src');img.style.display='none';}}renderMatchDebug(b);setText('kOpen',Number(k.open_topics||0));setText('kLate',Number(k.overdue_topics||0));setText('kTopRappels',Number(p.reminders_open_count||0));setText('kTopASuivre',Number(p.a_suivre_ouverts||p.followups_open_count||0));setText('kDateRef',p.date_reference||p.reference_date||'-');setText('kRappelsDate',Number(p.rappels_ouverts_a_date||p.reminders_open_count||0));setText('kASuivre',Number(p.a_suivre_ouverts||p.followups_open_count||0));renderTable(b.rows||[]);renderProjectTimeline(b);renderCompanyChart(b);renderReactivity(b);const companyRows=(p.rappels_cumules_par_entreprise||p.reminders_by_company||[]);setHtml('pilotByCompany',companyRows.length?companyRows.map(r=>{const nm=r.name||r.company||'';return `<button class='pilot-row-btn pilot-row' data-company='${esc(nm)}'><span class='company-cell'>${companyLogoHtml({name:nm,logo:r.logo||''})}<span class='name'>${esc(nm)}</span></span><span><strong>${Number(r.count||0)}</strong> rappels</span></button>`;}).join(''):"<div class='small'>Aucune donnée</div>");Array.from(document.querySelectorAll('.pilot-row-btn')).forEach(btn=>btn.addEventListener('click',()=>showReminderModal(btn.getAttribute('data-company')||'',b)));}
+function renderMetronomeProjectPickers(board){const options=(board&&board.metronome_projects)||[];const selected=String((board&&board.selected_metronome_project_id)||state.metronomeProjectId||'');const html=`<option value=''>Projet principal</option>${options.map(opt=>{const id=String(opt.project_id||'').trim();const label=String(opt.project_title||opt.project_id||'Projet').trim();return `<option value='${esc(id)}' ${id===selected?'selected':''}>${esc(label)}</option>`;}).join('')}`;['gpMetronomeProjectPickerPilot','gpMetronomeProjectPickerAnalysis'].forEach(id=>{const el=document.getElementById(id);if(el){el.innerHTML=html;el.value=selected;}});}
+function bindMetronomeProjectPickers(){['gpMetronomeProjectPickerPilot','gpMetronomeProjectPickerAnalysis'].forEach(id=>{const el=document.getElementById(id);if(!el||el.dataset.bound==='1')return;el.dataset.bound='1';el.addEventListener('change',async()=>{state.metronomeProjectId=el.value||'';['gpMetronomeProjectPickerPilot','gpMetronomeProjectPickerAnalysis'].forEach(otherId=>{const other=document.getElementById(otherId);if(other&&other!==el)other.value=state.metronomeProjectId;});await loadBoard(state.selectedId||'');});});}
+async function loadBoard(id){const requested=id||state.selectedId||'';if(!requested){state.selectedId='';state.selectedLabel='';state.board=null;renderBoard();return;}const selected=resolveAffaire(requested);const aid=(selected&&selected.affaire_id)||requested;if(String(aid)!==String(state.selectedId||'')){state.metronomeProjectId='';}state.selectedId=aid;const sel=document.getElementById('affaireSelect');if(sel)sel.value=aid;state.selectedLabel=(selected&&selected.display_name)||state.selectedLabel||'';localStorage.setItem('selectedAffaireId',aid);showLoading(true,'Chargement de la vue projet…');try{let b;const projectParam=state.metronomeProjectId?`&metronome_project_id=${encodeURIComponent(state.metronomeProjectId)}`:'';try{b=await api(`/api/project-management/board?affaire_id=${encodeURIComponent(aid)}${projectParam}`);}catch(errById){const msg=String((errById&&errById.message)||'');if(state.selectedLabel&&(msg.includes('Affaire introuvable')||msg.includes('affaire_id ou affaire_name requis')||msg.includes('404'))){const alt=String(state.selectedLabel||'').split(' - ').slice(-1)[0]||state.selectedLabel;b=await api(`/api/project-management/board?affaire_name=${encodeURIComponent(alt)}${projectParam}`);}else{throw errById;}}state.board=b;renderBoard();}catch(err){console.error(err);state.board=null;renderBoard();showPageError(err);}finally{showLoading(false);}}
+function renderMatchDebug(b){const md=(b&&b.match_debug)||{};const box=document.getElementById('matchBox');const status=document.getElementById('matchStatus');const reason=document.getElementById('matchReason');if(box){box.className=`match-box ${(b&&b.warning)?'warn':'ok'}`;}if(status){const conf=(b&&b.confidence_level)||'low';status.innerHTML=`Diagnostic de matching METRONOME <span class='conf-badge'>${esc(conf)}</span>`;}if(reason){reason.textContent=(b&&b.warning_message)||((b&&b.project_name)?`Projet chargé : ${trimProjectName(b.project_name)}`:'Aucune affaire sélectionnée.');}setHtml('matchSearchName',`<b>Projet recherché</b>${esc(trimProjectName(md.searched_project_name||'-'))}`);setHtml('matchSearchSlug',`<b>Slug recherché</b><span class='mono'>${esc(md.searched_project_slug||'-')}</span>`);setHtml('matchFoundName',`<b>Projet matché</b>${esc(trimProjectName(md.matched_project_name||'-'))}`);setHtml('matchFoundSlug',`<b>Slug matché</b><span class='mono'>${esc(md.matched_project_slug||'-')}</span>`);setHtml('matchResolvedTitle',`<b>Projet résolu (title)</b>${esc(trimProjectName(md.resolved_project_title||'-'))}`);setHtml('matchResolutionMode',`<b>Mode de résolution</b>${esc(md.resolution_mode||'-')}`);setHtml('matchScore',`<b>Score de match</b>${esc(String(md.match_score??'-'))}`);setHtml('rowsByTitle',`<b>Lignes filtrées par titre</b>${esc(String(md.rows_filtered_by_title??'-'))}`);setHtml('rowsById',`<b>Lignes filtrées par ID</b>${esc(String(md.rows_filtered_by_id??'-'))}`);const miss=((b&&b.missing_files)||[]);setHtml('missingFiles',`<b>Fichiers CSV manquants</b>${esc(miss.length?miss.join(', '):'-')}`);} 
+function renderBoard(){const b=state.board||{};const p=(b&&b.kpis_pilotage)||{};const k=(b&&b.kpis)||{};const hasMatch=!!((b&&b.match_debug&&((b.match_debug.matched_project_name||'')||(Number(b.match_debug.match_score||0)>0)))&&!b.warning);const secPilot=document.getElementById('sectionPilot');const secCompany=document.getElementById('sectionCompany');if(secPilot)secPilot.style.display=hasMatch?'block':'none';if(secCompany)secCompany.style.display=hasMatch?'block':'none';renderMetronomeProjectPickers(b);setText('projectTitle',trimProjectName(b.project_name||'-'));setText('projectDesc',b.project_description||'-');const img=document.getElementById('projectImage');if(img){const src=String(b.project_image||'').trim();if(src){img.src=src;img.style.display='block';}else{img.removeAttribute('src');img.style.display='none';}}renderMatchDebug(b);setText('kOpen',Number(k.open_topics||0));setText('kLate',Number(k.overdue_topics||0));setText('kTopRappels',Number(p.reminders_open_count||0));setText('kTopASuivre',Number(p.a_suivre_ouverts||p.followups_open_count||0));setText('kDateRef',p.date_reference||p.reference_date||'-');setText('kRappelsDate',Number(p.rappels_ouverts_a_date||p.reminders_open_count||0));setText('kASuivre',Number(p.a_suivre_ouverts||p.followups_open_count||0));renderTable(b.rows||[]);renderProjectTimeline(b);renderCompanyChart(b);renderReactivity(b);const companyRows=(p.rappels_cumules_par_entreprise||p.reminders_by_company||[]);setHtml('pilotByCompany',companyRows.length?companyRows.map(r=>{const nm=r.name||r.company||'';return `<button class='pilot-row-btn pilot-row' data-company='${esc(nm)}'><span class='company-cell'>${companyLogoHtml({name:nm,logo:r.logo||''})}<span class='name'>${esc(nm)}</span></span><span><strong>${Number(r.count||0)}</strong> rappels</span></button>`;}).join(''):"<div class='small'>Aucune donnée</div>");Array.from(document.querySelectorAll('.pilot-row-btn')).forEach(btn=>btn.addEventListener('click',()=>showReminderModal(btn.getAttribute('data-company')||'',b)));}
 function showPageError(err){const root=document.getElementById('boardTable');if(root)root.innerHTML=`<div class='small' style='padding:12px;color:#b42318'>${esc(err?.message||'Erreur de chargement')}</div>`;}
 async function loadAffaires(q){const data=await api(`/api/finance/affaires?search=${encodeURIComponent(q||'')}`);state.affaires=data.items||[];const sel=document.getElementById('affaireSelect');if(!sel)return;sel.innerHTML=`<option value=''>Sélectionner une affaire…</option>${state.affaires.map(a=>`<option value='${esc(a.affaire_id)}'>${esc(a.display_name||a.affaire_id)}</option>`).join('')}`;if(state.selectedId){const selected=state.affaires.find(a=>String(a.affaire_id||'')===String(state.selectedId||''));if(selected){state.selectedLabel=selected.display_name||state.selectedLabel||'';sel.value=selected.affaire_id;}}}
 function getProjectKey(){return state.selectedId?`id::${state.selectedId}`:'';}
@@ -4762,6 +4881,7 @@ async function init(){
     document.getElementById('btnCollapseAll').addEventListener('click',async()=>{await savePointage({}, {expanded_levels:[]});});
     document.getElementById('cetMembersInput').addEventListener('change',async()=>{await savePointage({}, state.pointage?.workState||{});});
     const reminderClose=document.getElementById('reminderModalClose');if(reminderClose)reminderClose.addEventListener('click',hideReminderModal);const perimeterClose=document.getElementById('perimeterDetailClose');if(perimeterClose)perimeterClose.addEventListener('click',hidePerimeterDetailModal);const boardWindowBtn=document.getElementById('boardWindowBtn');if(boardWindowBtn)boardWindowBtn.addEventListener('click',openBoardWindow);const boardWindowBtnHero=document.getElementById('boardWindowBtnHero');if(boardWindowBtnHero)boardWindowBtnHero.addEventListener('click',openBoardWindow);
+    bindMetronomeProjectPickers();
     const affaireSelect=document.getElementById('affaireSelect');if(affaireSelect)affaireSelect.addEventListener('change',async e=>{await loadBoard(e.target.value||'');});
     const companyMetric=document.getElementById('companyMetric');if(companyMetric)companyMetric.addEventListener('change',()=>renderCompanyChart(state.board||{}));
     const planningChartSelect=document.getElementById('planningChartSelect');if(planningChartSelect)planningChartSelect.addEventListener('change',()=>renderPlanningChart());
@@ -4872,14 +4992,14 @@ def dashboard_board_html() -> str:
 
   <div class='board-sections'>
   <section id='section-metronome' class='board-section'>
-    <div class='section-head'><h3>GESTION DE PROJET | METRONOME</h3><button class='notes-btn' data-notes-target='notes-metronome'>+ Notes</button></div>
+    <div class='section-head'><h3>GESTION DE PROJET | METRONOME</h3><div class='section-tools'><label for='metronomeProjectPickerPilot' class='small'>Projet METRONOME</label><select id='metronomeProjectPickerPilot' class='action-btn' style='height:32px;padding:0 12px'><option value=''>Projet principal</option></select><button class='notes-btn' data-notes-target='notes-metronome'>+ Notes</button></div></div>
     <div class='panel'>
       <div class='mini-grid'>
         <div class='mini-card'><div class='label'>Rappels ouverts à date</div><div id='metroReminder' class='value'>0</div></div>
         <div class='mini-card'><div class='label'>À suivre ouverts</div><div id='metroFollow' class='value'>0</div></div>
         <div class='mini-card'><div class='label'>Date de référence</div><div id='metroDate' class='value' style='font-size:32px'>-</div></div>
       </div>
-      <div style='margin-top:18px;font-size:18px;font-weight:900'>Retards cumulés par entreprise</div>
+      <div style='margin-top:18px;font-size:18px;font-weight:900'>Rappels ouverts à date cumulés par entreprise</div>
       <div id='metroCompanies' class='stack' style='margin-top:12px'></div>
     </div>
     <div id='companyReminderModal' class='pm-modal hidden'><div class='pm-modal-box'><div style='display:flex;justify-content:space-between;align-items:center;gap:12px'><h3 id='companyReminderTitle' style='margin:0'>Rappels ouverts</h3><button id='companyReminderClose' class='action-btn' style='height:38px;background:#ef8d00;color:#fff;border-color:#ef8d00'>Fermer</button></div><div id='companyReminderBody' style='margin-top:14px'></div></div></div>
@@ -4888,7 +5008,7 @@ def dashboard_board_html() -> str:
   </section>
 
   <section id='section-analysis' class='board-section'>
-    <div class='section-head'><h3>GESTION DE PROJET | ANALYSE METRONOME</h3><div class='section-tools'><label class='mini-toggle'><input type='checkbox' data-chart='analysis-company' checked>Entreprises</label><label class='mini-toggle'><input type='checkbox' data-chart='analysis-reactivity' checked>Réactivité</label><button class='notes-btn' data-notes-target='notes-analysis'>+ Notes</button></div></div>
+    <div class='section-head'><h3>GESTION DE PROJET | ANALYSE METRONOME</h3><div class='section-tools'><label for='metronomeProjectPicker' class='small'>Projet METRONOME</label><select id='metronomeProjectPicker' class='action-btn' style='height:32px;padding:0 12px'><option value=''>Projet principal</option></select><label class='mini-toggle'><input type='checkbox' data-chart='analysis-company' checked>Entreprises</label><label class='mini-toggle'><input type='checkbox' data-chart='analysis-reactivity' checked>Réactivité</label><button class='notes-btn' data-notes-target='notes-analysis'>+ Notes</button></div></div>
     <div id='chart-analysis-company' class='chart-box'>
       <div class='chart-title'>Tâches ouvertes / rappels par entreprise</div>
       <div id='analysisBars'></div>
@@ -4935,6 +5055,7 @@ const qs=new URLSearchParams(window.location.search);const affaireId=qs.get('aff
 const euro=v=>new Intl.NumberFormat('fr-FR',{style:'currency',currency:'EUR',maximumFractionDigits:0}).format(Number(v||0));
 const esc=v=>String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]||m));
 const escAttr=esc;
+function trimProjectName(v){const raw=String(v||'').trim();if(!raw)return raw;return raw.split(/[-—]/)[0].trim()||raw;}
 async function api(u){const r=await fetch(u);const d=await r.json();if(!r.ok) throw new Error(d.detail||'Erreur API');return d;}
 function parseDateOnly(v){const raw=String(v||'').trim();if(!raw)return null;const s=raw.split(' ')[0].split('T')[0];if(/^\d{4}-\d{2}-\d{2}$/.test(s)){const d=new Date(`${s}T00:00:00`);return Number.isNaN(d.getTime())?null:d;}const m=s.match(/^(\d{2})\/(\d{2})\/(\d{2,4})$/);if(m){const y=m[3].length===2?`20${m[3]}`:m[3];const d=new Date(`${y}-${m[2]}-${m[1]}T00:00:00`);return Number.isNaN(d.getTime())?null:d;}return null;}
 function fmtDate(v){const d=parseDateOnly(v);return d?d.toLocaleDateString('fr-FR',{day:'2-digit',month:'2-digit',year:'2-digit'}):'-';}
@@ -4968,7 +5089,11 @@ function showPlanningDelayModal({rootId,item,suffix=' j'}={}){const modal=docume
 function hidePlanningDelayModal(){const modal=document.getElementById('planningDelayModal');if(modal)modal.classList.add('hidden');}
 function showCompanyReminderModal(company,board){const p=(board&&board.kpis_pilotage)||{};const norm=v=>String(v||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').trim();const items=(p.reminders_open_items||[]).filter(x=>norm(x.company)===norm(company));const modal=document.getElementById('companyReminderModal');const title=document.getElementById('companyReminderTitle');const body=document.getElementById('companyReminderBody');if(title)title.textContent=`Rappels ouverts - ${company}`;if(body){if(!items.length){body.innerHTML=`<div class='company-row'><span class='name'>Aucun sujet en retard.</span><span class='count'>0</span></div>`;}else{const grouped={};for(const item of items){const key=String(item.perimetre||item.perimeter||'Général').trim()||'Général';(grouped[key]=grouped[key]||[]).push(item);}body.innerHTML=Object.keys(grouped).sort((a,b)=>a.localeCompare(b,'fr')).map(group=>`<section class='reminder-group'><div class='reminder-group-title'>${esc(group)}</div><table class='reminder-table'><thead><tr><th style='width:100%'>Tâche</th><th>Échéance</th><th>Rappel</th></tr></thead><tbody>${grouped[group].map(item=>`<tr><td>${esc(item.task||'-')}</td><td>${esc(fmtDate(item.deadline||''))}</td><td><span class='reminder-level'>${esc(reminderLevelLabel(item))}</span></td></tr>`).join('')}</tbody></table></section>`).join('');}}if(modal)modal.classList.remove('hidden');}
 function hideCompanyReminderModal(){const modal=document.getElementById('companyReminderModal');if(modal)modal.classList.add('hidden');}
-async function init(){restoreLayout();restoreNotes();document.querySelectorAll('[data-notes-target]').forEach(btn=>btn.addEventListener('click',()=>toggleNotes(btn.getAttribute('data-notes-target'))));document.getElementById('exportBtn').addEventListener('click',exportBoard);document.getElementById('importBtn').addEventListener('click',()=>document.getElementById('importInput').click());document.getElementById('importInput').addEventListener('change',async e=>{if(e.target.files&&e.target.files[0]){await importBoard(e.target.files[0]);e.target.value='';}});document.getElementById('printBtn').addEventListener('click',()=>window.print());document.getElementById('closeBtn').addEventListener('click',()=>window.close());const reminderModal=document.getElementById('companyReminderModal');if(reminderModal)reminderModal.addEventListener('click',e=>{if(e.target===reminderModal)hideCompanyReminderModal();});const financeProductionModal=document.getElementById('financeProductionModal');if(financeProductionModal)financeProductionModal.addEventListener('click',e=>{if(e.target===financeProductionModal)hideFinanceProductionModal();});const financeProductionClose=document.getElementById('financeProductionClose');if(financeProductionClose)financeProductionClose.onclick=hideFinanceProductionModal;const planningDelayModal=document.getElementById('planningDelayModal');if(planningDelayModal)planningDelayModal.addEventListener('click',e=>{if(e.target===planningDelayModal)hidePlanningDelayModal();});const planningDelayModalClose=document.getElementById('planningDelayModalClose');if(planningDelayModalClose)planningDelayModalClose.onclick=hidePlanningDelayModal;const financeModeMonthly=document.getElementById('financeModeMonthly');if(financeModeMonthly)financeModeMonthly.addEventListener('change',()=>{if(financeModeMonthly.checked&&window.__boardAffaire)renderFinance(window.__boardAffaire);});const financeModeCumulative=document.getElementById('financeModeCumulative');if(financeModeCumulative)financeModeCumulative.addEventListener('change',()=>{if(financeModeCumulative.checked&&window.__boardAffaire)renderFinance(window.__boardAffaire);});const financeShowProduction=document.getElementById('financeShowProduction');if(financeShowProduction)financeShowProduction.addEventListener('change',()=>{if(window.__boardAffaire)renderFinance(window.__boardAffaire);});if(!affaireId){setText('projectTitle','Aucune affaire sélectionnée');return;}const finance=await api(`/api/finance/affaire/${encodeURIComponent(affaireId)}`);let board={};let pointage={};try{board=await api(`/api/project-management/board?affaire_id=${encodeURIComponent(affaireId)}`);}catch(_){board={};}try{pointage=await api(`/api/project-management/pointage?affaire_id=${encodeURIComponent(affaireId)}`);}catch(_){pointage={};}const planningTasks=extractPlanningTasks(pointage,board);window.__boardPointageTasks=planningTasks;const affaire=(finance&&finance.affaire)||{};window.__boardAffaire=affaire;const billed=Number(affaire.facturation_totale||((affaire.anteriorite||0)+(affaire.facture_2026||affaire.facturation_cumulee_2026||0)));const budget=Number(affaire.commande_ht||0);const billedPct=budget>0?(billed/budget)*100:0;const projectTitle=String(board.project_name||affaire.affaire||affaire.display_name||affaireId).toUpperCase();const projectDesc=String(board.project_description||affaire.project_description||affaire.start_sentence||affaire.description||'').trim();const projectImage=String(board.project_image||affaire.project_image||affaire.image_url||affaire.image||'').trim();setText('projectTitle',projectTitle);setText('projectDesc',projectDesc||'Description indisponible');const img=document.getElementById('projectImage');if(projectImage){img.src=projectImage;img.style.display='block';}else{img.removeAttribute('src');img.style.display='none';}setText('pillBudget',euro(affaire.commande_ht||0));setText('pillRemain',euro(affaire.reste_a_facturer||0));setText('pillBilledPct',`${billedPct.toFixed(1)} %`);const planning=computePlanningDatasets(planningTasks);setText('pillPlannedPct',`${Number((planning.expected[0]||{}).value||0).toFixed(1)} %`);setText('pillPointedPct',`${(Number(affaire.pointage_progress_ratio||0)*100).toFixed(1)} %`);const p=(board&&board.kpis_pilotage)||{};setText('metroReminder',String(Number(p.rappels_ouverts_a_date||p.reminders_open_count||0)));setText('metroFollow',String(Number(p.a_suivre_ouverts||p.followups_open_count||0)));setText('metroDate',p.date_reference||p.reference_date||'-');document.getElementById('metroCompanies').innerHTML=renderCompanyRows((p.rappels_cumules_par_entreprise||p.reminders_by_company||[]));Array.from(document.querySelectorAll('.company-row-btn')).forEach(btn=>btn.addEventListener('click',()=>showCompanyReminderModal(btn.getAttribute('data-company')||'',board)));const closeModal=document.getElementById('companyReminderClose');if(closeModal)closeModal.onclick=hideCompanyReminderModal;const analysisReactivity=(p.reactivity_by_company||[]).slice(0,8);const planningResources=planning.resources.map(x=>({name:x.name,avg:x.avg}));const planningResourcesToday=planning.resourcesToday.map(x=>({name:x.name,avg:x.avg}));renderBarList('analysisBars',((p.project_company_views||{}).reminder||[]).slice(0,8));renderVerticalBars('analysisReactivity',analysisReactivity,{tempoName:'tempo'});renderPrintMetricList('analysisReactivityPrint',analysisReactivity,{suffix:' j'});renderPlanningCards('planningDelay',planning.delayTrigger.map(x=>({label:x.label,subtitle:x.subtitle,side:x.side})));renderProgressRows('planningProgress',planning.perimeterProgress);renderVerticalBars('planningResources',planningResources,{tempoName:'cst'});renderPrintMetricList('planningResourcesPrint',planningResources,{suffix:' j'});renderVerticalBars('planningResourcesToday',planningResourcesToday,{tempoName:'cst'});renderPrintMetricList('planningResourcesTodayPrint',planningResourcesToday,{suffix:' j'});renderProgressRows('planningExpected',planning.expected);const timelineToggle=document.getElementById('planningTimelineActualToggle');if(timelineToggle){timelineToggle.onchange=()=>renderPerimeterTimeline(planning.perimeterTimeline||[],{showActual:timelineToggle.checked});}renderPerimeterTimeline(planning.perimeterTimeline||[],{showActual:!!(timelineToggle&&timelineToggle.checked)});renderFinance(affaire);}
+function populateMetronomeProjectPicker(board){const options=(board&&board.metronome_projects)||[];const selected=String((board&&board.selected_metronome_project_id)||'');const html=`<option value=''>Projet principal</option>${options.map(opt=>{const id=String(opt.project_id||'').trim();const title=String(opt.project_title||opt.project_id||'Projet').trim();return `<option value='${escAttr(id)}' ${id===selected?'selected':''}>${esc(title)}</option>`;}).join('')}`;['metronomeProjectPicker','metronomeProjectPickerPilot'].forEach(id=>{const picker=document.getElementById(id);if(picker)picker.innerHTML=html;});}
+function renderMetronomeBoard(board){const p=(board&&board.kpis_pilotage)||{};setText('metroReminder',String(Number(p.rappels_ouverts_a_date||p.reminders_open_count||0)));setText('metroFollow',String(Number(p.a_suivre_ouverts||p.followups_open_count||0)));setText('metroDate',p.date_reference||p.reference_date||'-');document.getElementById('metroCompanies').innerHTML=renderCompanyRows((p.rappels_cumules_par_entreprise||p.reminders_by_company||[]));Array.from(document.querySelectorAll('.company-row-btn')).forEach(btn=>btn.addEventListener('click',()=>showCompanyReminderModal(btn.getAttribute('data-company')||'',board)));const analysisReactivity=(p.reactivity_by_company||[]).slice(0,8);renderBarList('analysisBars',((p.project_company_views||{}).reminder||[]).slice(0,8));renderVerticalBars('analysisReactivity',analysisReactivity,{tempoName:'tempo'});renderPrintMetricList('analysisReactivityPrint',analysisReactivity,{suffix:' j'});}
+async function loadMetronomeBoard(projectId=''){const params=new URLSearchParams({affaire_id:affaireId});if(projectId)params.set('metronome_project_id',projectId);const board=await api(`/api/project-management/board?${params.toString()}`);populateMetronomeProjectPicker(board);renderMetronomeBoard(board);return board;}
+function bindMetronomePickers(){['metronomeProjectPicker','metronomeProjectPickerPilot'].forEach(id=>{const picker=document.getElementById(id);if(!picker||picker.dataset.bound==='1')return;picker.dataset.bound='1';picker.addEventListener('change',async()=>{const selected=picker.value||'';['metronomeProjectPicker','metronomeProjectPickerPilot'].forEach(otherId=>{const other=document.getElementById(otherId);if(other&&other!==picker)other.value=selected;});try{await loadMetronomeBoard(selected);}catch(err){console.error(err);}});});}
+async function init(){restoreLayout();restoreNotes();document.querySelectorAll('[data-notes-target]').forEach(btn=>btn.addEventListener('click',()=>toggleNotes(btn.getAttribute('data-notes-target'))));document.getElementById('exportBtn').addEventListener('click',exportBoard);document.getElementById('importBtn').addEventListener('click',()=>document.getElementById('importInput').click());document.getElementById('importInput').addEventListener('change',async e=>{if(e.target.files&&e.target.files[0]){await importBoard(e.target.files[0]);e.target.value='';}});document.getElementById('printBtn').addEventListener('click',()=>window.print());document.getElementById('closeBtn').addEventListener('click',()=>window.close());const reminderModal=document.getElementById('companyReminderModal');if(reminderModal)reminderModal.addEventListener('click',e=>{if(e.target===reminderModal)hideCompanyReminderModal();});const financeProductionModal=document.getElementById('financeProductionModal');if(financeProductionModal)financeProductionModal.addEventListener('click',e=>{if(e.target===financeProductionModal)hideFinanceProductionModal();});const financeProductionClose=document.getElementById('financeProductionClose');if(financeProductionClose)financeProductionClose.onclick=hideFinanceProductionModal;const planningDelayModal=document.getElementById('planningDelayModal');if(planningDelayModal)planningDelayModal.addEventListener('click',e=>{if(e.target===planningDelayModal)hidePlanningDelayModal();});const planningDelayModalClose=document.getElementById('planningDelayModalClose');if(planningDelayModalClose)planningDelayModalClose.onclick=hidePlanningDelayModal;const financeModeMonthly=document.getElementById('financeModeMonthly');if(financeModeMonthly)financeModeMonthly.addEventListener('change',()=>{if(financeModeMonthly.checked&&window.__boardAffaire)renderFinance(window.__boardAffaire);});const financeModeCumulative=document.getElementById('financeModeCumulative');if(financeModeCumulative)financeModeCumulative.addEventListener('change',()=>{if(financeModeCumulative.checked&&window.__boardAffaire)renderFinance(window.__boardAffaire);});const financeShowProduction=document.getElementById('financeShowProduction');if(financeShowProduction)financeShowProduction.addEventListener('change',()=>{if(window.__boardAffaire)renderFinance(window.__boardAffaire);});if(!affaireId){setText('projectTitle','Aucune affaire sélectionnée');return;}const finance=await api(`/api/finance/affaire/${encodeURIComponent(affaireId)}`);let board={};let pointage={};try{board=await api(`/api/project-management/board?affaire_id=${encodeURIComponent(affaireId)}`);}catch(_){board={};}try{pointage=await api(`/api/project-management/pointage?affaire_id=${encodeURIComponent(affaireId)}`);}catch(_){pointage={};}const planningTasks=extractPlanningTasks(pointage,board);window.__boardPointageTasks=planningTasks;const affaire=(finance&&finance.affaire)||{};window.__boardAffaire=affaire;const billed=Number(affaire.facturation_totale||((affaire.anteriorite||0)+(affaire.facture_2026||affaire.facturation_cumulee_2026||0)));const budget=Number(affaire.commande_ht||0);const billedPct=budget>0?(billed/budget)*100:0;const projectTitle=trimProjectName(String(board.project_name||affaire.affaire||affaire.display_name||affaireId)).toUpperCase();const projectDesc=String(board.project_description||affaire.project_description||affaire.start_sentence||affaire.description||'').trim();const projectImage=String(board.project_image||affaire.project_image||affaire.image_url||affaire.image||'').trim();setText('projectTitle',projectTitle);setText('projectDesc',projectDesc||'Description indisponible');const img=document.getElementById('projectImage');if(projectImage){img.src=projectImage;img.style.display='block';}else{img.removeAttribute('src');img.style.display='none';}setText('pillBudget',euro(affaire.commande_ht||0));setText('pillRemain',euro(affaire.reste_a_facturer||0));setText('pillBilledPct',`${billedPct.toFixed(1)} %`);const planning=computePlanningDatasets(planningTasks);setText('pillPlannedPct',`${Number((planning.expected[0]||{}).value||0).toFixed(1)} %`);setText('pillPointedPct',`${(Number(affaire.pointage_progress_ratio||0)*100).toFixed(1)} %`);populateMetronomeProjectPicker(board);renderMetronomeBoard(board);bindMetronomePickers();const closeModal=document.getElementById('companyReminderClose');if(closeModal)closeModal.onclick=hideCompanyReminderModal;const planningResources=planning.resources.map(x=>({name:x.name,avg:x.avg}));const planningResourcesToday=planning.resourcesToday.map(x=>({name:x.name,avg:x.avg}));renderPlanningCards('planningDelay',planning.delayTrigger.map(x=>({label:x.label,subtitle:x.subtitle,side:x.side})));renderProgressRows('planningProgress',planning.perimeterProgress);renderVerticalBars('planningResources',planningResources,{tempoName:'cst'});renderPrintMetricList('planningResourcesPrint',planningResources,{suffix:' j'});renderVerticalBars('planningResourcesToday',planningResourcesToday,{tempoName:'cst'});renderPrintMetricList('planningResourcesTodayPrint',planningResourcesToday,{suffix:' j'});renderProgressRows('planningExpected',planning.expected);const timelineToggle=document.getElementById('planningTimelineActualToggle');if(timelineToggle){timelineToggle.onchange=()=>renderPerimeterTimeline(planning.perimeterTimeline||[],{showActual:timelineToggle.checked});}renderPerimeterTimeline(planning.perimeterTimeline||[],{showActual:!!(timelineToggle&&timelineToggle.checked)});renderFinance(affaire);}
 init().catch(err=>{setText('projectTitle',err.message||'Erreur de chargement');});
 </script></body></html>"""
 
@@ -5077,7 +5202,13 @@ def api_affaire_detail(affaire_id: str):
 
 
 @app.get("/api/project-management/board", response_class=JSONResponse)
-def api_project_management_board(affaire_id: str = Query(default=""), affaire_name: str = Query(default=""), start_date: str = Query(default=""), end_date: str = Query(default="")):
+def api_project_management_board(
+    affaire_id: str = Query(default=""),
+    affaire_name: str = Query(default=""),
+    start_date: str = Query(default=""),
+    end_date: str = Query(default=""),
+    metronome_project_id: str = Query(default=""),
+):
     name = clean_text(affaire_name)
     if affaire_id and not name:
         cache = service.get_finance_cache()
@@ -5088,15 +5219,51 @@ def api_project_management_board(affaire_id: str = Query(default=""), affaire_na
         candidates = [c for i, c in enumerate(candidates) if c and c not in candidates[:i]]
         if not candidates:
             raise HTTPException(status_code=400, detail="Aucun nom projet exploitable pour cette affaire")
-        boards = [metronome_service.build_project_board(c, start_date=start_date, end_date=end_date) for c in candidates]
+        forced_project_id = clean_text(metronome_project_id)
+        boards = [
+            metronome_service.build_project_board(
+                c,
+                start_date=start_date,
+                end_date=end_date,
+                forced_project_id=forced_project_id,
+            )
+            for c in candidates
+        ]
         boards.sort(key=lambda b: (clean_number((b.get("match_debug") or {}).get("match_score", 0)), len(b.get("rows") or [])), reverse=True)
         best = boards[0]
+        project_catalog: List[Dict[str, Any]] = []
+        seen_catalog_keys: set[str] = set()
+        for board in boards:
+            for option in (board.get("metronome_projects") or []):
+                pid = clean_text(option.get("project_id"))
+                title = clean_text(option.get("project_title"))
+                key = pid or slugify(title)
+                if not key or key in seen_catalog_keys:
+                    continue
+                seen_catalog_keys.add(key)
+                project_catalog.append({
+                    "project_id": pid,
+                    "project_title": title,
+                    "match_score": clean_number(option.get("match_score")),
+                    "source": clean_text(option.get("source")),
+                })
+        project_catalog.sort(key=lambda x: (-clean_number(x.get("match_score")), clean_text(x.get("project_title"))))
+        best["metronome_projects"] = project_catalog
+        if clean_text(metronome_project_id):
+            best["selected_metronome_project_id"] = clean_text(metronome_project_id)
+        else:
+            best["selected_metronome_project_id"] = ""
         if isinstance(best.get("match_debug"), dict):
             best["match_debug"]["searched_variants"] = candidates
         return best
     if not name:
         raise HTTPException(status_code=400, detail="affaire_id ou affaire_name requis")
-    return metronome_service.build_project_board(name, start_date=start_date, end_date=end_date)
+    return metronome_service.build_project_board(
+        name,
+        start_date=start_date,
+        end_date=end_date,
+        forced_project_id=clean_text(metronome_project_id),
+    )
 
 
 @app.get("/api/project-management/pointage", response_class=JSONResponse)
