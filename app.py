@@ -2449,8 +2449,14 @@ class MetronomeService:
                 local_name = clean_text(candidate_name)
                 if not local_name:
                     continue
+                local_slug = slugify(local_name)
+                local_tokens = self._tokenize_project_name(local_name)
                 score = self._score_project_match(target_slug, target_tokens, local_name)
-                if score < 55:
+                has_name_hit = bool(
+                    (target_slug and local_slug and (target_slug in local_slug or local_slug in target_slug))
+                    or (target_tokens and local_tokens and len(target_tokens & local_tokens) >= 1)
+                )
+                if not has_name_hit:
                     continue
                 key = project_row_id or slugify(local_name)
                 if not key or key in seen:
@@ -2691,6 +2697,16 @@ class MetronomeService:
                 clean_text(candidate.get("source")),
             )
 
+        matched_project_ids = [clean_text(p.get("project_id")) for p in metronome_projects if clean_text(p.get("project_id"))]
+        matched_project_ids = [pid for i, pid in enumerate(matched_project_ids) if pid and pid not in matched_project_ids[:i]]
+        selected_project_ids: set[str] = set()
+        if forced_id:
+            selected_project_ids = {forced_id}
+        elif matched_project_ids:
+            selected_project_ids = set(matched_project_ids)
+        elif resolved_id:
+            selected_project_ids = {resolved_id}
+
         if not resolved_title and not resolved_id:
             return {
                 "ok": False,
@@ -2709,7 +2725,7 @@ class MetronomeService:
         today = datetime.now().date()
         rows_filtered_by_title = 0
         rows_filtered_by_id = 0
-        filter_mode = "id" if resolved_id else "title"
+        filter_mode = "id_multi" if len(selected_project_ids) > 1 else ("id" if selected_project_ids else "title")
         match_debug["filter_mode"] = filter_mode
 
         def parse_date(value: str) -> Optional[date]:
@@ -2730,8 +2746,8 @@ class MetronomeService:
             entry_project_id = self._get_first_value(e, METRONOME_COLUMN_ALIASES["entry_project_id"])
 
             use_row = False
-            if resolved_id:
-                if entry_project_id == resolved_id:
+            if selected_project_ids:
+                if entry_project_id in selected_project_ids:
                     rows_filtered_by_id += 1
                     use_row = True
             elif resolved_title and entry_project_title == resolved_title:
@@ -3319,11 +3335,14 @@ class MetronomeService:
         warning_message = "Projet trouvé via entrées METRONOME (fallback)" if warning else ""
 
         project_display_name = resolved_title or target
+        if len(selected_project_ids) > 1:
+            project_display_name = f"{target} — multi-projets METRONOME"
         project_id = resolved_id or self._row_id(project_info)
         project_image = self._get_first_value(project_info, METRONOME_COLUMN_ALIASES["project_image"])
         project_description = self._get_first_value(project_info, METRONOME_COLUMN_ALIASES["project_description"])
         register_metronome_project(resolved_id, project_display_name, clean_number(match_debug.get("match_score")), "selected")
         metronome_projects.sort(key=lambda x: (-clean_number(x.get("match_score")), clean_text(x.get("project_title"))))
+        selected_metronome_project_id = forced_id if forced_id else ""
         return {
             "ok": True,
             "project_name": project_display_name,
@@ -3335,7 +3354,8 @@ class MetronomeService:
             "warning_message": warning_message,
             "match_debug": match_debug,
             "metronome_projects": metronome_projects,
-            "selected_metronome_project_id": project_id,
+            "selected_metronome_project_id": selected_metronome_project_id,
+            "selected_metronome_project_ids": sorted(selected_project_ids),
             "kpis_meeting_simple": meeting_simple_kpis,
             "kpis": {
                 "open_topics": len(open_tasks_today),
@@ -5062,7 +5082,7 @@ function showPlanningDelayModal({rootId,item,suffix=' j'}={}){const modal=docume
 function hidePlanningDelayModal(){const modal=document.getElementById('planningDelayModal');if(modal)modal.classList.add('hidden');}
 function showCompanyReminderModal(company,board){const p=(board&&board.kpis_pilotage)||{};const norm=v=>String(v||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').trim();const items=(p.reminders_open_items||[]).filter(x=>norm(x.company)===norm(company));const modal=document.getElementById('companyReminderModal');const title=document.getElementById('companyReminderTitle');const body=document.getElementById('companyReminderBody');if(title)title.textContent=`Rappels ouverts - ${company}`;if(body){if(!items.length){body.innerHTML=`<div class='company-row'><span class='name'>Aucun sujet en retard.</span><span class='count'>0</span></div>`;}else{const grouped={};for(const item of items){const key=String(item.perimetre||item.perimeter||'Général').trim()||'Général';(grouped[key]=grouped[key]||[]).push(item);}body.innerHTML=Object.keys(grouped).sort((a,b)=>a.localeCompare(b,'fr')).map(group=>`<section class='reminder-group'><div class='reminder-group-title'>${esc(group)}</div><table class='reminder-table'><thead><tr><th style='width:100%'>Tâche</th><th>Échéance</th><th>Rappel</th></tr></thead><tbody>${grouped[group].map(item=>`<tr><td>${esc(item.task||'-')}</td><td>${esc(fmtDate(item.deadline||''))}</td><td><span class='reminder-level'>${esc(reminderLevelLabel(item))}</span></td></tr>`).join('')}</tbody></table></section>`).join('');}}if(modal)modal.classList.remove('hidden');}
 function hideCompanyReminderModal(){const modal=document.getElementById('companyReminderModal');if(modal)modal.classList.add('hidden');}
-function populateMetronomeProjectPicker(board){const options=(board&&board.metronome_projects)||[];const selected=String((board&&board.selected_metronome_project_id)||(board&&board.project_id)||'');const html=`<option value=''>Projet principal</option>${options.map(opt=>{const id=String(opt.project_id||'').trim();const title=String(opt.project_title||opt.project_id||'Projet').trim();return `<option value='${escAttr(id)}' ${id===selected?'selected':''}>${esc(title)}</option>`;}).join('')}`;['metronomeProjectPicker','metronomeProjectPickerPilot'].forEach(id=>{const picker=document.getElementById(id);if(picker)picker.innerHTML=html;});}
+function populateMetronomeProjectPicker(board){const options=(board&&board.metronome_projects)||[];const selected=String((board&&board.selected_metronome_project_id)||'');const html=`<option value=''>Projet principal</option>${options.map(opt=>{const id=String(opt.project_id||'').trim();const title=String(opt.project_title||opt.project_id||'Projet').trim();return `<option value='${escAttr(id)}' ${id===selected?'selected':''}>${esc(title)}</option>`;}).join('')}`;['metronomeProjectPicker','metronomeProjectPickerPilot'].forEach(id=>{const picker=document.getElementById(id);if(picker)picker.innerHTML=html;});}
 function renderMetronomeBoard(board){const p=(board&&board.kpis_pilotage)||{};setText('metroReminder',String(Number(p.rappels_ouverts_a_date||p.reminders_open_count||0)));setText('metroFollow',String(Number(p.a_suivre_ouverts||p.followups_open_count||0)));setText('metroDate',p.date_reference||p.reference_date||'-');document.getElementById('metroCompanies').innerHTML=renderCompanyRows((p.rappels_cumules_par_entreprise||p.reminders_by_company||[]));Array.from(document.querySelectorAll('.company-row-btn')).forEach(btn=>btn.addEventListener('click',()=>showCompanyReminderModal(btn.getAttribute('data-company')||'',board)));const analysisReactivity=(p.reactivity_by_company||[]).slice(0,8);renderBarList('analysisBars',((p.project_company_views||{}).reminder||[]).slice(0,8));renderVerticalBars('analysisReactivity',analysisReactivity,{tempoName:'tempo'});renderPrintMetricList('analysisReactivityPrint',analysisReactivity,{suffix:' j'});}
 async function loadMetronomeBoard(projectId=''){const params=new URLSearchParams({affaire_id:affaireId});if(projectId)params.set('metronome_project_id',projectId);const board=await api(`/api/project-management/board?${params.toString()}`);populateMetronomeProjectPicker(board);renderMetronomeBoard(board);return board;}
 function bindMetronomePickers(){['metronomeProjectPicker','metronomeProjectPickerPilot'].forEach(id=>{const picker=document.getElementById(id);if(!picker||picker.dataset.bound==='1')return;picker.dataset.bound='1';picker.addEventListener('change',async()=>{const selected=picker.value||'';['metronomeProjectPicker','metronomeProjectPickerPilot'].forEach(otherId=>{const other=document.getElementById(otherId);if(other&&other!==picker)other.value=selected;});try{await loadMetronomeBoard(selected);}catch(err){console.error(err);}});});}
@@ -5227,7 +5247,10 @@ def api_project_management_board(
                 })
         project_catalog.sort(key=lambda x: (-clean_number(x.get("match_score")), clean_text(x.get("project_title"))))
         best["metronome_projects"] = project_catalog
-        best["selected_metronome_project_id"] = clean_text(best.get("project_id"))
+        if clean_text(metronome_project_id):
+            best["selected_metronome_project_id"] = clean_text(metronome_project_id)
+        else:
+            best["selected_metronome_project_id"] = ""
         if isinstance(best.get("match_debug"), dict):
             best["match_debug"]["searched_variants"] = candidates
         return best
