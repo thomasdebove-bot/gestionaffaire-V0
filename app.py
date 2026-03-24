@@ -3958,10 +3958,11 @@ class PointageService:
         mission_options = [
             {
                 "mission_key": mk,
-                "label": "Projet principal" if mk == "__default__" else mk.upper(),
+                "label": mk.upper(),
                 "tasks_count": len((slot.get("planning_tasks") or [])),
             }
             for mk, slot in sorted(missions.items(), key=lambda x: x[0])
+            if mk != "__default__"
         ]
         return {
             "project_key": project_key,
